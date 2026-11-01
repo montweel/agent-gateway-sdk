@@ -25,6 +25,13 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Build dashboard
+        working-directory: dashboard
+        run: npm ci && npm run build
+
+      - name: Verify dashboard build is packaged
+        run: npm pack --dry-run 2>&1 | grep -q "dashboard/dist/"
+
       - name: Publish
         run: npm publish --access public
         env:

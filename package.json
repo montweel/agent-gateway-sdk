@@ -20,9 +20,6 @@
   "type": "commonjs",
   "files": [
     "dist",
-    "src",
-    "!src/**/*_old*",
-    "!src/**/*_orig*",
     "dashboard/dist",
     "README.md",
     "TERMS.md",

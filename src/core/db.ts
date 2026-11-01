@@ -1,0 +1,243 @@
+import fs from "fs";
+import sqlite3 from "sqlite3";
+import { PENDING_TTL_MS } from "./constants";
+
+const CREATE_AGENT_LOGS_SQL = `
+  CREATE TABLE agent_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ALLOWED', 'BLOCKED', 'QUEUED', 'RATE_LIMITED', 'APPROVED', 'REJECTED')),
+    user_agent TEXT,
+    agent_key TEXT
+  )
+`;
+
+const CREATE_PENDING_ACTIONS_SQL = `
+  CREATE TABLE pending_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    headers TEXT,
+    body TEXT,
+    status TEXT NOT NULL CHECK (status IN ('PENDING', 'EXECUTING', 'APPROVED', 'REJECTED', 'FAILED', 'EXPIRED')),
+    response_preview TEXT,
+    decided_by TEXT,
+    expires_at INTEGER,
+    agent_key TEXT,
+    encrypted_payload TEXT
+  )
+`;
+
+const CREATE_USERS_SQL = `
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'viewer')),
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    otp_expires_at INTEGER,
+    created_at TEXT NOT NULL
+  )
+`;
+
+const CREATE_SESSIONS_SQL = `
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`;
+
+const CREATE_AGENT_KEYS_SQL = `
+  CREATE TABLE IF NOT EXISTS agent_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    key_prefix TEXT NOT NULL,
+    key_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+  )
+`;
+
+const CREATE_SYSTEM_SETTINGS_SQL = `
+  CREATE TABLE IF NOT EXISTS system_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  )
+`;
+
+export interface Db {
+  run(sql: string, params?: unknown[]): Promise<{ lastID: number; changes: number }>;
+  all<T>(sql: string, params?: unknown[]): Promise<T[]>;
+  get<T>(sql: string, params?: unknown[]): Promise<T | undefined>;
+  close(): Promise<void>;
+  /** Creates / migrates every table. Resolves when the database is ready. */
+  init(): Promise<void>;
+}
+
+export function createDatabase(dbPath: string): Db {
+  const db = new sqlite3.Database(dbPath, (err: Error | null) => {
+    if (err) console.error(`Could not open ${dbPath}:`, err.message);
+  });
+
+  function run(sql: string, params: unknown[] = []): Promise<{ lastID: number; changes: number }> {
+    return new Promise((resolve, reject) => {
+      db.run(sql, params, function (this: sqlite3.RunResult, err: Error | null) {
+        if (err) reject(err);
+        else resolve({ lastID: this.lastID, changes: this.changes });
+      });
+    });
+  }
+
+  function all<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+    return new Promise((resolve, reject) => {
+      db.all(sql, params, (err: Error | null, rows: unknown[]) => {
+        if (err) reject(err);
+        else resolve(rows as T[]);
+      });
+    });
+  }
+
+  function get<T>(sql: string, params: unknown[] = []): Promise<T | undefined> {
+    return new Promise((resolve, reject) => {
+      db.get(sql, params, (err: Error | null, row: unknown) => {
+        if (err) reject(err);
+        else resolve(row as T | undefined);
+      });
+    });
+  }
+
+  /**
+   * SQLite cannot change a CHECK constraint in place, so a table whose schema is
+   * out of date is rebuilt: rename, create the new one, copy the shared columns, drop.
+   * `extra` supplies values for columns the old table did not have (name -> SQL literal).
+   */
+  async function rebuildTable(table: string, createSql: string, extra: Record<string, string> = {}): Promise<void> {
+    console.log(`Migrating ${table} to the new schema...`);
+    await run("BEGIN IMMEDIATE");
+    try {
+      const oldCols = (await all<{ name: string }>(`PRAGMA table_info(${table})`)).map((c) => c.name);
+      await run(`ALTER TABLE ${table} RENAME TO ${table}_old`);
+      await run(createSql);
+      const newCols = (await all<{ name: string }>(`PRAGMA table_info(${table})`)).map((c) => c.name);
+      const shared = newCols.filter((c) => oldCols.includes(c));
+      const extraKeys = Object.keys(extra).filter((k) => !shared.includes(k));
+      const cols = [...shared, ...extraKeys];
+      const values = [...shared, ...extraKeys.map((k) => extra[k])];
+      await run(`INSERT INTO ${table} (${cols.join(", ")}) SELECT ${values.join(", ")} FROM ${table}_old`);
+      await run(`DROP TABLE ${table}_old`);
+      await run("COMMIT");
+    } catch (err) {
+      await run("ROLLBACK").catch(() => undefined);
+      throw err;
+    }
+  }
+
+  async function tableSql(name: string): Promise<string | undefined> {
+    const row = await get<{ sql: string | null }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      [name]
+    );
+    return row ? (row.sql ?? "") : undefined;
+  }
+
+  async function hasColumn(table: string, column: string): Promise<boolean> {
+    return (await all<{ name: string }>(`PRAGMA table_info(${table})`)).some((c) => c.name === column);
+  }
+
+  async function init(): Promise<void> {
+    // WAL lets readers and the single writer work at the same time, NORMAL
+    // sync is safe with WAL, and busy_timeout waits instead of failing fast.
+    await run("PRAGMA journal_mode = WAL");
+    await run("PRAGMA synchronous = NORMAL");
+    await run("PRAGMA busy_timeout = 5000");
+    await run("PRAGMA foreign_keys = ON");
+
+    // ---- agent_logs: the CHECK must list every status the code writes ----
+    const logsSql = await tableSql("agent_logs");
+    if (logsSql === undefined) {
+      await run(CREATE_AGENT_LOGS_SQL);
+    } else if (!logsSql.includes("'QUEUED'") || !logsSql.includes("'RATE_LIMITED'") || !logsSql.includes("'APPROVED'") || !logsSql.includes("'REJECTED'") ) {
+      await rebuildTable("agent_logs", CREATE_AGENT_LOGS_SQL);
+    } else if (!(await hasColumn("agent_logs", "agent_key"))) {
+      await run("ALTER TABLE agent_logs ADD COLUMN agent_key TEXT");
+    }
+
+    // ---- pending_actions: approval state machine + expiry ----
+    const pendingSql = await tableSql("pending_actions");
+    if (pendingSql === undefined) {
+      await run(CREATE_PENDING_ACTIONS_SQL);
+    } else if (!pendingSql.includes("'EXECUTING'") || !pendingSql.includes("'EXPIRED'") || !pendingSql.includes("'FAILED'")) {
+      // Rows that predate expiry get a fresh 24 hour window.
+      await rebuildTable("pending_actions", CREATE_PENDING_ACTIONS_SQL, {
+        expires_at: String(Date.now() + PENDING_TTL_MS),
+      });
+    } else {
+      if (!(await hasColumn("pending_actions", "expires_at"))) {
+        await run("ALTER TABLE pending_actions ADD COLUMN expires_at INTEGER");
+      }
+      if (!(await hasColumn("pending_actions", "agent_key"))) {
+        await run("ALTER TABLE pending_actions ADD COLUMN agent_key TEXT");
+      }
+      if (!(await hasColumn("pending_actions", "encrypted_payload"))) {
+        await run("ALTER TABLE pending_actions ADD COLUMN encrypted_payload TEXT");
+      }
+    }
+
+    // A decided or expired action must not keep its secrets.
+    await run(
+      "UPDATE pending_actions SET encrypted_payload = NULL WHERE encrypted_payload IS NOT NULL AND status IN ('APPROVED', 'REJECTED', 'EXPIRED')"
+    );
+
+    // A request that was mid-replay when the process died has an unknown outcome.
+    await run(
+      "UPDATE pending_actions SET status = 'FAILED', response_preview = 'Interrupted: the gateway restarted while this action was executing. Check the target before retrying.' WHERE status = 'EXECUTING'"
+    );
+
+    await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_timestamp ON agent_logs(timestamp DESC)");
+    await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_status ON agent_logs(status)");
+    await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_method ON agent_logs(method)");
+    await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_status_ts ON agent_logs(status, timestamp)");
+    await run("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_actions(status)");
+
+    await run(CREATE_USERS_SQL);
+    if (!(await hasColumn("users", "otp_expires_at"))) {
+      await run("ALTER TABLE users ADD COLUMN otp_expires_at INTEGER");
+    }
+    await run(CREATE_SESSIONS_SQL);
+    await run("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)");
+    await run("DELETE FROM sessions WHERE expires_at <= ?", [Date.now()]);
+    await run(CREATE_AGENT_KEYS_SQL);
+
+    // The free Pro trial starts the first time this database boots, and never restarts.
+    await run(CREATE_SYSTEM_SETTINGS_SQL);
+    await run("INSERT OR IGNORE INTO system_settings (key, value) VALUES ('trial_started_at', ?)", [
+      String(Date.now()),
+    ]);
+
+    // The database holds password hashes and request bodies: keep it owner-only
+    // (including the WAL side files, which hold the same data).
+    for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+      try {
+        fs.chmodSync(file, 0o600);
+      } catch {
+        // not fatal (the side files may not exist yet, or this is Windows)
+      }
+    }
+  }
+
+  return {
+    run,
+    all,
+    get,
+    init,
+    close: () =>
+      new Promise((resolve, reject) => {
+        db.close((err: Error | null) => (err ? reject(err) : resolve()));
+      }),
+  };
+}

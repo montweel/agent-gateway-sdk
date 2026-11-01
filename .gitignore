@@ -1,0 +1,36 @@
+# --- Secrets / signing keys (NEVER commit) ---
+.keys/
+*.key
+.env
+.env.*
+mont-state.json
+
+# --- Runtime state & generated secrets ---
+config.json
+rules.json
+logs.db*
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# --- Dependencies ---
+node_modules/
+
+# --- Logs / OS / editor ---
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Packed tarballs ---
+*.tgz
+
+# --- Internal / stale files (not part of the release) ---
+claude/
+**/*_old*
+**/*_orig*
+
+# NOTE: dist/ and dashboard/dist/ are intentionally TRACKED (pre-built for users).

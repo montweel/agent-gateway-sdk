@@ -1,0 +1,46 @@
+﻿{
+  "name": "agent-gateway-sdk",
+  "version": "1.0.0",
+  "description": "Mont Agent Gateway SDK. Use is governed by TERMS.md.",
+  "main": "dist/gateway.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc",
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/montweel/agent-gateway-sdk.git"
+  },
+  "homepage": "https://montweel.com",
+  "keywords": ["ai-agents", "gateway", "mcp", "access-control", "audit", "approval"],
+  "author": "Montweel <support@montweel.com> (https://montweel.com)",
+  "license": "SEE LICENSE IN TERMS.md",
+  "type": "commonjs",
+  "files": [
+    "dist",
+    "src",
+    "!src/**/*_old*",
+    "!src/**/*_orig*",
+    "dashboard/dist",
+    "README.md",
+    "TERMS.md",
+    "!mont-state.json"
+  ],
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.1",
+    "sqlite3": "^6.0.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
+
+

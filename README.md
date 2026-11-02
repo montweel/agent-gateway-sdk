@@ -5,6 +5,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-3b82f6?style=flat-square)](https://www.typescriptlang.org/)
 [![Database](https://img.shields.io/badge/Storage-Embedded%20SQLite%20WAL-f59e0b?style=flat-square)](https://www.sqlite.org/)
 [![License](https://img.shields.io/badge/License-Open--Core%20(See%20TERMS.md)-64748b?style=flat-square)](./TERMS.md)
+![Mont Gateway Dashboard](https://montweel.com/media/dashboard.png)
 
 **Open your product and APIs to autonomous AI agents—safely, visibly, and in under 60 seconds.**
 

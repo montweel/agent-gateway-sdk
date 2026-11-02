@@ -1,6 +1,6 @@
 ﻿{
   "name": "agent-gateway-sdk",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Mont Agent Gateway SDK. Use is governed by TERMS.md.",
   "main": "dist/gateway.js",
   "scripts": {

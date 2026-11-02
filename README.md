@@ -1,5 +1,5 @@
 # Mont (`agent-gateway-sdk`) — Zero-Infrastructure AI Agent API Gateway & Firewall
-
+[![npm version](https://img.shields.io/npm/v/agent-gateway-sdk?style=flat-square&color=cb3837)](https://www.npmjs.com/package/agent-gateway-sdk)
 [![Website](https://img.shields.io/badge/Website-montweel.com-6366f1?style=flat-square)](https://montweel.com)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20.17-10b981?style=flat-square)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-3b82f6?style=flat-square)](https://www.typescriptlang.org/)
@@ -12,7 +12,7 @@
 
 🌐 **Website & Free 90-Day Pro Trial Key:** [https://montweel.com](https://montweel.com)
 ⚖️ **Terms & License:** [TERMS.md](./TERMS.md)
-
+    Local-first alternative to cloud AI proxies
 ---
 
 ## Why Mont?

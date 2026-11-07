@@ -1,6 +1,6 @@
-﻿{
+{
   "name": "agent-gateway-sdk",
-  "version": "1.0.2",
+  "version": "1.3.0",
   "description": "Mont Agent Gateway SDK. Use is governed by TERMS.md.",
   "main": "dist/gateway.js",
   "bin": {
@@ -23,7 +23,14 @@
     "url": "https://github.com/montweel/agent-gateway-sdk.git"
   },
   "homepage": "https://montweel.com",
-  "keywords": ["ai-agents", "gateway", "mcp", "access-control", "audit", "approval"],
+  "keywords": [
+    "ai-agents",
+    "gateway",
+    "mcp",
+    "access-control",
+    "audit",
+    "approval"
+  ],
   "author": "Montweel <support@montweel.com> (https://montweel.com)",
   "license": "SEE LICENSE IN TERMS.md",
   "type": "commonjs",
@@ -48,5 +55,3 @@
     "typescript": "^7.0.2"
   }
 }
-
-

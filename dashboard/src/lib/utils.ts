@@ -32,8 +32,11 @@ export function prettyJson(text: string | null): string | null {
 
 const own = (rules: Rules, key: string): boolean => Object.prototype.hasOwnProperty.call(rules, key)
 
-/** Methods a rule can be pinned to. "ANY" means a path-only rule that matches every method. */
-export const RULE_METHOD_OPTIONS = ['ANY', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const
+/**
+ * Methods a rule can be pinned to. "ANY" means a path-only rule that matches every HTTP method.
+ * "MCP" rules govern MCP tools/call (path /api/mcp/tools/<tool name>).
+ */
+export const RULE_METHOD_OPTIONS = ['ANY', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'MCP'] as const
 export type RuleMethod = (typeof RULE_METHOD_OPTIONS)[number]
 
 /** Rules key: "/api/x" for any method, "POST /api/x" for one method (mirrors the server). */
@@ -49,9 +52,25 @@ export function splitRuleKey(key: string): { method: string; path: string } {
   return { method: key.slice(0, space).toUpperCase(), path: key.slice(space + 1).trim() }
 }
 
-/** True if a request with this method and path matches a rule (method rule first, then path-only). */
+/** "*" matches any characters; everything else is literal (mirrors the server). */
+function patternMatches(pattern: string, path: string): boolean {
+  const body = pattern
+    .split('*')
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('[^?#]*')
+  return new RegExp(`^${body}$`).test(path)
+}
+
+/** True if a request with this method and path matches a rule (exact keys, then "*" wildcard keys). */
 export function hasRule(rules: Rules, method: string, path: string): boolean {
-  return own(rules, ruleKey(method, path)) || own(rules, path)
+  const m = method.toUpperCase()
+  if (own(rules, ruleKey(m, path)) || (m !== 'MCP' && own(rules, path))) return true
+  return Object.keys(rules).some((key) => {
+    if (!key.includes('*')) return false
+    const { method: km, path: kp } = splitRuleKey(key)
+    if (km === 'ANY' ? m === 'MCP' : km !== m) return false
+    return patternMatches(kp, path)
+  })
 }
 
 /** Safe methods start as ALLOW; anything that changes data starts as REQUIRE_APPROVAL. */

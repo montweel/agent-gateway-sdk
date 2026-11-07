@@ -3,6 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.applyPreset = exports.POLICY_PRESETS = exports.createRedactor = exports.readPersistedListenPort = exports.signWebhookBody = exports.validatePolicies = exports.evaluateRule = void 0;
 exports.createAgentGateway = createAgentGateway;
 /**
  * agent-gateway-sdk: gateway core
@@ -22,13 +23,33 @@ exports.createAgentGateway = createAgentGateway;
  *   rateLimit.ts    gateway rate limiter + login brute-force guard
  *   auth.ts         sessions, SSO header trust, RBAC middleware
  *   proxy.ts        forwards allowed requests to targetUrl
- *   interceptor.ts  the /api/* guard (rate limit -> rules -> block/queue/allow)
+ *   interceptor.ts  the /api/* guard (rate limit -> key -> kill-switch -> rules/policies -> block/queue/allow)
+ *   policy.ts       deterministic payload policy engine (body/query/headers tiers)
+ *   approvals.ts    approval state machine, replay, revoke & block, rollback webhook
+ *   approvalSigning.ts  HMAC-SHA256 one-click approval links
+ *   approvalCallback.ts public confirm pages for those links
+ *   notify.ts       Slack / Telegram / webhook notifications (native fetch)
+ *   settingsStore.ts    v1.1 settings in SQLite (listen port, public URL, channels, rollback)
+ *   callerBlocklist.ts  persistent kill-switch list of agent keys / IPs
  *   adminRouter.ts  admin API; handlers live in routes/*
  *   discovery.ts    GET /.well-known/agent.json
  */
 const crypto_1 = __importDefault(require("crypto"));
 const path_1 = __importDefault(require("path"));
 const constants_1 = require("./constants");
+const settingsStore_1 = require("./settingsStore");
+const callerBlocklist_1 = require("./callerBlocklist");
+const notify_1 = require("./notify");
+const approvals_1 = require("./approvals");
+const approvalCallback_1 = require("./approvalCallback");
+const notify_2 = require("./notify");
+const redactor_1 = require("./redactor");
+const instance_1 = require("./instance");
+const toolGuard_1 = require("./toolGuard");
+const guards_1 = require("./guards");
+const operatingMode_1 = require("./operatingMode");
+const alerts_1 = require("./alerts");
+const protection_1 = require("./protection");
 const crypto_2 = require("./crypto");
 const agentKeys_1 = require("./agentKeys");
 const userCount_1 = require("./userCount");
@@ -41,6 +62,18 @@ const rules_1 = require("./rules");
 const interceptor_1 = require("./interceptor");
 const adminRouter_1 = require("./adminRouter");
 const discovery_1 = require("./discovery");
+var policy_1 = require("./policy");
+Object.defineProperty(exports, "evaluateRule", { enumerable: true, get: function () { return policy_1.evaluateRule; } });
+Object.defineProperty(exports, "validatePolicies", { enumerable: true, get: function () { return policy_1.validatePolicies; } });
+var notify_3 = require("./notify");
+Object.defineProperty(exports, "signWebhookBody", { enumerable: true, get: function () { return notify_3.signWebhookBody; } });
+var settingsStore_2 = require("./settingsStore");
+Object.defineProperty(exports, "readPersistedListenPort", { enumerable: true, get: function () { return settingsStore_2.readPersistedListenPort; } });
+var redactor_2 = require("./redactor");
+Object.defineProperty(exports, "createRedactor", { enumerable: true, get: function () { return redactor_2.createRedactor; } });
+var presets_1 = require("./presets");
+Object.defineProperty(exports, "POLICY_PRESETS", { enumerable: true, get: function () { return presets_1.POLICY_PRESETS; } });
+Object.defineProperty(exports, "applyPreset", { enumerable: true, get: function () { return presets_1.applyPreset; } });
 function createAgentGateway(options = {}) {
     const port = options.port ?? 3000;
     const rulesPath = options.rulesPath ?? path_1.default.resolve(process.cwd(), "rules.json");
@@ -54,7 +87,22 @@ function createAgentGateway(options = {}) {
     const license = (0, license_1.createLicenseService)(db, { licenseFile: path_1.default.join(path_1.default.dirname(dbPath), "mont-state.json") });
     const auth = (0, auth_1.createAuthService)(db, config, userCount, limiters, license);
     const agentKeys = (0, agentKeys_1.createAgentKeyStore)(db);
+    const settings = (0, settingsStore_1.createSettingsStore)(db);
+    const blocklist = (0, callerBlocklist_1.createCallerBlocklist)(db);
+    const redactor = (0, redactor_1.createRedactor)(() => settings.privacy());
+    const endpoints = {
+        telegramApiBase: (options.telegramApiBase ?? "https://api.telegram.org").replace(/\/+$/, ""),
+        slackApiBase: (options.slackApiBase ?? "https://slack.com/api").replace(/\/+$/, ""),
+        telegramPollTimeoutSec: typeof options.telegramPollTimeoutSec === "number" && options.telegramPollTimeoutSec >= 0 ? Math.min(50, options.telegramPollTimeoutSec) : 25,
+    };
+    const notifier = (0, notify_1.createNotifier)(settings, redactor, endpoints);
+    const instanceId = (0, instance_1.newInstanceId)();
+    const emergency = (0, operatingMode_1.createEmergencyStore)(db, typeof options.emergencyRefreshMs === "number" && options.emergencyRefreshMs >= 50 ? options.emergencyRefreshMs : 2000);
+    const alertIntervalMs = typeof options.alertCheckIntervalMs === "number" && options.alertCheckIntervalMs >= 50 ? options.alertCheckIntervalMs : 60000;
     const setup = { token: undefined };
+    const dbTimeoutMs = typeof options.dbOperationTimeoutMs === "number" && options.dbOperationTimeoutMs > 0
+        ? options.dbOperationTimeoutMs
+        : constants_1.DB_OPERATION_TIMEOUT_MS;
     // Optional dedicated admin listener (the host app binds it; see server.ts).
     const envAdminPort = Number(process.env.ADMIN_PORT);
     const adminPort = options.adminPort ?? (Number.isInteger(envAdminPort) && envAdminPort > 0 ? envAdminPort : undefined);
@@ -65,6 +113,12 @@ function createAgentGateway(options = {}) {
         await db.init();
         // Restore trial start + license key from mont-state.json / ~/.montweel/anchor.json if logs.db was deleted.
         await license.restoreState();
+        // If either of these cannot be read, `ready` rejects and every /api/* request fails closed (503).
+        await settings.load();
+        await blocklist.load();
+        await emergency.load();
+        // Held MCP calls of processes that died can never run: expire them (live processes' calls are kept).
+        await (0, instance_1.reapOrphanedMcp)(db, instanceId);
         // Startup notices
         const usersTotal = await userCount.get();
         const { adminToken, viewerToken } = config.resolveStaticTokens();
@@ -101,6 +155,7 @@ function createAgentGateway(options = {}) {
         port,
         replaySecret: crypto_1.default.randomBytes(32).toString("hex"),
         ready,
+        dbTimeoutMs,
         db,
         config,
         rules,
@@ -110,7 +165,37 @@ function createAgentGateway(options = {}) {
         license,
         userCount,
         setup,
+        settings,
+        blocklist,
+        notifier,
+        redactor,
+        mcpWaiters: new Map(),
+        instanceId,
+        emergency,
     };
+    ctx.approvals = (0, approvals_1.createApprovalService)(ctx);
+    ctx.bridges = (0, notify_2.createApprovalBridges)(ctx, endpoints);
+    ctx.guards = (0, guards_1.createGuards)(ctx);
+    ctx.alerts = (0, alerts_1.createAlerts)(ctx, alertIntervalMs);
+    settings.onChange(() => ctx.bridges.kick());
+    emergency.onChange((state, previous) => {
+        console.log(`[agent-gateway] Emergency mode: ${previous.mode} -> ${state.mode}${state.changedBy ? ` (by ${state.changedBy})` : ""}`);
+        // "!" key = send exactly once per change, across all processes.
+        ctx.alerts.event("emergency", `!${state.changedAt ?? Date.now()}`, `Gateway mode changed: ${(0, protection_1.modeLabel)(state.mode)}`, [
+            `By ${state.changedBy ?? "unknown"}${state.reason ? `: ${state.reason}` : ""}`,
+            state.mode === "normal" ? "Agent traffic is flowing under your normal rules again." : "Send /resume (Telegram) or use the dashboard to return to normal.",
+        ]);
+    });
+    // Background workers start once the database is ready (Telegram / Slack idle until configured).
+    let closed = false;
+    ready.then(() => {
+        if (closed)
+            return;
+        ctx.bridges.start();
+        emergency.start();
+        ctx.alerts.start();
+    }, () => undefined);
+    const mcp = (0, toolGuard_1.createMcpGuard)(ctx);
     // Periodic cleanup of limiter maps and expired sessions.
     const cleanupTimer = setInterval(() => {
         limiters.sweep();
@@ -126,6 +211,8 @@ function createAgentGateway(options = {}) {
             .run(`UPDATE pending_actions SET status = 'EXPIRED', encrypted_payload = NULL
          WHERE status IN ('PENDING', 'FAILED') AND expires_at IS NOT NULL AND expires_at <= ?`, [now])
             .catch(quiet);
+        // Budget / duplicate ledger: the longest window is 30 days.
+        void db.run("DELETE FROM guard_ledger WHERE ts < ?", [now - 31 * 24 * 3600000]).catch(quiet);
         // Decided/expired approvals hold request bodies: keep only the newest N so the table cannot grow forever.
         void db
             .run(`DELETE FROM pending_actions
@@ -140,11 +227,29 @@ function createAgentGateway(options = {}) {
         agentGateway: (0, interceptor_1.createInterceptor)(ctx),
         adminRouter: (0, adminRouter_1.createAdminRouter)(ctx),
         discoveryRouter: (0, discovery_1.createDiscoveryRouter)(ctx),
+        approvalCallbackRouter: (0, approvalCallback_1.createApprovalCallbackRouter)(ctx),
+        mcp,
         adminListener,
         ready,
-        close: () => {
+        close: async () => {
+            if (closed)
+                return db.close();
+            closed = true;
             clearInterval(cleanupTimer);
-            return db.close();
+            emergency.stop();
+            ctx.alerts.stop();
+            await ctx.bridges.stop();
+            // Held MCP calls die with this process: make sure they can never be approved later.
+            for (const id of [...ctx.mcpWaiters.keys()]) {
+                await db
+                    .run("UPDATE pending_actions SET status = 'EXPIRED', encrypted_payload = NULL, response_preview = ? WHERE id = ? AND status = 'PENDING'", [
+                    "Expired: the gateway shut down while this MCP tool call was waiting; it was never executed.",
+                    id,
+                ])
+                    .catch(() => undefined);
+            }
+            ctx.mcpWaiters.clear();
+            await db.close();
         },
     };
 }

@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.UNSAVED_HEADERS = exports.NEVER_FORWARD = exports.HOP_BY_HOP = exports.OTP_ALPHABET = exports.RULE_METHODS = exports.SENSITIVE_QUERY_KEYS = exports.REDACTED = exports.SENSITIVE_KEYS = exports.BASE62 = exports.HEADER_NAME_REGEX = exports.SSO_USERNAME_REGEX = exports.USERNAME_REGEX = exports.NO_BODY_METHODS = exports.DEFAULT_CONFIG = exports.MAX_LOG_UA_LENGTH = exports.MAX_LOG_PATH_LENGTH = exports.MAX_DECIDED_PENDING_ROWS = exports.MAX_PENDING_DISPLAY_CHARS = exports.MAX_PENDING_BODY_BYTES = exports.MAX_PENDING_ACTIONS = exports.MAX_TRACKED_IPS = exports.JSON_BODY_LIMIT = exports.LOGIN_MAX_FAILURES_PER_USER = exports.MAX_RULE_PATH_LENGTH = exports.MAX_CONCURRENT_SCRYPT = exports.MAX_LOG_ROWS = exports.SESSION_TOUCH_INTERVAL_MS = exports.OTP_TTL_MS = exports.PENDING_TTL_MS = exports.MAX_HOPS = exports.MAX_UPSTREAM_BYTES = exports.UPSTREAM_TIMEOUT_MS = exports.SESSION_TTL_MS = exports.LOGIN_MAX_FAILURES = exports.LOGIN_WINDOW_MS = exports.RATE_WINDOW_MS = exports.SETUP_TOKEN_HEADER = exports.AGENT_KEY_PREFIX = exports.AGENT_KEY_HEADER = exports.HOPS_HEADER = exports.SSO_SECRET_HEADER = exports.REPLAY_HEADER = exports.RULE_MODES = void 0;
+exports.OTP_ALPHABET = exports.MCP_TOOL_PATH_PREFIX = exports.MCP_RULE_METHOD = exports.RULE_METHODS = exports.SENSITIVE_QUERY_KEYS = exports.REDACTED = exports.SENSITIVE_KEYS = exports.BASE62 = exports.HEADER_NAME_REGEX = exports.SSO_USERNAME_REGEX = exports.USERNAME_REGEX = exports.NO_BODY_METHODS = exports.DEFAULT_CONFIG = exports.CALLBACK_MAX_FAILURES = exports.MAX_NOTIFY_PAYLOAD_CHARS = exports.ROLLBACK_TIMEOUT_MS = exports.NOTIFY_TIMEOUT_MS = exports.APPROVAL_CALLBACK_PREFIX = exports.MAX_AGENT_REASON_LENGTH = exports.AGENT_REASON_HEADER = exports.DB_OPERATION_TIMEOUT_MS = exports.MAX_LOG_UA_LENGTH = exports.MAX_LOG_PATH_LENGTH = exports.MAX_DECIDED_PENDING_ROWS = exports.MAX_PENDING_DISPLAY_CHARS = exports.MAX_PENDING_BODY_BYTES = exports.MAX_PENDING_ACTIONS = exports.MAX_TRACKED_IPS = exports.JSON_BODY_LIMIT = exports.LOGIN_MAX_FAILURES_PER_USER = exports.MAX_RULE_PATH_LENGTH = exports.MAX_CONCURRENT_SCRYPT = exports.MAX_LOG_ROWS = exports.SESSION_TOUCH_INTERVAL_MS = exports.OTP_TTL_MS = exports.PENDING_TTL_MS = exports.MAX_HOPS = exports.MAX_UPSTREAM_BYTES = exports.UPSTREAM_TIMEOUT_MS = exports.SESSION_TTL_MS = exports.LOGIN_MAX_FAILURES = exports.LOGIN_WINDOW_MS = exports.RATE_WINDOW_MS = exports.SETUP_TOKEN_HEADER = exports.AGENT_KEY_PREFIX = exports.AGENT_KEY_HEADER = exports.HOPS_HEADER = exports.SSO_SECRET_HEADER = exports.REPLAY_HEADER = exports.RULE_MODES = void 0;
+exports.UNSAVED_HEADERS = exports.NEVER_FORWARD = exports.HOP_BY_HOP = void 0;
 exports.RULE_MODES = ["ALLOW", "BLOCK", "REQUIRE_APPROVAL"];
 // The header NAME is fixed. Its VALUE is a random secret created per gateway
 // instance, so an outside caller cannot bypass the gateway by adding the header.
@@ -33,6 +34,15 @@ exports.MAX_PENDING_DISPLAY_CHARS = 32 * 1024; // redacted copy shown to approve
 exports.MAX_DECIDED_PENDING_ROWS = 5000; // retention for decided/expired approvals
 exports.MAX_LOG_PATH_LENGTH = 2048;
 exports.MAX_LOG_UA_LENGTH = 256;
+// v1.1: fail-closed, approvals, notifications
+exports.DB_OPERATION_TIMEOUT_MS = 4000; // a hung/locked SQLite op fails the request closed after this
+exports.AGENT_REASON_HEADER = "x-agent-reason";
+exports.MAX_AGENT_REASON_LENGTH = 1000;
+exports.APPROVAL_CALLBACK_PREFIX = "/_mont/approvals";
+exports.NOTIFY_TIMEOUT_MS = 5000;
+exports.ROLLBACK_TIMEOUT_MS = 10000;
+exports.MAX_NOTIFY_PAYLOAD_CHARS = 2500;
+exports.CALLBACK_MAX_FAILURES = 20; // bad signatures per IP per 15 minutes before lockout
 exports.DEFAULT_CONFIG = {
     targetUrl: "",
     rateLimitPerMinute: 60,
@@ -59,7 +69,10 @@ exports.REDACTED = "[REDACTED]";
 exports.SENSITIVE_QUERY_KEYS = ["token", "key", "secret", "password", "apikey", "auth"];
 // Methods a rule key can be pinned to ("POST /api/flights"). A key without a
 // method ("/api/flights") applies to every method that has no pinned rule.
-exports.RULE_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+// "MCP" is a pseudo-method for MCP tools/call rules ("MCP /api/mcp/tools/<tool>"); no HTTP request can carry it.
+exports.RULE_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "MCP"];
+exports.MCP_RULE_METHOD = "MCP";
+exports.MCP_TOOL_PATH_PREFIX = "/api/mcp/tools/";
 exports.OTP_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 // Hop-by-hop headers must never be forwarded by a proxy.
 exports.HOP_BY_HOP = new Set([

@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Filter, Plus, Search, X } from 'lucide-react'
+import { Download, Filter, Plus, Search, ShieldOff, X } from 'lucide-react'
 import { api, errorMessage } from '../lib/api'
 import { useDebouncedValue } from '../hooks/useDebouncedValue'
 import type { RulesApi } from '../hooks/useRules'
-import type { LogRow, Rules } from '../lib/types'
+import type { LogRow, RevokeResponse, Rules } from '../lib/types'
 import { formatTime, hasRule, INPUT_CLASS, READ_ONLY_HINT, ruleKey, suggestedMode } from '../lib/utils'
-import { Badge, ErrorBanner, LOG_TONES, MethodBadge, PageHeader, RefreshButton, Spinner } from '../components/ui'
+import { Badge, ErrorBanner, LOG_TONES, MethodBadge, PageHeader, RefreshButton, Spinner, SuccessBanner } from '../components/ui'
+import { RevokeModal } from '../components/RevokeModal'
+import type { RevokeTarget } from '../components/RevokeModal'
 
 
 export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: boolean }) {
@@ -14,6 +16,9 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [adding, setAdding] = useState<Set<string>>(new Set())
+  const [revokeTarget, setRevokeTarget] = useState<RevokeTarget | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [exporting, setExporting] = useState(false)
   const requestId = useRef(0)
 
   // Filter state
@@ -102,15 +107,68 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
     }
   }
 
+  // Revocations are logged as BLOCKED rows that point at the same action.
+  const revokedActions = new Set(
+    logs.filter((l) => l.status === 'BLOCKED' && l.action_id && l.detail?.startsWith('Revoked approval')).map((l) => l.action_id as number)
+  )
+
+  async function exportCsv() {
+    setExporting(true)
+    try {
+      const params: Record<string, string> = {}
+      if (statusFilter) params.status = statusFilter
+      if (methodFilter) params.method = methodFilter
+      if (fromFilter) params.from = new Date(fromFilter).toISOString()
+      if (toFilter) params.to = new Date(toFilter).toISOString()
+      const res = await api.get<Blob>('/logs/export.csv', { params, responseType: 'blob' })
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `mont-audit-${new Date().toISOString().slice(0, 10)}.csv`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError(`Could not export: ${errorMessage(err)}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  function onRevoked(result: RevokeResponse) {
+    setRevokeTarget(null)
+    const blocked = result.blocked.map((b) => `${b.kind === 'ip' ? 'IP' : 'agent key'} ${b.label ?? b.value}`).join(' and ')
+    setNotice(
+      `Approval #${result.id} revoked. Blocked ${blocked || 'the caller'}; auto-rejected ${result.autoRejected.length} queued request(s); rollback webhook: ${result.rollbackStatus}.`
+    )
+    void load()
+  }
+
   return (
     <>
       <PageHeader
         title="Audit Logs"
-        subtitle="Inspect and filter agent traffic by status, HTTP method, endpoint path, and timestamp."
-        action={<RefreshButton onClick={() => void refreshAll()} loading={loading} />}
+        subtitle="Inspect and filter agent traffic. Revoke any approved action and block its caller in one click."
+        action={
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => void exportCsv()}
+              disabled={exporting}
+              title="Download the filtered audit log as CSV (for accounting or chargeback disputes)"
+              className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:opacity-60"
+            >
+              {exporting ? <Spinner /> : <Download className="h-4 w-4" aria-hidden="true" />}
+              Export CSV
+            </button>
+            <RefreshButton onClick={() => void refreshAll()} loading={loading} />
+          </div>
+        }
       />
 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {notice && <SuccessBanner message={notice} onDismiss={() => setNotice(null)} />}
 
       <div className="mb-5 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
         <div className="mb-3 flex items-center justify-between">
@@ -218,7 +276,7 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
           <table className="min-w-full divide-y divide-slate-200">
             <thead className="bg-slate-50">
               <tr>
-                {['Timestamp', 'Path', 'Status', 'Method'].map((h) => (
+                {['Timestamp', 'Path', 'Status', 'Method', 'Actions'].map((h) => (
                   <th
                     key={h}
                     scope="col"
@@ -233,7 +291,7 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
               {loading ? (
                 [0, 1, 2, 3, 4].map((i) => (
                   <tr key={i} className="animate-pulse">
-                    {[40, 48, 24, 16].map((w, j) => (
+                    {[40, 48, 24, 16, 20].map((w, j) => (
                       <td key={j} className="px-6 py-4">
                         <div className="h-4 rounded bg-slate-200" style={{ width: `${w * 3}px` }} />
                       </td>
@@ -242,7 +300,7 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
                 ))
               ) : logs.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="px-6 py-16 text-center text-sm text-slate-500">
+                  <td colSpan={5} className="px-6 py-16 text-center text-sm text-slate-500">
                     {hasActiveFilters ? 'No audit logs match the selected filters.' : 'No requests logged yet.'}
                   </td>
                 </tr>
@@ -284,6 +342,36 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
                       <td className="whitespace-nowrap px-6 py-3.5">
                         <MethodBadge method={log.method} />
                       </td>
+                      <td className="whitespace-nowrap px-6 py-3.5">
+                        {log.status === 'APPROVED' && log.action_id ? (
+                          revokedActions.has(log.action_id) ? (
+                            <span className="text-xs font-medium text-red-700">Revoked</span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setRevokeTarget({
+                                  actionId: log.action_id as number,
+                                  method: log.method,
+                                  path: log.path,
+                                  agentKey: log.agent_key,
+                                  callerIp: log.caller_ip,
+                                })
+                              }
+                              disabled={readOnly}
+                              title={readOnly ? READ_ONLY_HINT : 'Block the caller, reject its queued requests and fire the rollback webhook'}
+                              className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50 px-2 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              <ShieldOff className="h-3 w-3" aria-hidden="true" />
+                              Revoke &amp; Block
+                            </button>
+                          )
+                        ) : log.detail ? (
+                          <span className="block max-w-[16rem] truncate text-xs text-slate-500" title={log.detail}>
+                            {log.detail}
+                          </span>
+                        ) : null}
+                      </td>
                     </tr>
                   )
                 })
@@ -292,6 +380,8 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
           </table>
         </div>
       </div>
+
+      {revokeTarget && <RevokeModal target={revokeTarget} onClose={() => setRevokeTarget(null)} onDone={onRevoked} />}
     </>
   )
 }

@@ -12,7 +12,15 @@
  *
  *   app.use(gateway.discoveryRouter);                 // GET /.well-known/agent.json
  *   app.use("/api/agent-admin", gateway.adminRouter); // admin API (mount BEFORE the gateway)
+ *   app.use(gateway.approvalCallbackRouter);          // signed phone Approve/Reject links (/_mont/approvals/*)
  *   app.use("/api", gateway.agentGateway);            // the interceptor
+ *
+ * Standalone reverse proxy (no code): `npx agent-gateway-sdk start --target https://api.example.com`
+ *
+ * rules.json payload policies (v1.1), first matching tier wins, else the rule's mode:
+ *   "POST /api/refund": { "mode": "REQUIRE_APPROVAL", "policies": [
+ *     { "name": "small", "when": [{ "field": "body.amount", "op": "<=", "value": 100 }], "mode": "ALLOW" },
+ *     { "name": "huge",  "when": [{ "field": "body.amount", "op": ">",  "value": 1000 }], "mode": "BLOCK" } ] }
  *
  *   // Optional: serve the admin API + dashboard on their own listener
  *   if (gateway.adminListener) { ...mount adminRouter on a second app and listen(adminListener.port, adminListener.host) }
@@ -34,12 +42,28 @@
  *                              ssoSharedSecret is generated; the proxy must send it as
  *                              x-gateway-sso-secret.
  */
-export { createAgentGateway } from "./core";
+export {
+  createAgentGateway,
+  evaluateRule,
+  validatePolicies,
+  signWebhookBody,
+  readPersistedListenPort,
+  createRedactor,
+  POLICY_PRESETS,
+  applyPreset,
+} from "./core";
+export type { Redactor, McpGuard, GuardResult, WaitResult, ToolCallRequest } from "./core";
+export { createMcpHttpProxy, startMcpStdioProxy, gateToolCall } from "./mcpProxy";
+export type { McpHttpProxyOptions, McpStdioProxyOptions, McpStdioProxy } from "./mcpProxy";
 export type {
   AgentGateway,
   AgentGatewayOptions,
   AuthUser,
   GatewayConfig,
+  GatewaySettings,
+  PolicyCondition,
+  PolicyOperator,
+  PolicyTier,
   Rule,
   RuleMode,
   Rules,

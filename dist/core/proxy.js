@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.UpstreamTooLargeError = void 0;
+exports.ClientAbortedError = exports.UpstreamTooLargeError = void 0;
 exports.isTimeoutError = isTimeoutError;
 exports.readCapped = readCapped;
 exports.proxyToTarget = proxyToTarget;
@@ -19,6 +19,14 @@ class UpstreamTooLargeError extends Error {
     }
 }
 exports.UpstreamTooLargeError = UpstreamTooLargeError;
+/** Raised when the agent's own connection closes before the upstream answered. */
+class ClientAbortedError extends Error {
+    constructor() {
+        super("The client disconnected before the upstream responded.");
+        this.name = "ClientAbortedError";
+    }
+}
+exports.ClientAbortedError = ClientAbortedError;
 function isTimeoutError(err) {
     const name = err?.name;
     return name === "TimeoutError" || name === "AbortError";
@@ -48,6 +56,16 @@ async function readCapped(upstream, max = constants_1.MAX_UPSTREAM_BYTES) {
     }
     return Buffer.concat(chunks);
 }
+/**
+ * Forwards an ALLOWED request to targetUrl.
+ *
+ * Fail-closed behaviour:
+ *   - Nothing is sent upstream if the client has already disconnected.
+ *   - If the client disconnects while the upstream call is in flight, the upstream call is aborted.
+ *   - The whole upstream response is read (and size-capped) BEFORE any status or header is
+ *     written, so an upstream that dies mid-response becomes a clean 502/504, never a
+ *     truncated 200 that an agent could mistake for success.
+ */
 async function proxyToTarget(req, res, targetUrl, config) {
     const url = targetUrl + req.originalUrl;
     // Identity headers (the standard ones plus whatever this install configured for
@@ -69,17 +87,32 @@ async function proxyToTarget(req, res, targetUrl, config) {
     const hops = Number.parseInt(req.get(constants_1.HOPS_HEADER) ?? "0", 10);
     headers.set(constants_1.HOPS_HEADER, String((Number.isFinite(hops) && hops > 0 ? hops : 0) + 1));
     const body = (0, utils_1.extractBody)(req);
+    // Abort the upstream call if the agent goes away mid-request.
+    const clientAbort = new AbortController();
+    const onClose = () => {
+        if (!res.writableFinished)
+            clientAbort.abort(new ClientAbortedError());
+    };
+    res.once("close", onClose);
+    // req.destroyed is true once the body was consumed, so check the socket instead.
+    const clientGone = () => Boolean(req.socket?.destroyed) || res.destroyed || res.headersSent || res.writableEnded;
+    if (clientGone()) {
+        res.off("close", onClose);
+        return;
+    }
     try {
         const upstream = await fetch(url, {
             method: req.method,
             headers,
             body: body ?? undefined,
             redirect: "manual",
-            signal: AbortSignal.timeout(constants_1.UPSTREAM_TIMEOUT_MS),
+            signal: AbortSignal.any([AbortSignal.timeout(constants_1.UPSTREAM_TIMEOUT_MS), clientAbort.signal]),
         });
         // Read (and size-check) the whole body before committing to a status, so an
         // oversized or broken response can still become a clean 502/504.
         const payload = await readCapped(upstream);
+        if (clientGone())
+            return;
         res.status(upstream.status);
         upstream.headers.forEach((value, key) => {
             if (!SKIP_RESPONSE_HEADERS.has(key.toLowerCase()))
@@ -92,8 +125,16 @@ async function proxyToTarget(req, res, targetUrl, config) {
         res.send(payload);
     }
     catch (err) {
-        if (res.headersSent)
+        if (clientAbort.signal.aborted) {
+            console.error("Proxy aborted: the client disconnected mid-request:", url);
+            if (!res.headersSent)
+                res.destroy();
             return;
+        }
+        if (res.headersSent) {
+            res.destroy();
+            return;
+        }
         if (isTimeoutError(err)) {
             console.error("Proxy timeout:", url);
             (0, utils_1.sendError)(res, 504, "Gateway Timeout", "The target server did not respond in time.");
@@ -103,7 +144,10 @@ async function proxyToTarget(req, res, targetUrl, config) {
         }
         else {
             console.error("Proxy error:", err);
-            (0, utils_1.sendError)(res, 502, "Bad Gateway", "Could not reach the target server.");
+            (0, utils_1.sendError)(res, 502, "Bad Gateway", "Could not reach the target server, or it failed mid-response.");
         }
+    }
+    finally {
+        res.off("close", onClose);
     }
 }

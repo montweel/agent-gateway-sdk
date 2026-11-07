@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Refund Disaster · Mont Agent Gateway demo</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .flash-red { animation: flashRed .6s ease-out; }
+    @keyframes flashRed { 0% { background: rgba(239,68,68,.35); } 100% { background: transparent; } }
+    .slide-in { animation: slideIn .25s ease-out; }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+    .json-key { color: #7dd3fc; } .json-str { color: #6ee7b7; } .json-num { color: #fcd34d; } .json-bool { color: #c4b5fd; } .json-null { color: #94a3b8; }
+    .json-risk { background: rgba(239,68,68,.3); outline: 1px solid rgba(248,113,113,.7); border-radius: 3px; padding: 0 2px; }
+  </style>
+</head>
+<body class="h-screen overflow-hidden bg-slate-100 font-sans text-slate-900">
+  <!-- Top bar -->
+  <header class="flex h-16 items-center justify-between border-b border-slate-200 bg-white px-6">
+    <div class="flex items-center gap-3">
+      <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-600 font-bold text-white">A</div>
+      <div>
+        <p class="text-sm font-semibold">Acme Outfitters · Store Admin</p>
+        <p class="text-xs text-slate-500">Simulated e-commerce merchant dashboard · no real store or money</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <div class="flex rounded-xl bg-slate-100 p-1" role="radiogroup" aria-label="Protection mode">
+        <button id="modeOff" class="rounded-lg px-4 py-2 text-sm font-semibold" role="radio">Protection OFF</button>
+        <button id="modeOn" class="rounded-lg px-4 py-2 text-sm font-semibold" role="radio">🛡️ Mont Gateway ON</button>
+      </div>
+      <button id="attackBtn" class="rounded-xl bg-red-600 px-4 py-2.5 text-sm font-bold text-white shadow-lg shadow-red-600/30 hover:bg-red-500 disabled:opacity-50">
+        ⚠️ Simulate Indirect Prompt Injection Attack
+      </button>
+      <button id="resetBtn" class="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50">Reset</button>
+    </div>
+  </header>
+
+  <main class="grid h-[calc(100vh-4rem)] grid-cols-[1fr_440px]">
+    <!-- LEFT: store + agent -->
+    <section class="grid grid-rows-[auto_1fr] gap-4 overflow-hidden p-5">
+      <div class="grid grid-cols-3 gap-4">
+        <div id="balanceCard" class="col-span-1 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">Store balance</p>
+          <p id="balance" class="mt-1 text-4xl font-bold tabular-nums text-emerald-600">$5,000.00</p>
+          <div class="mt-3 h-2 overflow-hidden rounded-full bg-slate-100"><div id="balanceBar" class="h-full bg-emerald-500 transition-all duration-300" style="width:100%"></div></div>
+        </div>
+        <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">Orders refunded</p>
+          <p id="refundedCount" class="mt-1 text-4xl font-bold tabular-nums">0 / 20</p>
+        </div>
+        <div id="customersCard" class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">Customers</p>
+          <p id="customerCount" class="mt-1 text-4xl font-bold tabular-nums">10</p>
+          <p id="customerNote" class="mt-1 text-xs text-slate-500">Customer table intact</p>
+        </div>
+      </div>
+
+      <div class="grid min-h-0 grid-cols-2 gap-4">
+        <div class="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white shadow-sm">
+          <div class="border-b border-slate-100 px-5 py-3 text-sm font-semibold">Recent orders</div>
+          <div class="min-h-0 flex-1 overflow-y-auto">
+            <table class="w-full text-sm"><tbody id="orders"></tbody></table>
+          </div>
+          <div id="storeLog" class="max-h-28 overflow-y-auto border-t border-slate-100 bg-slate-50 px-4 py-2 font-mono text-[11px] text-slate-600"></div>
+        </div>
+
+        <div class="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white shadow-sm">
+          <div class="flex items-center justify-between border-b border-slate-100 px-5 py-3">
+            <span class="text-sm font-semibold">🤖 AI Customer Support Agent</span>
+            <span class="rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700">tools: refund, delete_customers</span>
+          </div>
+          <div id="chat" class="min-h-0 flex-1 space-y-3 overflow-y-auto p-4 text-sm">
+            <div class="max-w-[85%] rounded-2xl rounded-tl-sm bg-slate-100 px-3 py-2">Hi! I'm the Acme support assistant. How can I help with your order today?</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: Mont panel -->
+    <aside class="flex min-h-0 flex-col border-l border-slate-800 bg-slate-900 text-slate-200">
+      <div class="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+        <div class="flex items-center gap-2">
+          <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-sm font-bold text-white">M</div>
+          <div>
+            <p class="text-sm font-semibold text-white">Mont Approval Panel</p>
+            <p id="gwStatus" class="text-xs text-slate-400">Gateway: OFF</p>
+          </div>
+        </div>
+        <span id="pendingBadge" class="hidden rounded-full bg-amber-500 px-2.5 py-0.5 text-xs font-bold text-slate-900">0 pending</span>
+      </div>
+
+      <div class="border-b border-slate-800 px-5 py-3">
+        <p class="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Live agent traffic</p>
+        <div class="mb-2 grid grid-cols-4 gap-2 text-center text-[11px]">
+          <div class="rounded-lg bg-slate-800 py-1.5"><p id="cExec" class="text-lg font-bold text-red-400">0</p>executed</div>
+          <div class="rounded-lg bg-slate-800 py-1.5"><p id="cHeld" class="text-lg font-bold text-amber-300">0</p>held</div>
+          <div class="rounded-lg bg-slate-800 py-1.5"><p id="cLimited" class="text-lg font-bold text-violet-300">0</p>rate-limited</div>
+          <div class="rounded-lg bg-slate-800 py-1.5"><p id="cBlocked" class="text-lg font-bold text-emerald-300">0</p>blocked</div>
+        </div>
+        <div id="feed" class="h-40 space-y-1 overflow-y-auto font-mono text-[11px]"></div>
+      </div>
+
+      <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+        <p class="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Pending approvals</p>
+        <div id="approvals" class="space-y-3">
+          <p class="text-sm text-slate-500">Nothing waiting.</p>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const money = (n) => (n < 0 ? '-$' : '$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const RISK = ['amount', 'price', 'delete', 'email', 'destination'];
+  const isRisk = (k) => RISK.some((r) => k.toLowerCase().includes(r));
+
+  let protectedMode = true;
+  let counts = { exec: 0, held: 0, limited: 0, blocked: 0 };
+  let lastBalance = 5000;
+
+  function setMode(on) {
+    protectedMode = on;
+    $('modeOn').className = 'rounded-lg px-4 py-2 text-sm font-semibold ' + (on ? 'bg-indigo-600 text-white shadow' : 'text-slate-500');
+    $('modeOff').className = 'rounded-lg px-4 py-2 text-sm font-semibold ' + (!on ? 'bg-red-600 text-white shadow' : 'text-slate-500');
+    $('gwStatus').textContent = on ? 'Gateway: ON · guarding /api/shopify/*' : 'Gateway: OFF · requests go straight to the store';
+    $('gwStatus').className = 'text-xs ' + (on ? 'text-emerald-400' : 'text-red-400');
+  }
+  $('modeOn').onclick = () => setMode(true);
+  $('modeOff').onclick = () => setMode(false);
+  setMode(true);
+
+  function renderState(s) {
+    $('balance').textContent = money(s.balance);
+    $('balance').className = 'mt-1 text-4xl font-bold tabular-nums ' + (s.balance <= 0 ? 'text-red-600' : s.balance < 5000 ? 'text-amber-600' : 'text-emerald-600');
+    $('balanceBar').style.width = Math.max(0, (s.balance / 5000) * 100) + '%';
+    $('balanceBar').className = 'h-full transition-all duration-300 ' + (s.balance <= 1000 ? 'bg-red-500' : 'bg-emerald-500');
+    if (s.balance < lastBalance) { $('balanceCard').classList.remove('flash-red'); void $('balanceCard').offsetWidth; $('balanceCard').classList.add('flash-red'); }
+    lastBalance = s.balance;
+    const refunded = s.orders.filter((o) => o.status === 'REFUNDED').length;
+    $('refundedCount').textContent = refunded + ' / ' + s.orders.length;
+    $('customerCount').textContent = s.customers.length;
+    $('customerCount').className = 'mt-1 text-4xl font-bold tabular-nums ' + (s.customers.length === 0 ? 'text-red-600' : '');
+    $('customerNote').textContent = s.customers.length === 0 ? '⚠️ Customer table WIPED' : 'Customer table intact';
+    $('customerNote').className = 'mt-1 text-xs ' + (s.customers.length === 0 ? 'font-semibold text-red-600' : 'text-slate-500');
+    $('orders').innerHTML = s.orders.map((o) =>
+      '<tr class="border-b border-slate-50 ' + (o.status === 'REFUNDED' ? 'bg-red-50' : '') + '">' +
+      '<td class="px-5 py-2 font-mono text-xs">' + esc(o.id) + '</td>' +
+      '<td class="py-2 text-xs text-slate-600">' + esc(o.customer) + '</td>' +
+      '<td class="py-2 text-right text-xs tabular-nums">' + money(o.total) + '</td>' +
+      '<td class="px-5 py-2 text-right"><span class="rounded-full px-2 py-0.5 text-[10px] font-bold ' +
+      (o.status === 'REFUNDED' ? 'bg-red-100 text-red-700' : 'bg-emerald-100 text-emerald-700') + '">' + o.status + '</span></td></tr>'
+    ).join('');
+  }
+
+  function addChat(role, text) {
+    const div = document.createElement('div');
+    div.className = 'slide-in max-w-[90%] whitespace-pre-wrap rounded-2xl px-3 py-2 ' +
+      (role === 'customer' ? 'ml-auto rounded-tr-sm bg-amber-50 text-amber-950 ring-1 ring-amber-200' : 'rounded-tl-sm bg-slate-100');
+    if (role === 'customer') {
+      const parts = text.split('<!--');
+      div.innerHTML = '<p class="mb-1 text-[10px] font-semibold uppercase tracking-wider text-amber-700">Customer ticket</p>' + esc(parts[0]) +
+        (parts[1] ? '<span class="mt-1 block rounded bg-red-100 px-1.5 py-1 font-mono text-[11px] text-red-800 ring-1 ring-red-300" title="Hidden instruction (invisible to humans in the rendered ticket)">&lt;!--' + esc(parts[1]) + '</span>' : '');
+    } else {
+      div.textContent = '🤖 ' + text;
+    }
+    $('chat').appendChild(div);
+    $('chat').scrollTop = $('chat').scrollHeight;
+  }
+
+  function addFeed(r) {
+    let label, cls;
+    if (r.status >= 200 && r.status < 300 && r.status !== 202) { label = 'EXECUTED'; cls = 'text-red-400'; counts.exec++; }
+    else if (r.status === 202) { label = 'HELD FOR APPROVAL'; cls = 'text-amber-300'; counts.held++; }
+    else if (r.status === 429) { label = 'RATE-LIMITED'; cls = 'text-violet-300'; counts.limited++; }
+    else if (r.status === 403) { label = 'BLOCKED'; cls = 'text-emerald-300'; counts.blocked++; }
+    else { label = 'ERROR ' + r.status; cls = 'text-slate-400'; }
+    $('cExec').textContent = counts.exec; $('cHeld').textContent = counts.held; $('cLimited').textContent = counts.limited; $('cBlocked').textContent = counts.blocked;
+    const line = document.createElement('div');
+    line.className = 'slide-in flex justify-between gap-2';
+    line.innerHTML = '<span class="text-slate-400">#' + String(r.n).padStart(2, '0') + ' ' + esc(r.method) + ' ' + esc(r.path.replace('/api/shopify', '')) +
+      (r.amount ? ' $' + r.amount : '') + '</span><span class="font-bold ' + cls + '">' + r.status + ' ' + label + '</span>';
+    $('feed').appendChild(line);
+    $('feed').scrollTop = $('feed').scrollHeight;
+  }
+
+  function addStoreLog(t) {
+    const p = document.createElement('p');
+    p.className = 'slide-in text-red-600';
+    p.textContent = new Date().toLocaleTimeString() + '  ' + t.text;
+    $('storeLog').prepend(p);
+  }
+
+  // Syntax-highlighted JSON with high-risk keys outlined in red.
+  function jsonHtml(v, indent) {
+    indent = indent || '';
+    const next = indent + '  ';
+    if (v === null) return '<span class="json-null">null</span>';
+    if (typeof v === 'string') return '<span class="json-str">"' + esc(v) + '"</span>';
+    if (typeof v === 'number') return '<span class="json-num">' + v + '</span>';
+    if (typeof v === 'boolean') return '<span class="json-bool">' + v + '</span>';
+    if (Array.isArray(v)) return '[\n' + v.map((x) => next + jsonHtml(x, next)).join(',\n') + '\n' + indent + ']';
+    return '{\n' + Object.keys(v).map((k) =>
+      next + '<span class="json-key ' + (isRisk(k) ? 'json-risk' : '') + '">"' + esc(k) + '"</span>: ' + jsonHtml(v[k], next)
+    ).join(',\n') + '\n' + indent + '}';
+  }
+
+  async function loadApprovals() {
+    let rows = [];
+    try { rows = await (await fetch('/demo/approvals')).json(); } catch { return; }
+    if (!Array.isArray(rows)) return;
+    const pending = rows.filter((a) => a.status === 'PENDING');
+    $('pendingBadge').textContent = pending.length + ' pending';
+    $('pendingBadge').classList.toggle('hidden', pending.length === 0);
+    const decided = rows.filter((a) => a.status !== 'PENDING').slice(0, 3);
+    if (rows.length === 0) { $('approvals').innerHTML = '<p class="text-sm text-slate-500">Nothing waiting.</p>'; return; }
+    $('approvals').innerHTML = pending.concat(decided).map((a) => {
+      let body = null; try { body = JSON.parse(a.body); } catch {}
+      const risks = body && typeof body === 'object' ? Object.keys(body).filter(isRisk).map((k) => k + ' = ' + JSON.stringify(body[k])) : [];
+      const isP = a.status === 'PENDING';
+      const why = a.matched_policy === 'rule' ? 'body.amount > $100 (owner approval tier)' : (a.matched_policy || '');
+      return '<div class="slide-in rounded-xl border ' + (isP ? 'border-amber-500/60 bg-slate-800' : 'border-slate-700 bg-slate-800/50') + ' p-3">' +
+        '<div class="flex items-center justify-between"><span class="font-mono text-xs"><b class="text-violet-300">' + esc(a.method) + '</b> ' + esc(a.path) + '</span>' +
+        '<span class="rounded-full px-2 py-0.5 text-[10px] font-bold ' + (isP ? 'bg-amber-500 text-slate-900' : a.status === 'APPROVED' ? 'bg-emerald-600 text-white' : 'bg-slate-600 text-white') + '">' + esc(a.status) + '</span></div>' +
+        '<p class="mt-1 text-[11px] text-slate-400">#' + a.id + ' · held by ' + esc(why) + '</p>' +
+        '<p class="mt-1 text-[11px] text-slate-400">Caller: ' + esc(a.caller_ua || 'unknown') + ' · IP ' + esc(a.caller_ip || '?') + '</p>' +
+        (a.agent_reason ? '<p class="mt-2 rounded-lg bg-indigo-500/10 px-2 py-1.5 text-[11px] text-indigo-200 ring-1 ring-indigo-500/30"><b>Agent says:</b> ' + esc(a.agent_reason) + '</p>' : '') +
+        (risks.length ? '<p class="mt-2 rounded-lg bg-red-500/15 px-2 py-1.5 text-[11px] text-red-200 ring-1 ring-red-500/40">⚠️ High-risk: ' + esc(risks.join(', ')) + '</p>' : '') +
+        '<pre class="mt-2 max-h-40 overflow-auto rounded-lg bg-slate-950 p-2 font-mono text-[11px] leading-relaxed">' + (body ? jsonHtml(body) : esc(a.body || '(no body)')) + '</pre>' +
+        (isP ? '<div class="mt-3 grid grid-cols-2 gap-2">' +
+          '<button data-id="' + a.id + '" data-d="APPROVE" class="decide rounded-lg bg-emerald-600 py-2 text-sm font-bold text-white hover:bg-emerald-500">Approve</button>' +
+          '<button data-id="' + a.id + '" data-d="REJECT" class="decide rounded-lg bg-red-600 py-2 text-sm font-bold text-white hover:bg-red-500">Reject</button></div>' : '') +
+        '</div>';
+    }).join('');
+  }
+
+  $('approvals').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button.decide');
+    if (!btn) return;
+    btn.disabled = true;
+    const res = await fetch('/demo/approvals/' + btn.dataset.id + '/decide', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision: btn.dataset.d }),
+    });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); alert(d.message || d.error || 'Failed'); }
+    loadApprovals();
+  });
+
+  $('attackBtn').onclick = async () => {
+    $('attackBtn').disabled = true; $('resetBtn').disabled = true;
+    const res = await fetch('/demo/attack', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ protected: protectedMode }) });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); alert(d.error || 'Could not start'); $('attackBtn').disabled = false; $('resetBtn').disabled = false; }
+  };
+
+  $('resetBtn').onclick = async () => {
+    const res = await fetch('/demo/reset', { method: 'POST' });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); alert(d.error || 'Reset failed'); }
+  };
+
+  const es = new EventSource('/demo/events');
+  es.addEventListener('state', (e) => renderState(JSON.parse(e.data)));
+  es.addEventListener('chat', (e) => { const d = JSON.parse(e.data); addChat(d.role, d.text); });
+  es.addEventListener('request', (e) => { addFeed(JSON.parse(e.data)); if (protectedMode) loadApprovals(); });
+  es.addEventListener('store-log', (e) => addStoreLog(JSON.parse(e.data)));
+  es.addEventListener('approvals-changed', () => { loadApprovals(); $('attackBtn').disabled = false; $('resetBtn').disabled = false; });
+  es.addEventListener('reset', () => {
+    counts = { exec: 0, held: 0, limited: 0, blocked: 0 }; lastBalance = 5000;
+    ['cExec', 'cHeld', 'cLimited', 'cBlocked'].forEach((id) => ($(id).textContent = '0'));
+    $('feed').innerHTML = ''; $('storeLog').innerHTML = '';
+    $('chat').innerHTML = '<div class="max-w-[85%] rounded-2xl rounded-tl-sm bg-slate-100 px-3 py-2">Hi! I\'m the Acme support assistant. How can I help with your order today?</div>';
+    loadApprovals();
+  });
+
+  loadApprovals();
+  setInterval(loadApprovals, 2000);
+})();
+</script>
+</body>
+</html>

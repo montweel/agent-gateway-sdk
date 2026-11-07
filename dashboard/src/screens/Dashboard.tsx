@@ -12,6 +12,8 @@ import { LogsTab } from '../tabs/LogsTab'
 import { AnalyticsTab } from '../tabs/AnalyticsTab'
 import { TeamTab } from '../tabs/TeamTab'
 import { SettingsTab } from '../tabs/SettingsTab'
+import { SetupTab } from '../tabs/SetupTab'
+import { EmergencyBar } from '../components/EmergencyBar'
  
 function ViewerBanner() {
   return (
@@ -83,6 +85,7 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
           onSignOut={onSignOut}
           onOpenPasswordModal={() => setShowPasswordModal(true)}
         />
+        <EmergencyBar readOnly={readOnly} />
         {licenseApi.license?.expired && <LicenseExpiredBanner license={licenseApi.license} onOpen={openLicense} />}
         {readOnly && <ViewerBanner />}
         <div className="mx-auto max-w-5xl px-10 py-8">
@@ -91,6 +94,7 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
           {tab === 'logs' && <LogsTab rulesApi={rulesApi} readOnly={readOnly} />}
           {tab === 'analytics' && <AnalyticsTab isPro={licenseApi.isPro} onOpenLicense={openLicense} />}
           {tab === 'team' && !readOnly && <TeamTab currentUser={user} />}
+          {tab === 'setup' && <SetupTab rulesApi={rulesApi} readOnly={readOnly} />}
           {tab === 'settings' && <SettingsTab readOnly={readOnly} licenseApi={licenseApi} />}
         </div>
       </main>

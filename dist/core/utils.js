@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.MAX_RULE_RATE_LIMIT = exports.PRO_REQUIRED_MESSAGE = exports.UPGRADE_URL = void 0;
+exports.HIGH_RISK_FIELDS = exports.DbTimeoutError = exports.MAX_RULE_RATE_LIMIT = exports.PRO_REQUIRED_MESSAGE = exports.UPGRADE_URL = void 0;
 exports.sendError = sendError;
 exports.sendProRequired = sendProRequired;
 exports.sendCaughtError = sendCaughtError;
@@ -17,8 +17,12 @@ exports.redactSensitive = redactSensitive;
 exports.ruleKey = ruleKey;
 exports.parseRuleKey = parseRuleKey;
 exports.redactQueryString = redactQueryString;
+exports.redactQueryObject = redactQueryObject;
 exports.isValidRuleRateLimit = isValidRuleRateLimit;
 exports.normalizeRule = normalizeRule;
+exports.withTimeout = withTimeout;
+exports.failClosed = failClosed;
+exports.findHighRiskFields = findHighRiskFields;
 exports.extractBody = extractBody;
 exports.extractRedactedBody = extractRedactedBody;
 exports.sanitizeHeaders = sanitizeHeaders;
@@ -27,6 +31,7 @@ exports.truncate = truncate;
 const fs_1 = __importDefault(require("fs"));
 const constants_1 = require("./constants");
 const crypto_1 = require("./crypto");
+const policy_1 = require("./policy");
 function sendError(res, status, error, message, extra) {
     res.status(status).json({ error, message, ...extra });
 }
@@ -230,6 +235,18 @@ function redactQueryString(url) {
         .join("&");
     return url.slice(0, q + 1) + redacted + url.slice(queryEnd);
 }
+/** Parsed query object with sensitive parameter values replaced by "[REDACTED]". */
+function redactQueryObject(query) {
+    const out = {};
+    if (typeof query !== "object" || query === null)
+        return out;
+    for (const [k, v] of Object.entries(query)) {
+        const name = k.toLowerCase().replace(/[_-]/g, "");
+        const sensitive = constants_1.SENSITIVE_QUERY_KEYS.some((s) => name === s || name.endsWith(s)) || isSensitiveKey(k);
+        out[k] = sensitive ? constants_1.REDACTED : redactSensitive(v);
+    }
+    return out;
+}
 exports.MAX_RULE_RATE_LIMIT = 1000000;
 function isValidRuleRateLimit(n) {
     return typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= exports.MAX_RULE_RATE_LIMIT;
@@ -247,9 +264,83 @@ function normalizeRule(value) {
         const rule = { mode, description: typeof v.description === "string" ? v.description : "" };
         if (isValidRuleRateLimit(v.rateLimit))
             rule.rateLimit = v.rateLimit;
+        const policies = (0, policy_1.normalizePolicies)(v.policies);
+        if (policies === "invalid") {
+            // Fail closed: a rule whose policies cannot be trusted is enforced as BLOCK.
+            return { ...rule, mode: "BLOCK", description: `${rule.description} [policies invalid: enforced as BLOCK]`.trim() };
+        }
+        if (policies)
+            rule.policies = policies;
+        const budget = (0, policy_1.validateBudget)(v.budget);
+        const dedupe = (0, policy_1.validateDedupe)(v.dedupe);
+        if (!budget.ok || !dedupe.ok) {
+            // Fail closed: a cap we cannot read must not silently disappear.
+            const message = !budget.ok ? budget.message : !dedupe.ok ? dedupe.message : "";
+            console.error(`Invalid budget/dedupe in rules.json (${message}); the rule is enforced as BLOCK.`);
+            return { ...rule, mode: "BLOCK", policies: undefined, description: `${rule.description} [guards invalid: enforced as BLOCK]`.trim() };
+        }
+        if (budget.value)
+            rule.budget = budget.value;
+        if (dedupe.value)
+            rule.dedupe = dedupe.value;
         return rule;
     }
     return null;
+}
+/** Thrown by withTimeout. The interceptor turns it into a fail-closed 503. */
+class DbTimeoutError extends Error {
+    constructor(label, ms) {
+        super(`${label} did not finish within ${ms} ms.`);
+        this.name = "DbTimeoutError";
+    }
+}
+exports.DbTimeoutError = DbTimeoutError;
+/** Rejects with DbTimeoutError when `promise` takes longer than `ms`. The original keeps running. */
+function withTimeout(promise, ms, label) {
+    let timer;
+    const timeout = new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new DbTimeoutError(label, ms)), ms);
+        timer.unref();
+    });
+    return Promise.race([promise, timeout]).finally(() => {
+        if (timer)
+            clearTimeout(timer);
+    });
+}
+/**
+ * The single exit for "something went wrong while deciding": the request is refused and
+ * never forwarded. 503 with Retry-After when we can still answer; if a response had already
+ * started, the connection is destroyed so the client cannot mistake a partial reply for success.
+ */
+function failClosed(res, context, err) {
+    console.error(`[agent-gateway] FAIL-CLOSED (${context}):`, err);
+    if (res.headersSent) {
+        res.destroy();
+        return;
+    }
+    res.setHeader("Retry-After", "5");
+    sendError(res, 503, "Service Unavailable", "The gateway could not safely evaluate this request, so it was refused and not forwarded. Retry shortly.");
+}
+/** Field names that the approval inspector and notifications flag as high-risk (substring, case-insensitive). */
+exports.HIGH_RISK_FIELDS = ["amount", "price", "delete", "email", "destination"];
+/** Dot paths (body.*) of every key in a JSON value that looks high-risk, with its value. */
+function findHighRiskFields(value, prefix = "body", depth = 0, out = []) {
+    if (depth > 12 || out.length >= 50)
+        return out;
+    if (Array.isArray(value)) {
+        value.forEach((v, i) => findHighRiskFields(v, `${prefix}.${i}`, depth + 1, out));
+    }
+    else if (typeof value === "object" && value !== null) {
+        for (const [k, v] of Object.entries(value)) {
+            const p = `${prefix}.${k}`;
+            const lower = k.toLowerCase();
+            if (exports.HIGH_RISK_FIELDS.some((r) => lower.includes(r)) && (typeof v !== "object" || v === null)) {
+                out.push({ path: p, value: v });
+            }
+            findHighRiskFields(v, p, depth + 1, out);
+        }
+    }
+    return out;
 }
 function extractBody(req) {
     if (constants_1.NO_BODY_METHODS.includes(req.method))

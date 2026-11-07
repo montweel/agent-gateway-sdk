@@ -113,6 +113,148 @@ npm start
 
 Open `http://127.0.0.1:3000/agent-admin/` to create the owner account (the first-boot setup key is printed in the console banner), set your **Target URL**, create your first agent API key, and add route rules.
 
+Or, with no clone at all:
+
+```bash
+npx agent-gateway-sdk start --target https://api.mystore.com
+# agents call  http://127.0.0.1:8080/api/...   admin console  http://127.0.0.1:3000/agent-admin/
+```
+
+---
+
+## v1.1: Payload Policies, Phone Approvals, Revoke & Kill-Switch
+
+**Fail-closed guarantee.** A request is forwarded only after every check passed *and* its audit row is durably written. SQLite errors, lock waits longer than `dbOperationTimeoutMs` (default 4 s), malformed JSON, policy evaluation errors and client disconnects all end in 4xx/503, never in `next()` or an upstream call. Upstream responses are fully read before anything is sent back, so an upstream that dies mid-response becomes a clean 502, not a truncated 200.
+
+**Payload policies.** Tiers on any rule inspect `body.*`, `query.*` and `headers.*` with `> < >= <= === !== contains in regex exists`. First matching tier wins; otherwise the rule's own mode applies. Body numbers are never coerced (`"250"` is not 250), and routes whose policies read the body only accept `application/json`.
+
+```json
+"POST /api/refund": {
+  "mode": "REQUIRE_APPROVAL",
+  "policies": [
+    { "name": "small", "when": [{ "field": "body.amount", "op": "<=", "value": 100 }],  "mode": "ALLOW" },
+    { "name": "huge",  "when": [{ "field": "body.amount", "op": ">",  "value": 1000 }], "mode": "BLOCK" }
+  ]
+}
+```
+
+**Payload inspector.** Pending approvals show the redacted body and query in a collapsible JSON tree with `amount`, `price`, `delete`, `email` and `destination` fields flagged, plus the caller's agent key, IP, User-Agent and the agent's `x-agent-reason` header.
+
+**Revoke & Block Caller.** On any approved action (Approvals or Audit Logs): blocks the agent key and/or IP in a persistent kill-switch list, auto-rejects that caller's queued requests, and optionally POSTs `{ "event": "approval.revoked", "originalRequestId", "method", "path", "body", ... }` to your rollback webhook (HMAC-signed `x-mont-signature`, `Idempotency-Key: mont-revoke-<id>`).
+
+**Phone approvals.** Slack, Telegram or a custom webhook receive every `REQUIRE_APPROVAL` request with a payload summary and HMAC-SHA256-signed Approve / Reject links (`/_mont/approvals/:id/confirm`). Links open a confirmation page; only the button press acts, so chat link previews can never approve anything. Configure it in the **Gateway Setup (No-Code)** tab, together with the upstream URL, listen port, rate limits and payload rules.
+
+Mount the link handler on your public app in middleware mode: `app.use(gateway.approvalCallbackRouter)`.
+
+**Try it:** `npm run demo:shopify` (simulated refund-injection demo, see `examples/shopify-refund-demo`) and `npm test` (fail-closed and chaos suite).
+
+---
+
+## v1.2: Zero-Tunnel Approvals, Policy Packs, PII Scrubber, MCP Proxy
+
+**Approve from your phone with no tunnel.** In **Gateway Setup → Approve from your phone**:
+- **Telegram (Buttons mode):** paste a @BotFather token and your chat id. Mont long-polls `getUpdates` *outbound* and sends Approve / Reject inline buttons, so you need no public URL, ngrok or open port.
+- **Slack (Socket Mode):** a Slack app with Socket Mode and Interactivity on, a bot token (`xoxb-`, `chat:write`), an app-level token (`xapp-`, `connections:write`) and a channel id.
+
+Each button carries an HMAC bound to that exact queued request. Taps are accepted only from the configured chat or channel and, optionally, only from listed approver user ids. If several gateway processes share one data folder, a SQLite lease makes sure only one of them polls.
+
+**1-click Starter Policy Packs** (Setup → Payload rules): *E-Commerce & Shopify*, *Stripe & FinTech*, *Internal CRUD*. Packs use the new `*` wildcard rule keys, e.g. `"POST /api/*refund*"` or `"DELETE /api/*"`. Precedence is exact key, then method wildcard, then any-method wildcard, with the more specific pattern winning. You can add a pack to your rules or replace them; everything else stays default-deny. API: `GET /api/agent-admin/setup/presets`, `POST /api/agent-admin/setup/presets/:id/apply {"mode":"merge"|"replace"}`.
+
+**PII & secret scrubber.** Nothing is written to SQLite or sent to Slack, Telegram or a webhook before it passes through it:
+- **Always removed:** auth headers, cookies, API keys, passwords, tokens, known key formats (Stripe, GitHub, Slack, AWS, JWT, Telegram, OpenAI/Anthropic) and Luhn-valid card numbers.
+- **On by default, can be switched off:** emails (`j***@example.com`) and phone numbers.
+
+Payload rules still evaluate the real values, and approved requests replay from the encrypted original.
+
+**MCP tool-call proxy.** Guards every JSON-RPC `tools/call` with the same rules, payload policies, rate limits, kill-switch, audit log and approvals:
+
+```bash
+# Streamable HTTP (clients connect to http://127.0.0.1:8090/mcp)
+npx agent-gateway-sdk mcp-http --upstream http://127.0.0.1:9000/mcp
+# stdio: use this as the "command" in your MCP client config
+npx agent-gateway-sdk mcp-stdio --data-dir ~/.mont -- npx -y @modelcontextprotocol/server-filesystem /data
+```
+
+```json
+"MCP /api/mcp/tools/search_orders": { "mode": "ALLOW" },
+"MCP /api/mcp/tools/refund_order":  { "mode": "REQUIRE_APPROVAL",
+  "policies": [{ "when": [{ "field": "body.amount", "op": "<=", "value": 100 }], "mode": "ALLOW" }] },
+"MCP /api/mcp/tools/*delete*":      { "mode": "BLOCK" }
+```
+
+How it behaves:
+- `params.arguments` is checked as `body.*`.
+- Tools without a rule are blocked. HTTP rules such as `/api/*` never apply to MCP tools.
+- Refusals come back as tool results with `isError: true`, so the model can read why the call didn't run.
+- A call that needs approval is held open until someone decides (default wait 5 minutes). If the wait runs out or the agent disconnects, the call expires and can never run later.
+- Approvals work from any gateway process sharing the data folder, from the dashboard, and from Telegram or Slack.
+
+Programmatic use: `createMcpHttpProxy(gateway, { upstreamUrl })`, `startMcpStdioProxy(gateway, { command, args })`, or `gateway.mcp.check(...)` for custom transports.
+
+---
+
+## v1.3: Shop-Owner Safety Kit
+
+Per-request limits stop one big bad action. These features stop the slow, repeated and after-hours ones, and keep you in control from your phone.
+
+### Spending budgets (cumulative caps)
+Twenty refunds of $90 each all pass an "amount ≤ $100" rule. A budget caps the **total** an agent can move on its own:
+
+```json
+"POST /api/*refund*": {
+  "mode": "ALLOW",
+  "budget": { "field": "body.amount", "max": 300, "windowMinutes": 60, "per": "global", "onExceed": "REQUIRE_APPROVAL" }
+}
+```
+
+- `per`: `"global"` (all agents together) or `"caller"` (each agent key or IP has its own allowance).
+- `onExceed`: what happens to a request that would go over the cap, either `REQUIRE_APPROVAL` or `BLOCK`.
+- A missing amount, or an amount sent as text, counts as over budget (fail-closed).
+- Approved requests count toward the budget too.
+- Budgets are stored in SQLite, so they survive restarts.
+- A burst of 50 concurrent requests can't overspend: each rule's check-and-record runs under a lock.
+- Live usage: dashboard top bar, `GET /api/agent-admin/guards/usage`, Telegram `/status`.
+
+### Duplicate-action protection
+```json
+"dedupe": { "fields": ["body.orderId"], "windowMinutes": 1440, "onDuplicate": "BLOCK" }
+```
+- Refuses (or holds for approval) a second action with the same field values while the first one is allowed, waiting, or executed. That stops looping agents and double refunds, even when 8 identical requests arrive at once.
+- Rejected or expired attempts don't count, so a legitimate retry still works.
+
+### Emergency switch: Lockdown / Approval-only
+- **Lockdown:** refuses every agent request (HTTP and MCP). Nothing already waiting can be approved; rejecting still works.
+- **Approval-only:** every write waits for a human; reads keep working.
+
+Switch from the dashboard's top bar, from `POST /api/agent-admin/emergency {"mode":"lockdown","reason":"..."}`, or from Telegram. The change reaches every gateway process sharing the database within about 2 seconds. Every change is logged and sent as an alert.
+
+### Business hours
+Gateway Setup → Step 5: pick a time zone, business days and opening hours. Outside them, writes your rules would allow wait for your approval; reads stay allowed. Daylight saving and overnight shifts (e.g. 22:00–06:00) are handled.
+
+### Telegram bot commands (Buttons mode)
+| Command | What it does |
+|---|---|
+| `/status` | Mode, last 24h counts, money protected, budgets |
+| `/pending` | Re-sends waiting requests with Approve / Reject buttons |
+| `/lockdown [reason]` | Emergency lockdown |
+| `/approvalonly [reason]` | Every write needs approval |
+| `/resume` | Back to normal |
+
+Commands are accepted only from the configured chat and, if an approver list is set, only from approvers.
+
+### Security alerts & daily digest
+Sent to your Telegram, Slack and/or webhook (event `"alert"`), each at most once even if several gateway processes share the database:
+- **Attack burst:** at least N requests refused within M minutes (default 10 in 5), with the top routes and callers.
+- **Spending budget reached.**
+- **Lockdown / approval-only switched** on or off.
+- **Daily digest** at the hour you choose, in your time zone: counts, money protected, money executed, waiting approvals, budgets, most-blocked routes. "Send digest now" sends it on demand (`POST /api/agent-admin/alerts/digest`).
+
+### "Money protected" & CSV export
+- Every audit row now stores the request's amount. `GET /api/agent-admin/protection/summary?hours=24` (and the dashboard top bar) shows how much money agents tried to move and were stopped, next to what was executed.
+- **Audit Logs → Export CSV** (`GET /api/agent-admin/logs/export.csv`, same filters as the log view) downloads up to 50,000 rows for accounting or chargeback disputes. Text cells starting with `=`, `+`, `-` or `@` are prefixed with `'` so nothing in the file can run as a spreadsheet formula.
+
+The **E-Commerce** starter pack now includes a $300/hour refund budget and one-refund-per-order protection. The **FinTech** pack includes $1,000/day transfer and payout budgets plus a duplicate-payment check (same destination and amount within 10 minutes).
+
 ---
 
 ## Configuration (Environment Variables)

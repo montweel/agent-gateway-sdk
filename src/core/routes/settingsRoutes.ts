@@ -13,11 +13,24 @@ import {
   sendProRequired,
   validateRulePath,
 } from "../utils";
-import type { Rule } from "../types";
+import type { BudgetSpec, DedupeSpec, PolicyTier, Rule } from "../types";
+import { validateBudget, validateDedupe, validatePolicies } from "../policy";
 
 /** Adds rateLimit to a rule only when it is a real limit, so rules.json stays clean. */
 function withRateLimit(rule: Rule, rateLimit: number | null | undefined): Rule {
   return typeof rateLimit === "number" ? { ...rule, rateLimit } : rule;
+}
+
+/** Adds policies only when there are some, so rules.json stays clean. */
+function withPolicies(rule: Rule, policies: PolicyTier[] | undefined): Rule {
+  return policies && policies.length > 0 ? { ...rule, policies } : rule;
+}
+
+function withGuards(rule: Rule, budget: BudgetSpec | undefined, dedupe: DedupeSpec | undefined): Rule {
+  const out: Rule = { ...rule };
+  if (budget) out.budget = budget;
+  if (dedupe) out.dedupe = dedupe;
+  return out;
 }
 
 function parseHeaderName(
@@ -199,12 +212,16 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
       const existing = Object.prototype.hasOwnProperty.call(current, endpoint) ? current[endpoint] : undefined;
 
       if (typeof value === "boolean") {
-        updates[endpoint] = withRateLimit(
-          { mode: value ? "ALLOW" : "BLOCK", description: existing?.description ?? "" },
-          existing?.rateLimit
+        updates[endpoint] = withGuards(
+          withPolicies(
+            withRateLimit({ mode: value ? "ALLOW" : "BLOCK", description: existing?.description ?? "" }, existing?.rateLimit),
+            existing?.policies
+          ),
+          existing?.budget,
+          existing?.dedupe
         );
       } else if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-        const v = value as { mode?: unknown; description?: unknown; rateLimit?: unknown };
+        const v = value as { mode?: unknown; description?: unknown; rateLimit?: unknown; policies?: unknown; budget?: unknown; dedupe?: unknown };
         if (typeof v.mode !== "string" || !RULE_MODES.includes(v.mode as RuleMode)) {
           sendError(res, 400, "Bad Request", `mode for "${endpoint}" must be ALLOW, BLOCK or REQUIRE_APPROVAL.`);
           return;
@@ -228,12 +245,48 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
           );
           return;
         }
-        updates[endpoint] = withRateLimit(
-          {
-            mode: v.mode as RuleMode,
-            description: typeof desc === "string" ? desc : existing?.description ?? "",
-          },
-          v.rateLimit === undefined ? existing?.rateLimit : (v.rateLimit as number | null)
+        // policies: omitted = keep the existing tiers, null or [] = clear, list = replace.
+        let policies: PolicyTier[] | undefined = existing?.policies;
+        if (v.policies !== undefined) {
+          const checked = validatePolicies(v.policies);
+          if (!checked.ok) {
+            sendError(res, 400, "Bad Request", `Invalid policies for "${endpoint}": ${checked.message}`);
+            return;
+          }
+          policies = checked.policies;
+        }
+        // budget / dedupe: omitted = keep, null = remove, object = replace.
+        let budget = existing?.budget;
+        if (v.budget !== undefined) {
+          const b = validateBudget(v.budget);
+          if (!b.ok) {
+            sendError(res, 400, "Bad Request", `Invalid budget for "${endpoint}": ${b.message}`);
+            return;
+          }
+          budget = b.value;
+        }
+        let dedupe = existing?.dedupe;
+        if (v.dedupe !== undefined) {
+          const d = validateDedupe(v.dedupe);
+          if (!d.ok) {
+            sendError(res, 400, "Bad Request", `Invalid dedupe for "${endpoint}": ${d.message}`);
+            return;
+          }
+          dedupe = d.value;
+        }
+        updates[endpoint] = withGuards(
+          withPolicies(
+            withRateLimit(
+              {
+                mode: v.mode as RuleMode,
+                description: typeof desc === "string" ? desc : existing?.description ?? "",
+              },
+              v.rateLimit === undefined ? existing?.rateLimit : (v.rateLimit as number | null)
+            ),
+            policies
+          ),
+          budget,
+          dedupe
         );
       } else {
         sendError(res, 400, "Bad Request", `Value for "${endpoint}" must be true/false or { mode, description }.`);
@@ -244,7 +297,14 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
     try {
       const rules: Rules = { ...current, ...updates };
       rulesStore.save(rules);
-      res.json({ success: true, rules });
+      const warnings = Object.entries(updates)
+        .filter(([, r]) => r.policies && r.policies.length > 0 && r.mode === "ALLOW")
+        .map(
+          ([k]) =>
+            `"${k}" falls back to ALLOW when no policy tier matches (for example when a field is missing). ` +
+            "Use REQUIRE_APPROVAL or BLOCK as the fallback for fail-closed behaviour."
+        );
+      res.json({ success: true, rules, warnings });
     } catch (err) {
       sendInternalError(res, "Failed to save rules", err, "Could not write rules.json.");
     }

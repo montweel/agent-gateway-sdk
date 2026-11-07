@@ -12,6 +12,7 @@ import {
   UNSAVED_HEADERS,
 } from "./constants";
 import { ScryptBusyError } from "./crypto";
+import { normalizePolicies, validateBudget, validateDedupe } from "./policy";
 
 export function sendError(
   res: Response,
@@ -231,6 +232,18 @@ export function redactQueryString(url: string): string {
   return url.slice(0, q + 1) + redacted + url.slice(queryEnd);
 }
 
+/** Parsed query object with sensitive parameter values replaced by "[REDACTED]". */
+export function redactQueryObject(query: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (typeof query !== "object" || query === null) return out;
+  for (const [k, v] of Object.entries(query as Record<string, unknown>)) {
+    const name = k.toLowerCase().replace(/[_-]/g, "");
+    const sensitive = SENSITIVE_QUERY_KEYS.some((s) => name === s || name.endsWith(s)) || isSensitiveKey(k);
+    out[k] = sensitive ? REDACTED : redactSensitive(v);
+  }
+  return out;
+}
+
 export const MAX_RULE_RATE_LIMIT = 1_000_000;
 
 export function isValidRuleRateLimit(n: unknown): n is number {
@@ -242,16 +255,93 @@ export function normalizeRule(value: unknown): Rule | null {
   if (value === false) return { mode: "BLOCK", description: "" };
 
   if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-    const v = value as { mode?: unknown; description?: unknown; rateLimit?: unknown };
+    const v = value as { mode?: unknown; description?: unknown; rateLimit?: unknown; policies?: unknown; budget?: unknown; dedupe?: unknown };
     const mode =
       typeof v.mode === "string" && RULE_MODES.includes(v.mode as RuleMode)
         ? (v.mode as RuleMode)
         : "BLOCK";
     const rule: Rule = { mode, description: typeof v.description === "string" ? v.description : "" };
     if (isValidRuleRateLimit(v.rateLimit)) rule.rateLimit = v.rateLimit;
+    const policies = normalizePolicies(v.policies);
+    if (policies === "invalid") {
+      // Fail closed: a rule whose policies cannot be trusted is enforced as BLOCK.
+      return { ...rule, mode: "BLOCK", description: `${rule.description} [policies invalid: enforced as BLOCK]`.trim() };
+    }
+    if (policies) rule.policies = policies;
+    const budget = validateBudget(v.budget);
+    const dedupe = validateDedupe(v.dedupe);
+    if (!budget.ok || !dedupe.ok) {
+      // Fail closed: a cap we cannot read must not silently disappear.
+      const message = !budget.ok ? budget.message : !dedupe.ok ? dedupe.message : "";
+      console.error(`Invalid budget/dedupe in rules.json (${message}); the rule is enforced as BLOCK.`);
+      return { ...rule, mode: "BLOCK", policies: undefined, description: `${rule.description} [guards invalid: enforced as BLOCK]`.trim() };
+    }
+    if (budget.value) rule.budget = budget.value;
+    if (dedupe.value) rule.dedupe = dedupe.value;
     return rule;
   }
   return null;
+}
+
+/** Thrown by withTimeout. The interceptor turns it into a fail-closed 503. */
+export class DbTimeoutError extends Error {
+  constructor(label: string, ms: number) {
+    super(`${label} did not finish within ${ms} ms.`);
+    this.name = "DbTimeoutError";
+  }
+}
+
+/** Rejects with DbTimeoutError when `promise` takes longer than `ms`. The original keeps running. */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new DbTimeoutError(label, ms)), ms);
+    timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * The single exit for "something went wrong while deciding": the request is refused and
+ * never forwarded. 503 with Retry-After when we can still answer; if a response had already
+ * started, the connection is destroyed so the client cannot mistake a partial reply for success.
+ */
+export function failClosed(res: Response, context: string, err: unknown): void {
+  console.error(`[agent-gateway] FAIL-CLOSED (${context}):`, err);
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  res.setHeader("Retry-After", "5");
+  sendError(
+    res,
+    503,
+    "Service Unavailable",
+    "The gateway could not safely evaluate this request, so it was refused and not forwarded. Retry shortly."
+  );
+}
+
+/** Field names that the approval inspector and notifications flag as high-risk (substring, case-insensitive). */
+export const HIGH_RISK_FIELDS = ["amount", "price", "delete", "email", "destination"];
+
+/** Dot paths (body.*) of every key in a JSON value that looks high-risk, with its value. */
+export function findHighRiskFields(value: unknown, prefix = "body", depth = 0, out: Array<{ path: string; value: unknown }> = []): Array<{ path: string; value: unknown }> {
+  if (depth > 12 || out.length >= 50) return out;
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => findHighRiskFields(v, `${prefix}.${i}`, depth + 1, out));
+  } else if (typeof value === "object" && value !== null) {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const p = `${prefix}.${k}`;
+      const lower = k.toLowerCase();
+      if (HIGH_RISK_FIELDS.some((r) => lower.includes(r)) && (typeof v !== "object" || v === null)) {
+        out.push({ path: p, value: v });
+      }
+      findHighRiskFields(v, p, depth + 1, out);
+    }
+  }
+  return out;
 }
 
 export function extractBody(req: Request): string | null {

@@ -26,6 +26,14 @@ export class UpstreamTooLargeError extends Error {
   }
 }
 
+/** Raised when the agent's own connection closes before the upstream answered. */
+export class ClientAbortedError extends Error {
+  constructor() {
+    super("The client disconnected before the upstream responded.");
+    this.name = "ClientAbortedError";
+  }
+}
+
 export function isTimeoutError(err: unknown): boolean {
   const name = (err as { name?: unknown } | null)?.name;
   return name === "TimeoutError" || name === "AbortError";
@@ -56,6 +64,16 @@ export async function readCapped(upstream: FetchResponse, max: number = MAX_UPST
   return Buffer.concat(chunks);
 }
 
+/**
+ * Forwards an ALLOWED request to targetUrl.
+ *
+ * Fail-closed behaviour:
+ *   - Nothing is sent upstream if the client has already disconnected.
+ *   - If the client disconnects while the upstream call is in flight, the upstream call is aborted.
+ *   - The whole upstream response is read (and size-capped) BEFORE any status or header is
+ *     written, so an upstream that dies mid-response becomes a clean 502/504, never a
+ *     truncated 200 that an agent could mistake for success.
+ */
 export async function proxyToTarget(
   req: Request,
   res: Response,
@@ -85,19 +103,34 @@ export async function proxyToTarget(
 
   const body = extractBody(req);
 
+  // Abort the upstream call if the agent goes away mid-request.
+  const clientAbort = new AbortController();
+  const onClose = (): void => {
+    if (!res.writableFinished) clientAbort.abort(new ClientAbortedError());
+  };
+  res.once("close", onClose);
+
+  // req.destroyed is true once the body was consumed, so check the socket instead.
+  const clientGone = (): boolean => Boolean(req.socket?.destroyed) || res.destroyed || res.headersSent || res.writableEnded;
+  if (clientGone()) {
+    res.off("close", onClose);
+    return;
+  }
+
   try {
     const upstream = await fetch(url, {
       method: req.method,
       headers,
       body: body ?? undefined,
       redirect: "manual",
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      signal: AbortSignal.any([AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), clientAbort.signal]),
     });
 
     // Read (and size-check) the whole body before committing to a status, so an
     // oversized or broken response can still become a clean 502/504.
     const payload = await readCapped(upstream);
 
+    if (clientGone()) return;
     res.status(upstream.status);
     upstream.headers.forEach((value: string, key: string) => {
       if (!SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) res.setHeader(key, value);
@@ -108,7 +141,15 @@ export async function proxyToTarget(
 
     res.send(payload);
   } catch (err) {
-    if (res.headersSent) return;
+    if (clientAbort.signal.aborted) {
+      console.error("Proxy aborted: the client disconnected mid-request:", url);
+      if (!res.headersSent) res.destroy();
+      return;
+    }
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
     if (isTimeoutError(err)) {
       console.error("Proxy timeout:", url);
       sendError(res, 504, "Gateway Timeout", "The target server did not respond in time.");
@@ -116,7 +157,9 @@ export async function proxyToTarget(
       sendError(res, 502, "Bad Gateway", err.message);
     } else {
       console.error("Proxy error:", err);
-      sendError(res, 502, "Bad Gateway", "Could not reach the target server.");
+      sendError(res, 502, "Bad Gateway", "Could not reach the target server, or it failed mid-response.");
     }
+  } finally {
+    res.off("close", onClose);
   }
 }

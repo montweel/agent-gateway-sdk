@@ -36,6 +36,16 @@ export const MAX_DECIDED_PENDING_ROWS = 5_000; // retention for decided/expired 
 export const MAX_LOG_PATH_LENGTH = 2_048;
 export const MAX_LOG_UA_LENGTH = 256;
 
+// v1.1: fail-closed, approvals, notifications
+export const DB_OPERATION_TIMEOUT_MS = 4_000; // a hung/locked SQLite op fails the request closed after this
+export const AGENT_REASON_HEADER = "x-agent-reason";
+export const MAX_AGENT_REASON_LENGTH = 1_000;
+export const APPROVAL_CALLBACK_PREFIX = "/_mont/approvals";
+export const NOTIFY_TIMEOUT_MS = 5_000;
+export const ROLLBACK_TIMEOUT_MS = 10_000;
+export const MAX_NOTIFY_PAYLOAD_CHARS = 2_500;
+export const CALLBACK_MAX_FAILURES = 20; // bad signatures per IP per 15 minutes before lockout
+
 export const DEFAULT_CONFIG: GatewayConfig = {
   targetUrl: "",
   rateLimitPerMinute: 60,
@@ -67,7 +77,10 @@ export const SENSITIVE_QUERY_KEYS = ["token", "key", "secret", "password", "apik
 
 // Methods a rule key can be pinned to ("POST /api/flights"). A key without a
 // method ("/api/flights") applies to every method that has no pinned rule.
-export const RULE_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+// "MCP" is a pseudo-method for MCP tools/call rules ("MCP /api/mcp/tools/<tool>"); no HTTP request can carry it.
+export const RULE_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "MCP"];
+export const MCP_RULE_METHOD = "MCP";
+export const MCP_TOOL_PATH_PREFIX = "/api/mcp/tools/";
 
 export const OTP_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 

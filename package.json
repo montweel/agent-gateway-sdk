@@ -3,11 +3,20 @@
   "version": "1.0.2",
   "description": "Mont Agent Gateway SDK. Use is governed by TERMS.md.",
   "main": "dist/gateway.js",
+  "bin": {
+    "agent-gateway-sdk": "dist/cli.js",
+    "mont-gateway": "dist/cli.js"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --import tsx --test --test-concurrency=1 --test-timeout=60000 tests/security-chaos.test.ts tests/v12-features.test.ts tests/v13-shop.test.ts",
+    "typecheck": "tsc --noEmit -p . && tsc --noEmit -p tsconfig.tools.json",
     "build": "tsc",
+    "build:all": "tsc && npm --prefix dashboard run build",
     "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts"
+    "start": "tsx src/server.ts",
+    "proxy": "tsx src/cli.ts start",
+    "demo:shopify": "tsx examples/shopify-refund-demo/server.ts",
+    "leads": "tsx scripts/find-leads.ts"
   },
   "repository": {
     "type": "git",

@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { BarChart3, Inbox, ScrollText, Settings, ShieldCheck, Users } from 'lucide-react'
+import { BarChart3, Inbox, ScrollText, Settings, ShieldCheck, Users, Wand2 } from 'lucide-react'
 import type { AuthUser, LicenseStatus, Tab } from '../lib/types'
 import { MontLogo } from './MontLogo'
 
@@ -60,6 +60,7 @@ export function Sidebar({
     { id: 'logs', label: 'Audit Logs', icon: <ScrollText className="h-5 w-5" aria-hidden="true" /> },
     { id: 'analytics', label: 'Analytics', icon: <BarChart3 className="h-5 w-5" aria-hidden="true" /> },
     { id: 'team', label: 'Team & Users', icon: <Users className="h-5 w-5" aria-hidden="true" />, adminOnly: true },
+    { id: 'setup', label: 'Gateway Setup (No-Code)', icon: <Wand2 className="h-5 w-5" aria-hidden="true" /> },
     { id: 'settings', label: 'Settings & Discovery', icon: <Settings className="h-5 w-5" aria-hidden="true" /> },
   ]
  

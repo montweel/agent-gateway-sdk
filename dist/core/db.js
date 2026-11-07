@@ -15,7 +15,62 @@ const CREATE_AGENT_LOGS_SQL = `
     path TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('ALLOWED', 'BLOCKED', 'QUEUED', 'RATE_LIMITED', 'APPROVED', 'REJECTED')),
     user_agent TEXT,
-    agent_key TEXT
+    agent_key TEXT,
+    action_id INTEGER,
+    caller_ip TEXT,
+    detail TEXT,
+    amount REAL
+  )
+`;
+// Budgets (kind 'spend') and duplicate fingerprints (kind 'dedupe'). See guards.ts.
+const CREATE_GUARD_LEDGER_SQL = `
+  CREATE TABLE IF NOT EXISTS guard_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_key TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('spend', 'dedupe')),
+    caller TEXT,
+    fingerprint TEXT,
+    amount REAL,
+    action_id INTEGER,
+    ts INTEGER NOT NULL
+  )
+`;
+// Columns added after the first release. Added with ALTER TABLE when missing.
+const AGENT_LOGS_EXTRA_COLUMNS = {
+    agent_key: "TEXT",
+    action_id: "INTEGER",
+    caller_ip: "TEXT",
+    detail: "TEXT",
+    amount: "REAL",
+};
+const PENDING_EXTRA_COLUMNS = {
+    expires_at: "INTEGER",
+    agent_key: "TEXT",
+    encrypted_payload: "TEXT",
+    query_json: "TEXT",
+    caller_ip: "TEXT",
+    caller_ua: "TEXT",
+    agent_key_id: "INTEGER",
+    agent_key_prefix: "TEXT",
+    agent_reason: "TEXT",
+    matched_policy: "TEXT",
+    revoked_at: "TEXT",
+    revoked_by: "TEXT",
+    rollback_status: "TEXT",
+    kind: "TEXT",
+    owner: "TEXT",
+};
+const CREATE_BLOCKED_CALLERS_SQL = `
+  CREATE TABLE IF NOT EXISTS blocked_callers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK (kind IN ('agent_key', 'ip')),
+    value TEXT NOT NULL,
+    label TEXT,
+    reason TEXT,
+    source_action_id INTEGER,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (kind, value)
   )
 `;
 const CREATE_PENDING_ACTIONS_SQL = `
@@ -31,7 +86,19 @@ const CREATE_PENDING_ACTIONS_SQL = `
     decided_by TEXT,
     expires_at INTEGER,
     agent_key TEXT,
-    encrypted_payload TEXT
+    encrypted_payload TEXT,
+    query_json TEXT,
+    caller_ip TEXT,
+    caller_ua TEXT,
+    agent_key_id INTEGER,
+    agent_key_prefix TEXT,
+    agent_reason TEXT,
+    matched_policy TEXT,
+    revoked_at TEXT,
+    revoked_by TEXT,
+    rollback_status TEXT,
+    kind TEXT,
+    owner TEXT
   )
 `;
 const CREATE_USERS_SQL = `
@@ -152,8 +219,10 @@ function createDatabase(dbPath) {
         else if (!logsSql.includes("'QUEUED'") || !logsSql.includes("'RATE_LIMITED'") || !logsSql.includes("'APPROVED'") || !logsSql.includes("'REJECTED'")) {
             await rebuildTable("agent_logs", CREATE_AGENT_LOGS_SQL);
         }
-        else if (!(await hasColumn("agent_logs", "agent_key"))) {
-            await run("ALTER TABLE agent_logs ADD COLUMN agent_key TEXT");
+        for (const [column, type] of Object.entries(AGENT_LOGS_EXTRA_COLUMNS)) {
+            if (!(await hasColumn("agent_logs", column))) {
+                await run(`ALTER TABLE agent_logs ADD COLUMN ${column} ${type}`);
+            }
         }
         // ---- pending_actions: approval state machine + expiry ----
         const pendingSql = await tableSql("pending_actions");
@@ -166,26 +235,28 @@ function createDatabase(dbPath) {
                 expires_at: String(Date.now() + constants_1.PENDING_TTL_MS),
             });
         }
-        else {
-            if (!(await hasColumn("pending_actions", "expires_at"))) {
-                await run("ALTER TABLE pending_actions ADD COLUMN expires_at INTEGER");
-            }
-            if (!(await hasColumn("pending_actions", "agent_key"))) {
-                await run("ALTER TABLE pending_actions ADD COLUMN agent_key TEXT");
-            }
-            if (!(await hasColumn("pending_actions", "encrypted_payload"))) {
-                await run("ALTER TABLE pending_actions ADD COLUMN encrypted_payload TEXT");
+        for (const [column, type] of Object.entries(PENDING_EXTRA_COLUMNS)) {
+            if (!(await hasColumn("pending_actions", column))) {
+                await run(`ALTER TABLE pending_actions ADD COLUMN ${column} ${type}`);
             }
         }
+        // Kill-switch list (Revoke & Block Caller).
+        await run(CREATE_BLOCKED_CALLERS_SQL);
+        await run(CREATE_GUARD_LEDGER_SQL);
+        await run("CREATE INDEX IF NOT EXISTS idx_guard_ledger_lookup ON guard_ledger(rule_key, kind, ts)");
+        await run("CREATE INDEX IF NOT EXISTS idx_guard_ledger_fp ON guard_ledger(rule_key, fingerprint)");
         // A decided or expired action must not keep its secrets.
         await run("UPDATE pending_actions SET encrypted_payload = NULL WHERE encrypted_payload IS NOT NULL AND status IN ('APPROVED', 'REJECTED', 'EXPIRED')");
         // A request that was mid-replay when the process died has an unknown outcome.
-        await run("UPDATE pending_actions SET status = 'FAILED', response_preview = 'Interrupted: the gateway restarted while this action was executing. Check the target before retrying.' WHERE status = 'EXECUTING'");
+        // (Held MCP calls belong to whichever process holds them; index.ts reaps only orphaned ones.)
+        await run("UPDATE pending_actions SET status = 'FAILED', response_preview = 'Interrupted: the gateway restarted while this action was executing. Check the target before retrying.' WHERE status = 'EXECUTING' AND (kind IS NULL OR kind != 'mcp')");
         await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_timestamp ON agent_logs(timestamp DESC)");
         await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_status ON agent_logs(status)");
         await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_method ON agent_logs(method)");
         await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_status_ts ON agent_logs(status, timestamp)");
         await run("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_actions(status)");
+        await run("CREATE INDEX IF NOT EXISTS idx_pending_caller_ip ON pending_actions(caller_ip)");
+        await run("CREATE INDEX IF NOT EXISTS idx_pending_agent_key_id ON pending_actions(agent_key_id)");
         await run(CREATE_USERS_SQL);
         if (!(await hasColumn("users", "otp_expires_at"))) {
             await run("ALTER TABLE users ADD COLUMN otp_expires_at INTEGER");

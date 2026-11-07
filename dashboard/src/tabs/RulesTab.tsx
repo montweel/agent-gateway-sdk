@@ -7,6 +7,7 @@ import type { Mode, Rule, Rules } from '../lib/types'
 import { INPUT_CLASS, READ_ONLY_HINT, RULE_METHOD_OPTIONS, ruleKey, splitRuleKey } from '../lib/utils'
 import type { RuleMethod } from '../lib/utils'
 import { ErrorBanner, ModeSwitch, PageHeader, RefreshButton, RuleMethodBadge, Spinner } from '../components/ui'
+import { HistoryReplay } from '../components/HistoryReplay'
 
 function RuleRow({
   ruleId,
@@ -132,6 +133,12 @@ function RuleRow({
           />
           {limitError && <span className="text-xs text-red-600">Whole number, 1 to 1,000,000</span>}
         </label>
+      )}
+      {(rule.mode === 'SHADOW_BLOCK' || rule.mode === 'SHADOW_APPROVAL') && (
+        <p className="mt-1.5 text-xs text-slate-500">
+          Dry run: matching requests still go through. The audit log marks what this rule would have done, so you can watch it on
+          live traffic before enforcing it.
+        </p>
       )}
       {rule.mode === 'BLOCK' && (
         <p className="mt-1.5 text-xs text-slate-400">Blocked endpoints are not listed in agent discovery.</p>
@@ -259,7 +266,7 @@ export function RulesTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly:
     [rules]
   )
   const counts = useMemo(() => {
-    const c = { ALLOW: 0, REQUIRE_APPROVAL: 0, BLOCK: 0 }
+    const c: Record<Mode, number> = { ALLOW: 0, REQUIRE_APPROVAL: 0, BLOCK: 0, SHADOW_BLOCK: 0, SHADOW_APPROVAL: 0 }
     for (const [, rule] of entries) c[rule.mode] += 1
     return c
   }, [entries])
@@ -269,6 +276,7 @@ export function RulesTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly:
     { label: 'Allowed', value: counts.ALLOW, color: 'text-emerald-600' },
     { label: 'Require approval', value: counts.REQUIRE_APPROVAL, color: 'text-amber-600' },
     { label: 'Blocked', value: counts.BLOCK, color: 'text-red-600' },
+    { label: 'Shadow (dry run)', value: counts.SHADOW_BLOCK + counts.SHADOW_APPROVAL, color: 'text-slate-600' },
   ]
 
   return (
@@ -281,7 +289,9 @@ export function RulesTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly:
 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
-      <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <HistoryReplay rules={rules} />
+
+      <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-5">
         {stats.map((s) => (
           <div key={s.label} className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
             <p className="text-sm text-slate-500">{s.label}</p>

@@ -1,8 +1,17 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OTP_ALPHABET = exports.MCP_TOOL_PATH_PREFIX = exports.MCP_RULE_METHOD = exports.RULE_METHODS = exports.SENSITIVE_QUERY_KEYS = exports.REDACTED = exports.SENSITIVE_KEYS = exports.BASE62 = exports.HEADER_NAME_REGEX = exports.SSO_USERNAME_REGEX = exports.USERNAME_REGEX = exports.NO_BODY_METHODS = exports.DEFAULT_CONFIG = exports.CALLBACK_MAX_FAILURES = exports.MAX_NOTIFY_PAYLOAD_CHARS = exports.ROLLBACK_TIMEOUT_MS = exports.NOTIFY_TIMEOUT_MS = exports.APPROVAL_CALLBACK_PREFIX = exports.MAX_AGENT_REASON_LENGTH = exports.AGENT_REASON_HEADER = exports.DB_OPERATION_TIMEOUT_MS = exports.MAX_LOG_UA_LENGTH = exports.MAX_LOG_PATH_LENGTH = exports.MAX_DECIDED_PENDING_ROWS = exports.MAX_PENDING_DISPLAY_CHARS = exports.MAX_PENDING_BODY_BYTES = exports.MAX_PENDING_ACTIONS = exports.MAX_TRACKED_IPS = exports.JSON_BODY_LIMIT = exports.LOGIN_MAX_FAILURES_PER_USER = exports.MAX_RULE_PATH_LENGTH = exports.MAX_CONCURRENT_SCRYPT = exports.MAX_LOG_ROWS = exports.SESSION_TOUCH_INTERVAL_MS = exports.OTP_TTL_MS = exports.PENDING_TTL_MS = exports.MAX_HOPS = exports.MAX_UPSTREAM_BYTES = exports.UPSTREAM_TIMEOUT_MS = exports.SESSION_TTL_MS = exports.LOGIN_MAX_FAILURES = exports.LOGIN_WINDOW_MS = exports.RATE_WINDOW_MS = exports.SETUP_TOKEN_HEADER = exports.AGENT_KEY_PREFIX = exports.AGENT_KEY_HEADER = exports.HOPS_HEADER = exports.SSO_SECRET_HEADER = exports.REPLAY_HEADER = exports.RULE_MODES = void 0;
-exports.UNSAVED_HEADERS = exports.NEVER_FORWARD = exports.HOP_BY_HOP = void 0;
-exports.RULE_MODES = ["ALLOW", "BLOCK", "REQUIRE_APPROVAL"];
+exports.SENSITIVE_KEYS = exports.BASE62 = exports.HEADER_NAME_REGEX = exports.SSO_USERNAME_REGEX = exports.USERNAME_REGEX = exports.NO_BODY_METHODS = exports.DEFAULT_CONFIG = exports.CALLBACK_MAX_FAILURES = exports.MAX_NOTIFY_PAYLOAD_CHARS = exports.ROLLBACK_TIMEOUT_MS = exports.NOTIFY_TIMEOUT_MS = exports.APPROVAL_CALLBACK_PREFIX = exports.MAX_AGENT_REASON_LENGTH = exports.AGENT_REASON_HEADER = exports.DB_OPERATION_TIMEOUT_MS = exports.MAX_LOG_UA_LENGTH = exports.MAX_LOG_PATH_LENGTH = exports.MAX_DECIDED_PENDING_ROWS = exports.MAX_PENDING_DISPLAY_CHARS = exports.MAX_PENDING_BODY_BYTES = exports.MAX_PENDING_ACTIONS = exports.MAX_TRACKED_IPS = exports.JSON_BODY_LIMIT = exports.LOGIN_MAX_FAILURES_PER_USER = exports.MAX_RULE_PATH_LENGTH = exports.MAX_CONCURRENT_SCRYPT = exports.MAX_LOG_ROWS = exports.SESSION_TOUCH_INTERVAL_MS = exports.OTP_TTL_MS = exports.PENDING_TTL_MS = exports.MAX_HOPS = exports.MAX_UPSTREAM_BYTES = exports.UPSTREAM_TIMEOUT_MS = exports.SESSION_TTL_MS = exports.LOGIN_MAX_FAILURES = exports.LOGIN_WINDOW_MS = exports.RATE_WINDOW_MS = exports.SETUP_TOKEN_HEADER = exports.AGENT_KEY_PREFIX = exports.AGENT_KEY_HEADER = exports.HOPS_HEADER = exports.SSO_SECRET_HEADER = exports.REPLAY_HEADER = exports.MAX_SNAPSHOT_CHARS = exports.DEFAULT_WORKSPACE_SLUG = exports.DEFAULT_WORKSPACE_ID = exports.WORKSPACE_PATH_PREFIX = exports.WORKSPACE_KEY_PREFIX = exports.WORKSPACE_HEADER = exports.RULE_MODES = void 0;
+exports.UNSAVED_HEADERS = exports.NEVER_FORWARD = exports.HOP_BY_HOP = exports.OTP_ALPHABET = exports.MCP_TOOL_PATH_PREFIX = exports.MCP_RULE_METHOD = exports.RULE_METHODS = exports.SENSITIVE_QUERY_KEYS = exports.REDACTED = void 0;
+exports.RULE_MODES = ["ALLOW", "BLOCK", "REQUIRE_APPROVAL", "SHADOW_BLOCK", "SHADOW_APPROVAL"];
+// v2.0 multi-tenant workspaces
+exports.WORKSPACE_HEADER = "x-mont-workspace";
+exports.WORKSPACE_KEY_PREFIX = "mws_";
+/** Path-prefix routing: /api/w/<slug>/... is the same request as /api/... in workspace <slug>. */
+exports.WORKSPACE_PATH_PREFIX = "/api/w/";
+exports.DEFAULT_WORKSPACE_ID = 1;
+exports.DEFAULT_WORKSPACE_SLUG = "default";
+/** Largest request snapshot (redacted JSON) kept in the audit log for the policy time-machine. */
+exports.MAX_SNAPSHOT_CHARS = 16 * 1024;
 // The header NAME is fixed. Its VALUE is a random secret created per gateway
 // instance, so an outside caller cannot bypass the gateway by adding the header.
 exports.REPLAY_HEADER = "x-gateway-internal-replay";
@@ -95,6 +104,7 @@ exports.NEVER_FORWARD = new Set([
     exports.SSO_SECRET_HEADER,
     exports.SETUP_TOKEN_HEADER,
     exports.AGENT_KEY_HEADER,
+    exports.WORKSPACE_HEADER,
     // Identity headers set by an SSO proxy. They must never reach the upstream
     // where they could be mistaken for a verified identity.
     "x-forwarded-user",

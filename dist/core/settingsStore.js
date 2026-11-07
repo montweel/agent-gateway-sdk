@@ -27,6 +27,7 @@ function defaultSettings() {
         timezone: "UTC",
         schedule: { enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "18:00" },
         alerts: { enabled: true, burstThreshold: 10, burstWindowMinutes: 5, digestHour: null },
+        responseGuard: { enabled: false, maxArrayItems: 200, onLargeArray: "block", onSecret: "scrub" },
     };
 }
 function isValidTimeZone(tz) {
@@ -54,6 +55,7 @@ function coerceSettings(raw) {
     const pv = (typeof r.privacy === "object" && r.privacy !== null ? r.privacy : {});
     const sc = (typeof r.schedule === "object" && r.schedule !== null ? r.schedule : {});
     const al = (typeof r.alerts === "object" && r.alerts !== null ? r.alerts : {});
+    const rg = (typeof r.responseGuard === "object" && r.responseGuard !== null ? r.responseGuard : {});
     const port = r.listenPort;
     return {
         listenPort: typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null,
@@ -97,6 +99,15 @@ function coerceSettings(raw) {
                 ? al.burstWindowMinutes
                 : d.alerts.burstWindowMinutes,
             digestHour: Number.isInteger(al.digestHour) && al.digestHour >= 0 && al.digestHour <= 23 ? al.digestHour : null,
+        },
+        responseGuard: {
+            enabled: bool(rg.enabled),
+            maxArrayItems: Number.isInteger(rg.maxArrayItems) && rg.maxArrayItems >= 1 && rg.maxArrayItems <= 1000000
+                ? rg.maxArrayItems
+                : d.responseGuard.maxArrayItems,
+            // Fail safe: anything unreadable picks the stricter action.
+            onLargeArray: rg.onLargeArray === "truncate" ? "truncate" : "block",
+            onSecret: rg.onSecret === "block" || (rg.onSecret !== undefined && rg.onSecret !== "scrub") ? "block" : "scrub",
         },
     };
 }

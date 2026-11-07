@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { ChevronDown, KeyRound, Lock, LogOut } from 'lucide-react'
 import type { AuthUser } from '../lib/types'
 
@@ -7,11 +8,14 @@ export function TopBar({
   online,
   onSignOut,
   onOpenPasswordModal,
+  workspaceSlot,
 }: {
   user: AuthUser
   online: boolean
   onSignOut: () => void
   onOpenPasswordModal: () => void
+  /** v2: the Workspace Switcher (rendered only on multi-workspace installs). */
+  workspaceSlot?: ReactNode
 }) {
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -40,12 +44,15 @@ export function TopBar({
 
   return (
     <header className="sticky top-0 z-20 flex h-14 items-center justify-between border-b border-slate-200 bg-white/90 px-8 backdrop-blur-xs">
-      <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600">
-        <span className={`h-2 w-2 shrink-0 rounded-full ${online ? 'bg-emerald-500' : 'bg-red-500'}`} />
-        <span className="font-mono">
-          {window.location.host}
-          {online ? '' : ' (offline)'}
-        </span>
+      <div className="flex items-center gap-3">
+        <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600">
+          <span className={`h-2 w-2 shrink-0 rounded-full ${online ? 'bg-emerald-500' : 'bg-red-500'}`} />
+          <span className="font-mono">
+            {window.location.host}
+            {online ? '' : ' (offline)'}
+          </span>
+        </div>
+        {workspaceSlot}
       </div>
 
       <div className="relative" ref={menuRef}>

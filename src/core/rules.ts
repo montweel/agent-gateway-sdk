@@ -75,24 +75,30 @@ export function lookupInRules(rules: Rules, patterns: Pattern[], method: string,
   return undefined;
 }
 
+/**
+ * Normalises a parsed rules object (rules.json, or a workspace's rules in SQLite). Invalid keys
+ * are dropped (= default deny); rules whose policies / guards cannot be trusted load as BLOCK.
+ */
+export function parseRulesObject(raw: unknown): Rules {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+  const rules: Rules = {};
+  for (const [rawKey, value] of Object.entries(raw as Record<string, unknown>)) {
+    const parsed = parseRuleKey(rawKey);
+    if ("error" in parsed) continue;
+    // Only valid gateway paths are accepted. This also rejects "__proto__",
+    // traversal ("..") and whitespace/control characters in hand-edited files.
+    if (validateRulePath(parsed.path) !== null) continue;
+    const rule = normalizeRule(value);
+    if (rule) rules[ruleKey(parsed.method, parsed.path)] = rule;
+  }
+  return rules;
+}
+
 export function createRulesStore(rulesPath: string): RulesStore {
   const cache = createFileCache<Rules>(rulesPath, (text) => {
     if (text === null) return {};
     try {
-      const raw = JSON.parse(text) as unknown;
-      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
-
-      const rules: Rules = {};
-      for (const [rawKey, value] of Object.entries(raw as Record<string, unknown>)) {
-        const parsed = parseRuleKey(rawKey);
-        if ("error" in parsed) continue;
-        // Only valid gateway paths are accepted. This also rejects "__proto__",
-        // traversal ("..") and whitespace/control characters in hand-edited files.
-        if (validateRulePath(parsed.path) !== null) continue;
-        const rule = normalizeRule(value);
-        if (rule) rules[ruleKey(parsed.method, parsed.path)] = rule;
-      }
-      return rules;
+      return parseRulesObject(JSON.parse(text) as unknown);
     } catch (err) {
       console.error("Could not read rules.json, treating all paths as blocked:", err);
       return {};

@@ -2,6 +2,8 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.registerLogRoutes = registerLogRoutes;
 const utils_1 = require("../utils");
+const protection_1 = require("../protection");
+const scope_1 = require("./scope");
 // window -> total span and bucket size (both in ms)
 const WINDOWS = {
     "1h": { spanMs: 60 * 60000, stepMs: 5 * 60000 },
@@ -9,15 +11,21 @@ const WINDOWS = {
     "24h": { spanMs: 24 * 60 * 60000, stepMs: 60 * 60000 },
     "1w": { spanMs: 7 * 24 * 60 * 60000, stepMs: 24 * 60 * 60000 },
 };
-const LOG_STATUSES = ["ALLOWED", "BLOCKED", "QUEUED", "RATE_LIMITED", "APPROVED", "REJECTED"];
+const LOG_STATUSES = ["ALLOWED", "BLOCKED", "QUEUED", "RATE_LIMITED", "APPROVED", "REJECTED", "RESPONSE_BLOCKED", "RESPONSE_SCRUBBED"];
 /** Audit log listing and traffic analytics. */
 function registerLogRoutes(router, ctx) {
     const { db, license } = ctx;
     router.get("/logs", async (req, res) => {
+        const scoped = (0, scope_1.readScope)(ctx, req, res);
+        if (scoped === undefined)
+            return;
         try {
-            const { status, method, search, from, to, limit } = req.query;
-            let sql = "SELECT * FROM agent_logs WHERE 1=1";
-            const params = [];
+            const { status, method, search, from, to, limit, shadow } = req.query;
+            const wf = (0, protection_1.workspaceFilter)(scoped?.id ?? null);
+            let sql = `SELECT * FROM agent_logs WHERE 1=1${wf.sql}`;
+            const params = [...wf.params];
+            if (shadow === "1" || shadow === "true")
+                sql += " AND shadow IS NOT NULL";
             if (typeof status === "string" && status.trim() !== "") {
                 sql += " AND status = ?";
                 params.push(status.trim().toUpperCase());
@@ -47,7 +55,17 @@ function registerLogRoutes(router, ctx) {
             const parsedLimit = Math.min(Math.max(Math.trunc(Number(limit)) || 100, 1), 1000);
             sql += " ORDER BY id DESC LIMIT ?";
             params.push(parsedLimit);
-            res.json(await db.all(sql, params));
+            const rows = await db.all(sql, params);
+            // The chain fields are for /audit/verify; the snapshot can be large: keep list responses lean.
+            res.json(rows.map((row) => {
+                const r = { ...row };
+                r.has_snapshot = row.request_snapshot !== null;
+                r.sealed = row.row_hash !== null;
+                r.workspace_slug = ctx.workspaces.get(row.workspace_id ?? 1)?.slug ?? null;
+                delete r.request_snapshot;
+                delete r.prev_hash;
+                return r;
+            }));
         }
         catch (err) {
             (0, utils_1.sendInternalError)(res, "Logs error", err, "Could not load audit logs.");
@@ -56,6 +74,10 @@ function registerLogRoutes(router, ctx) {
     // Traffic analytics. Rows are bucketed in SQL by integer-dividing the unix time
     // by the bucket size, so the buckets line up exactly with the ones built below.
     router.get("/logs/analytics", async (req, res) => {
+        const scoped = (0, scope_1.readScope)(ctx, req, res);
+        if (scoped === undefined)
+            return;
+        const wf = (0, protection_1.workspaceFilter)(scoped?.id ?? null);
         try {
             const requested = typeof req.query.window === "string" ? req.query.window.toLowerCase() : "24h";
             // The 7-day window is Pro. Community falls back to 24h and says so, rather than failing.
@@ -70,15 +92,15 @@ function registerLogRoutes(router, ctx) {
             // 1. Get resolved/direct traffic from agent_logs (excluding raw arrival QUEUED logs)
             const rows = await db.all(`SELECT CAST(strftime('%s', timestamp) AS INTEGER) / ? AS bucket, status, COUNT(*) AS count
          FROM agent_logs
-         WHERE timestamp >= ? AND status != 'QUEUED'
-         GROUP BY bucket, status`, [stepSec, cutoffIso]);
+         WHERE timestamp >= ? AND status != 'QUEUED'${wf.sql}
+         GROUP BY bucket, status`, [stepSec, cutoffIso, ...wf.params]);
             // 2. Get ONLY currently pending requests bucketed by when they were queued
             const pendingBuckets = await db.all(`SELECT CAST(strftime('%s', timestamp) AS INTEGER) / ? AS bucket, COUNT(*) AS count
          FROM pending_actions
-         WHERE status = 'PENDING' AND timestamp >= ?
-         GROUP BY bucket`, [stepSec, cutoffIso]);
+         WHERE status = 'PENDING' AND timestamp >= ?${wf.sql}
+         GROUP BY bucket`, [stepSec, cutoffIso, ...wf.params]);
             // 3. Get total live pending count for the top KPI card
-            const pendingCountRow = await db.get(`SELECT COUNT(*) as count FROM pending_actions WHERE status = 'PENDING'`);
+            const pendingCountRow = await db.get(`SELECT COUNT(*) as count FROM pending_actions WHERE status = 'PENDING'${wf.sql}`, wf.params);
             const actualPendingCount = pendingCountRow?.count ?? 0;
             // 4. Top Targeted Endpoints (combines resolved logs + currently pending actions)
             const topEndpoints = await db.all(`SELECT
@@ -88,13 +110,13 @@ function registerLogRoutes(router, ctx) {
            SUM(CASE WHEN status IN ('ALLOWED', 'APPROVED') THEN 1 ELSE 0 END) AS allowed,
            SUM(CASE WHEN status IN ('BLOCKED', 'RATE_LIMITED', 'REJECTED', 'PENDING') THEN 1 ELSE 0 END) AS intervened
          FROM (
-           SELECT method, path, status FROM agent_logs WHERE timestamp >= ? AND status != 'QUEUED'
+           SELECT method, path, status FROM agent_logs WHERE timestamp >= ? AND status != 'QUEUED'${wf.sql}
            UNION ALL
-           SELECT method, path, status FROM pending_actions WHERE status = 'PENDING' AND timestamp >= ?
+           SELECT method, path, status FROM pending_actions WHERE status = 'PENDING' AND timestamp >= ?${wf.sql}
          )
          GROUP BY method, path
          ORDER BY total DESC, intervened DESC
-         LIMIT 8`, [cutoffIso, cutoffIso]);
+         LIMIT 8`, [cutoffIso, ...wf.params, cutoffIso, ...wf.params]);
             // 5. Top Active AI Agents / Callers
             const topAgents = await db.all(`SELECT
            COALESCE(NULLIF(TRIM(user_agent), ''), 'Unknown Agent') AS agent,
@@ -102,10 +124,10 @@ function registerLogRoutes(router, ctx) {
            SUM(CASE WHEN status IN ('ALLOWED', 'APPROVED') THEN 1 ELSE 0 END) AS allowed,
            SUM(CASE WHEN status IN ('BLOCKED', 'RATE_LIMITED', 'REJECTED') THEN 1 ELSE 0 END) AS intervened
          FROM agent_logs
-         WHERE timestamp >= ? AND status != 'QUEUED'
+         WHERE timestamp >= ? AND status != 'QUEUED'${wf.sql}
          GROUP BY agent
          ORDER BY total DESC, intervened DESC
-         LIMIT 8`, [cutoffIso]);
+         LIMIT 8`, [cutoffIso, ...wf.params]);
             const buckets = new Map();
             for (let b = firstBucket; b <= lastBucket; b++) {
                 buckets.set(b, {
@@ -116,6 +138,8 @@ function registerLogRoutes(router, ctx) {
                     RATE_LIMITED: 0,
                     APPROVED: 0,
                     REJECTED: 0,
+                    RESPONSE_BLOCKED: 0,
+                    RESPONSE_SCRUBBED: 0,
                     total: 0,
                 });
             }
@@ -126,6 +150,8 @@ function registerLogRoutes(router, ctx) {
                 RATE_LIMITED: 0,
                 APPROVED: 0,
                 REJECTED: 0,
+                RESPONSE_BLOCKED: 0,
+                RESPONSE_SCRUBBED: 0,
             };
             for (const r of rows) {
                 if (!LOG_STATUSES.includes(r.status))

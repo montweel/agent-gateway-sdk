@@ -4,6 +4,9 @@ exports.EMERGENCY_MODES = void 0;
 exports.createEmergencyStore = createEmergencyStore;
 exports.localTime = localTime;
 exports.isWithinBusinessHours = isWithinBusinessHours;
+exports.stricterMode = stricterMode;
+exports.effectiveMode = effectiveMode;
+exports.scheduleFor = scheduleFor;
 exports.applyOperatingMode = applyOperatingMode;
 /**
  * Shop-wide operating modes, applied on top of the per-endpoint rules:
@@ -132,23 +135,41 @@ function isWithinBusinessHours(schedule, timeZone, now = new Date()) {
         return schedule.days.includes((t.weekday + 6) % 7);
     return false;
 }
+/** The stricter of two modes (lockdown > approval_only > normal). */
+function stricterMode(a, b) {
+    const rank = { normal: 0, approval_only: 1, lockdown: 2 };
+    return rank[a] >= rank[b] ? a : b;
+}
+/** Effective emergency mode for a workspace: the global switch and the workspace's own, whichever is stricter. */
+function effectiveMode(ctx, workspace) {
+    const global = ctx.emergency.current().mode;
+    return workspace && !workspace.isDefault ? stricterMode(global, workspace.mode) : global;
+}
+/** Business hours for a workspace: its own override, else the global setting. */
+function scheduleFor(ctx, workspace) {
+    const s = ctx.settings.peek();
+    return {
+        schedule: workspace?.schedule ?? s.schedule,
+        timezone: workspace?.timezone ?? s.timezone,
+    };
+}
 /**
  * Applies lockdown / approval-only / business hours to a rule decision.
  * `kind` "mcp": tool calls cannot be told apart as reads, so approval-only holds all of them.
  */
-function applyOperatingMode(ctx, decision, method, kind) {
-    const emergency = ctx.emergency.current();
-    if (emergency.mode === "lockdown")
+function applyOperatingMode(ctx, decision, method, kind, workspace) {
+    const mode = effectiveMode(ctx, workspace);
+    if (mode === "lockdown")
         return { mode: "BLOCK", matched: "lockdown" };
     if (decision.mode !== "ALLOW")
         return decision;
     const isRead = kind === "http" && READ_METHODS.includes(method.toUpperCase());
     if (isRead)
         return decision;
-    if (emergency.mode === "approval_only")
+    if (mode === "approval_only")
         return { mode: "REQUIRE_APPROVAL", matched: "approval-only mode" };
-    const s = ctx.settings.peek();
-    if (s.schedule.enabled && !isWithinBusinessHours(s.schedule, s.timezone)) {
+    const { schedule, timezone } = scheduleFor(ctx, workspace);
+    if (schedule.enabled && !isWithinBusinessHours(schedule, timezone)) {
         return { mode: "REQUIRE_APPROVAL", matched: "outside business hours" };
     }
     return decision;

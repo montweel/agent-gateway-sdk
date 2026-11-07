@@ -51,9 +51,29 @@ export {
   createRedactor,
   POLICY_PRESETS,
   applyPreset,
+  verifyLicenseKey,
+  signLicenseV2,
+  featuresFor,
+  computeRowHash,
+  GENESIS_HASH,
+  inspectResponseBody,
+  inspectMcpResult,
 } from "./core";
-export type { Redactor, McpGuard, GuardResult, WaitResult, ToolCallRequest } from "./core";
-export { createMcpHttpProxy, startMcpStdioProxy, gateToolCall } from "./mcpProxy";
+export type {
+  Redactor,
+  McpGuard,
+  GuardResult,
+  WaitResult,
+  ToolCallRequest,
+  ExecuteOverride,
+  LicenseStatus,
+  LicenseTier,
+  LicenseFeatures,
+  VerifyReport,
+  Workspace,
+  SimulationReport,
+} from "./core";
+export { createMcpHttpProxy, startMcpStdioProxy, gateToolCall, parseSse } from "./mcpProxy";
 export type { McpHttpProxyOptions, McpStdioProxyOptions, McpStdioProxy } from "./mcpProxy";
 export type {
   AgentGateway,

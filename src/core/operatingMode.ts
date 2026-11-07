@@ -2,6 +2,7 @@ import type { Db } from "./db";
 import type { GatewayContext } from "./context";
 import type { EmergencyMode, EmergencyState, ScheduleSettings } from "./types";
 import type { PolicyDecision } from "./policy";
+import type { Workspace } from "./workspaces";
 
 /**
  * Shop-wide operating modes, applied on top of the per-endpoint rules:
@@ -142,19 +143,40 @@ export function isWithinBusinessHours(schedule: ScheduleSettings, timeZone: stri
   return false;
 }
 
+/** The stricter of two modes (lockdown > approval_only > normal). */
+export function stricterMode(a: EmergencyMode, b: EmergencyMode): EmergencyMode {
+  const rank: Record<EmergencyMode, number> = { normal: 0, approval_only: 1, lockdown: 2 };
+  return rank[a] >= rank[b] ? a : b;
+}
+
+/** Effective emergency mode for a workspace: the global switch and the workspace's own, whichever is stricter. */
+export function effectiveMode(ctx: GatewayContext, workspace: Workspace | undefined): EmergencyMode {
+  const global = ctx.emergency.current().mode;
+  return workspace && !workspace.isDefault ? stricterMode(global, workspace.mode) : global;
+}
+
+/** Business hours for a workspace: its own override, else the global setting. */
+export function scheduleFor(ctx: GatewayContext, workspace: Workspace | undefined): { schedule: ScheduleSettings; timezone: string } {
+  const s = ctx.settings.peek();
+  return {
+    schedule: workspace?.schedule ?? s.schedule,
+    timezone: workspace?.timezone ?? s.timezone,
+  };
+}
+
 /**
  * Applies lockdown / approval-only / business hours to a rule decision.
  * `kind` "mcp": tool calls cannot be told apart as reads, so approval-only holds all of them.
  */
-export function applyOperatingMode(ctx: GatewayContext, decision: PolicyDecision, method: string, kind: "http" | "mcp"): PolicyDecision {
-  const emergency = ctx.emergency.current();
-  if (emergency.mode === "lockdown") return { mode: "BLOCK", matched: "lockdown" };
+export function applyOperatingMode(ctx: GatewayContext, decision: PolicyDecision, method: string, kind: "http" | "mcp", workspace?: Workspace): PolicyDecision {
+  const mode = effectiveMode(ctx, workspace);
+  if (mode === "lockdown") return { mode: "BLOCK", matched: "lockdown" };
   if (decision.mode !== "ALLOW") return decision;
   const isRead = kind === "http" && READ_METHODS.includes(method.toUpperCase());
   if (isRead) return decision;
-  if (emergency.mode === "approval_only") return { mode: "REQUIRE_APPROVAL", matched: "approval-only mode" };
-  const s = ctx.settings.peek();
-  if (s.schedule.enabled && !isWithinBusinessHours(s.schedule, s.timezone)) {
+  if (mode === "approval_only") return { mode: "REQUIRE_APPROVAL", matched: "approval-only mode" };
+  const { schedule, timezone } = scheduleFor(ctx, workspace);
+  if (schedule.enabled && !isWithinBusinessHours(schedule, timezone)) {
     return { mode: "REQUIRE_APPROVAL", matched: "outside business hours" };
   }
   return decision;

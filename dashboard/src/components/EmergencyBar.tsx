@@ -36,7 +36,18 @@ const MODES: { mode: EmergencyMode; label: string; hint: string; active: string;
  * Always-visible strip: the emergency switch plus the last 24 hours at a glance
  * (money protected, blocked, waiting for approval, budgets).
  */
-export function EmergencyBar({ readOnly }: { readOnly: boolean }) {
+export function EmergencyBar({
+  readOnly,
+  workspace = 'default',
+  multiWorkspace = false,
+}: {
+  readOnly: boolean
+  /** Selected workspace slug, or 'all'. */
+  workspace?: string
+  multiWorkspace?: boolean
+}) {
+  // A client workspace has its own switch; the default workspace and 'All Clients' drive the global one.
+  const scope = multiWorkspace && workspace !== 'all' && workspace !== 'default' ? 'client' : 'global'
   const [summary, setSummary] = useState<ProtectionSummary | null>(null)
   const [busy, setBusy] = useState<EmergencyMode | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -63,7 +74,11 @@ export function EmergencyBar({ readOnly }: { readOnly: boolean }) {
     if (readOnly || !summary || summary.emergency.mode === mode) return
     let reason: string | null = null
     if (mode !== 'normal') {
-      reason = window.prompt(mode === 'lockdown' ? 'Lock down all agent traffic. Reason (optional):' : 'Require approval for every write. Reason (optional):', '')
+      const who = scope === 'client' ? `this client's (${workspace})` : multiWorkspace ? "ALL clients'" : 'all'
+      reason = window.prompt(
+        mode === 'lockdown' ? `Lock down ${who} agent traffic. Reason (optional):` : `Require approval for every write (${scope === 'client' ? workspace : 'all clients'}). Reason (optional):`,
+        ''
+      )
       if (reason === null) return // cancelled
     }
     setBusy(mode)
@@ -84,6 +99,12 @@ export function EmergencyBar({ readOnly }: { readOnly: boolean }) {
   return (
     <div className={`border-b ${tone}`}>
       <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3 px-10 py-3">
+        <div className="flex items-center gap-2">
+        {multiWorkspace && (
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+            {scope === 'client' ? `Client switch · ${workspace}` : 'Global switch · all clients'}
+          </span>
+        )}
         <div role="radiogroup" aria-label="Emergency mode" className="inline-flex rounded-lg bg-slate-100 p-1">
           {MODES.map((m) => {
             const active = current === m.mode
@@ -106,6 +127,7 @@ export function EmergencyBar({ readOnly }: { readOnly: boolean }) {
             )
           })}
         </div>
+        </div>
 
         {summary && (
           <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-slate-600">
@@ -121,9 +143,15 @@ export function EmergencyBar({ readOnly }: { readOnly: boolean }) {
             <span className={summary.pending > 0 ? 'font-semibold text-amber-700' : ''}>
               <strong>{summary.pending}</strong> waiting for you
             </span>
+            {summary.shadow && summary.shadow.wouldBlock + summary.shadow.wouldHold > 0 && (
+              <span title="SHADOW rules: requests let through that an enforced rule would have blocked / held">
+                <strong className="text-slate-900">{summary.shadow.wouldBlock + summary.shadow.wouldHold}</strong> shadow hits
+              </span>
+            )}
             {summary.budgets.map((b) => (
-              <span key={b.ruleKey} title={`${b.ruleKey}: per ${b.windowMinutes} min${b.per === 'caller' ? ', per agent' : ''}`}>
-                Budget <span className="font-mono">{b.ruleKey.replace(/^[A-Z]+ /, '')}</span>:{' '}
+              <span key={`${b.workspaceSlug ?? ''}:${b.ruleKey}`} title={`${b.ruleKey}: per ${b.windowMinutes} min${b.per === 'caller' ? ', per agent' : ''}`}>
+                Budget {b.workspaceSlug && b.workspaceSlug !== 'default' && workspace === 'all' ? `[${b.workspaceSlug}] ` : ''}
+                <span className="font-mono">{b.ruleKey.replace(/^[A-Z]+ /, '')}</span>:{' '}
                 <strong className={b.remaining <= 0 ? 'text-red-700' : 'text-slate-900'}>
                   {money(b.spent)}/{money(b.max)}
                 </strong>
@@ -134,7 +162,9 @@ export function EmergencyBar({ readOnly }: { readOnly: boolean }) {
       </div>
       {summary && current !== 'normal' && (
         <div className="mx-auto max-w-5xl px-10 pb-2 text-xs font-medium text-slate-700">
+          {scope === 'client' ? `[${workspace}] ` : ''}
           {current === 'lockdown' ? 'LOCKDOWN: every agent request is refused.' : 'APPROVAL-ONLY: every write waits for a human.'}
+          {scope === 'client' && summary.globalEmergency && summary.globalEmergency.mode !== 'normal' && ' (set by the global switch)'}
           {summary.emergency.reason && <> Reason: “{summary.emergency.reason}”.</>}
           {summary.emergency.changedBy && (
             <>

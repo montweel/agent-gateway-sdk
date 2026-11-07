@@ -19,10 +19,10 @@ function LicenseBadge({ license, onOpen }: { license: LicenseStatus | null; onOp
     tone = 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
     title = `Pro Trial · ${license.daysRemaining ?? 0}d left`
     subtitle = 'Get free 90-day key ↗'
-  } else if (license.tier === 'PRO') {
+  } else if (license.tier === 'PRO' || license.tier === 'AGENCY') {
     tone = 'border-indigo-500/40 bg-indigo-500/10 text-indigo-300 hover:bg-indigo-500/20'
-    title = `Mont Pro · ${license.org ?? 'Licensed'} (${license.daysRemaining ?? 0}d left)`
-    subtitle = null
+    title = `Mont ${license.tier === 'AGENCY' ? 'Agency' : 'Pro'} · ${license.org ?? 'Licensed'} (${license.daysRemaining ?? 0}d left)`
+    subtitle = license.maxWorkspaces && license.maxWorkspaces > 1 ? `Up to ${license.maxWorkspaces} workspaces` : null
   }
 
   return (

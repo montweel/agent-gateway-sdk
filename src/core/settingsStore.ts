@@ -20,6 +20,7 @@ export function defaultSettings(): GatewaySettings {
     timezone: "UTC",
     schedule: { enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "18:00" },
     alerts: { enabled: true, burstThreshold: 10, burstWindowMinutes: 5, digestHour: null },
+    responseGuard: { enabled: false, maxArrayItems: 200, onLargeArray: "block", onSecret: "scrub" },
   };
 }
 
@@ -48,6 +49,7 @@ export function coerceSettings(raw: unknown): GatewaySettings {
   const pv = (typeof r.privacy === "object" && r.privacy !== null ? r.privacy : {}) as Record<string, unknown>;
   const sc = (typeof r.schedule === "object" && r.schedule !== null ? r.schedule : {}) as Record<string, unknown>;
   const al = (typeof r.alerts === "object" && r.alerts !== null ? r.alerts : {}) as Record<string, unknown>;
+  const rg = (typeof r.responseGuard === "object" && r.responseGuard !== null ? r.responseGuard : {}) as Record<string, unknown>;
   const port = r.listenPort;
   return {
     listenPort: typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null,
@@ -93,6 +95,16 @@ export function coerceSettings(raw: unknown): GatewaySettings {
           ? (al.burstWindowMinutes as number)
           : d.alerts.burstWindowMinutes,
       digestHour: Number.isInteger(al.digestHour) && (al.digestHour as number) >= 0 && (al.digestHour as number) <= 23 ? (al.digestHour as number) : null,
+    },
+    responseGuard: {
+      enabled: bool(rg.enabled),
+      maxArrayItems:
+        Number.isInteger(rg.maxArrayItems) && (rg.maxArrayItems as number) >= 1 && (rg.maxArrayItems as number) <= 1_000_000
+          ? (rg.maxArrayItems as number)
+          : d.responseGuard.maxArrayItems,
+      // Fail safe: anything unreadable picks the stricter action.
+      onLargeArray: rg.onLargeArray === "truncate" ? "truncate" : "block",
+      onSecret: rg.onSecret === "block" || (rg.onSecret !== undefined && rg.onSecret !== "scrub") ? "block" : "scrub",
     },
   };
 }

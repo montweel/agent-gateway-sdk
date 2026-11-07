@@ -16,6 +16,7 @@ import path from "path";
 import express from "express";
 import type { Request, Response } from "express";
 import sqlite3 from "sqlite3";
+import { TEST_AGENCY_KEY } from "./testLicense";
 import { createAgentGateway } from "../src/gateway";
 import type { AgentGateway, Rules } from "../src/gateway";
 import { evaluateRule, validatePolicies } from "../src/core/policy";
@@ -73,6 +74,8 @@ async function makeHarness(opts: { rules: Rules; targetUrl?: string; rateLimitPe
     dbPath,
     adminToken: ADMIN_TOKEN,
     dbOperationTimeoutMs: opts.dbTimeoutMs ?? 2000,
+    licenseKey: TEST_AGENCY_KEY,
+    licenseAnchorFile: path.join(dir, "anchor.json"),
   });
   await gateway.ready;
 

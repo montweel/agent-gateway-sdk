@@ -1,10 +1,10 @@
 import { useMemo, useState } from 'react'
 import axios from 'axios'
-import { AlertCircle, Bot, Check, MessageSquareQuote, ShieldOff, X } from 'lucide-react'
+import { AlertCircle, Bot, Check, MessageSquareQuote, PencilLine, ShieldOff, X } from 'lucide-react'
 import { api, errorMessage } from '../lib/api'
 import type { ApprovalsApi } from '../hooks/useApprovals'
 import type { Approval, Decision, DecideResponse, RevokeResponse } from '../lib/types'
-import { formatTime, READ_ONLY_HINT } from '../lib/utils'
+import { formatTime, INPUT_CLASS, prettyJson, READ_ONLY_HINT } from '../lib/utils'
 import { HighRiskSummary, JsonInspector } from '../components/JsonInspector'
 import { RevokeModal } from '../components/RevokeModal'
 import type { RevokeTarget } from '../components/RevokeModal'
@@ -66,6 +66,24 @@ function CallerPanel({ a }: { a: Approval }) {
   )
 }
 
+interface EditDraft {
+  body: string
+  query: string
+  error: string | null
+}
+
+/** Parses an edit textarea. Empty = no change to that part. */
+function parseDraft(text: string, label: string, mustBeObject: boolean): { ok: true; value: unknown } | { ok: false; message: string } {
+  if (text.trim() === '') return { ok: true, value: undefined }
+  try {
+    const v = JSON.parse(text) as unknown
+    if (mustBeObject && (typeof v !== 'object' || v === null || Array.isArray(v))) return { ok: false, message: `${label} must be a JSON object.` }
+    return { ok: true, value: v }
+  } catch (e) {
+    return { ok: false, message: `${label} is not valid JSON: ${(e as Error).message}` }
+  }
+}
+
 export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: ApprovalsApi; readOnly: boolean }) {
   const { approvals, loading, error, reload } = approvalsApi
   const [filter, setFilter] = useState<'ALL' | 'PENDING'>('ALL')
@@ -73,24 +91,50 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
   const [cardErrors, setCardErrors] = useState<Record<number, string | undefined>>({})
   const [notice, setNotice] = useState<string | null>(null)
   const [revokeTarget, setRevokeTarget] = useState<RevokeTarget | null>(null)
+  const [edits, setEdits] = useState<Record<number, EditDraft | undefined>>({})
+
+  function startEdit(a: Approval) {
+    setEdits((prev) => ({
+      ...prev,
+      [a.id]: { body: prettyJson(a.body) ?? '', query: a.kind === 'mcp' ? '' : (prettyJson(a.query_json ?? null) ?? '{}'), error: null },
+    }))
+  }
+
+  async function approveEdited(a: Approval) {
+    const draft = edits[a.id]
+    if (!draft) return
+    const body = parseDraft(draft.body, a.kind === 'mcp' ? 'Tool arguments' : 'Body', a.kind === 'mcp')
+    const query = a.kind === 'mcp' ? ({ ok: true, value: undefined } as const) : parseDraft(draft.query, 'Query', true)
+    if (!body.ok || !query.ok) {
+      setEdits((prev) => ({ ...prev, [a.id]: { ...draft, error: !body.ok ? body.message : !query.ok ? query.message : null } }))
+      return
+    }
+    const ok = await decide(a.id, 'APPROVE', { modifiedBody: body.value, modifiedQuery: query.value })
+    if (ok) setEdits((prev) => ({ ...prev, [a.id]: undefined }))
+  }
 
   const pendingCount = useMemo(() => approvals.filter((a) => a.status === 'PENDING').length, [approvals])
   const visible = filter === 'PENDING' ? approvals.filter((a) => a.status === 'PENDING') : approvals
 
-  async function decide(id: number, decision: Decision) {
-    if (readOnly) return
+  async function decide(id: number, decision: Decision, edit?: { modifiedBody?: unknown; modifiedQuery?: unknown }): Promise<boolean> {
+    if (readOnly) return false
     setCardErrors((prev) => ({ ...prev, [id]: undefined }))
     setNotice(null)
     setDeciding((prev) => ({ ...prev, [id]: decision }))
     try {
-      const res = await api.post<DecideResponse>(`/approvals/${id}/decide`, { decision })
+      const payload: Record<string, unknown> = { decision }
+      if (edit?.modifiedBody !== undefined) payload.modifiedBody = edit.modifiedBody
+      if (edit?.modifiedQuery !== undefined) payload.modifiedQuery = edit.modifiedQuery
+      const res = await api.post<DecideResponse>(`/approvals/${id}/decide`, payload)
       if (decision === 'APPROVE' || decision === 'RETRY') {
         const code = res.data.replayStatus !== undefined ? ` The target replied with HTTP ${res.data.replayStatus}.` : ''
         const warn = res.data.warning ? ` ${res.data.warning}` : ''
-        setNotice(`Request #${id} was ${decision === 'RETRY' ? 'retried' : 'approved'} and executed.${code}${warn}`)
+        const changed = res.data.edited && res.data.changes?.length ? ` Your edits: ${res.data.changes.join('; ')}.` : ''
+        setNotice(`Request #${id} was ${decision === 'RETRY' ? 'retried' : 'approved'} and executed.${changed}${code}${warn}`)
       } else {
         setNotice(`Request #${id} was rejected.`)
       }
+      return true
     } catch (err) {
       let message = errorMessage(err)
       const status = axios.isAxiosError(err) ? err.response?.status : undefined
@@ -98,6 +142,7 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
         message = `${message} The list has been refreshed.`
       }
       setCardErrors((prev) => ({ ...prev, [id]: message }))
+      return false
     } finally {
       setDeciding((prev) => ({ ...prev, [id]: undefined }))
       await reload(true)
@@ -177,6 +222,7 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono text-xs font-semibold text-slate-600">#{a.id}</span>
+                      {a.workspace_slug && a.workspace_slug !== 'default' && <Badge tone="slate">{a.workspace_name ?? a.workspace_slug}</Badge>}
                       {a.kind === 'mcp' ? <Badge tone="violet">MCP tool call</Badge> : <MethodBadge method={a.method} />}
                       <span className="break-all font-mono text-sm font-medium text-slate-900">
                         {a.kind === 'mcp' ? a.path.replace('/api/mcp/tools/', '') : a.path}
@@ -231,6 +277,72 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
                   </div>
                 </details>
 
+                {(a.modified_body || a.modified_query) && (
+                  <div className="mt-4 rounded-lg border border-indigo-200 bg-indigo-50/60 p-3">
+                    <p className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-indigo-700">
+                      <PencilLine className="h-3.5 w-3.5" aria-hidden="true" /> Executed with the approver's edits
+                    </p>
+                    {a.modified_body && <JsonInspector text={a.modified_body} maxHeight="max-h-40" />}
+                    {a.modified_query && (
+                      <>
+                        <p className="mb-1 mt-2 text-xs font-medium text-slate-500">Edited query</p>
+                        <JsonInspector text={a.modified_query} maxHeight="max-h-32" />
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {isPending && edits[a.id] && (
+                  <div className="mt-4 rounded-lg border border-indigo-300 bg-white p-4">
+                    <p className="text-sm font-semibold text-slate-900">Edit &amp; Approve</p>
+                    <p className="mt-0.5 text-xs text-slate-500">
+                      Change any value, then approve. Fields you leave untouched keep their real values, including the ones shown redacted
+                      here. The rule is re-checked against your edit, so hard limits still apply.
+                    </p>
+                    <label className="mt-3 block">
+                      <span className="mb-1 block text-xs font-medium text-slate-600">{a.kind === 'mcp' ? 'Tool arguments (JSON)' : 'Request body (JSON)'}</span>
+                      <textarea
+                        value={edits[a.id]?.body ?? ''}
+                        onChange={(e) => setEdits((prev) => ({ ...prev, [a.id]: { ...(prev[a.id] as EditDraft), body: e.target.value, error: null } }))}
+                        rows={Math.min(16, Math.max(4, (edits[a.id]?.body ?? '').split('\n').length + 1))}
+                        spellCheck={false}
+                        className={`${INPUT_CLASS} font-mono text-xs`}
+                      />
+                    </label>
+                    {a.kind !== 'mcp' && (
+                      <label className="mt-3 block">
+                        <span className="mb-1 block text-xs font-medium text-slate-600">Query parameters (JSON object)</span>
+                        <textarea
+                          value={edits[a.id]?.query ?? ''}
+                          onChange={(e) => setEdits((prev) => ({ ...prev, [a.id]: { ...(prev[a.id] as EditDraft), query: e.target.value, error: null } }))}
+                          rows={3}
+                          spellCheck={false}
+                          className={`${INPUT_CLASS} font-mono text-xs`}
+                        />
+                      </label>
+                    )}
+                    {edits[a.id]?.error && <p role="alert" className="mt-2 text-xs text-red-600">{edits[a.id]?.error}</p>}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void approveEdited(a)}
+                        disabled={action !== undefined}
+                        className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500 disabled:opacity-60"
+                      >
+                        {action === 'APPROVE' ? <Spinner /> : <Check className="h-4 w-4" aria-hidden="true" />}
+                        Approve with changes
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEdits((prev) => ({ ...prev, [a.id]: undefined }))}
+                        className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                      >
+                        Cancel edit
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {a.response_preview && (
                   <div className="mt-4">
                     <p className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-slate-500">Response preview</p>
@@ -284,6 +396,17 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
                         {action === 'APPROVE' || action === 'RETRY' ? <Spinner /> : <Check className="h-4 w-4" aria-hidden="true" />}
                         {isFailed ? 'Retry' : 'Approve & Execute'}
                       </button>
+                      {isPending && !edits[a.id] && (
+                        <button
+                          onClick={() => startEdit(a)}
+                          disabled={action !== undefined || readOnly}
+                          title={readOnly ? READ_ONLY_HINT : 'Change the payload (e.g. lower a refund amount) before it runs (Mont Pro)'}
+                          className="inline-flex items-center gap-2 rounded-lg border border-indigo-200 bg-white px-4 py-2 text-sm font-semibold text-indigo-700 shadow-sm transition hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          <PencilLine className="h-4 w-4" aria-hidden="true" />
+                          Edit &amp; Approve
+                        </button>
+                      )}
                       <button
                         onClick={() => void decide(a.id, 'REJECT')}
                         disabled={action !== undefined || readOnly}

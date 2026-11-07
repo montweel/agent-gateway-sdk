@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.REDACTED_SECRET = exports.REDACTED_CARD = exports.REDACTED = void 0;
 exports.luhnValid = luhnValid;
 exports.looksLikeCard = looksLikeCard;
+exports.scrubSecrets = scrubSecrets;
 exports.isSecretKey = isSecretKey;
 exports.createRedactor = createRedactor;
 exports.REDACTED = "[REDACTED]";
@@ -90,6 +91,27 @@ function luhnValid(digits) {
 /** Luhn-valid AND starts with a real card network prefix (2-6), so ms timestamps (1…) never match. */
 function looksLikeCard(digits) {
     return /^[2-6]/.test(digits) && luhnValid(digits);
+}
+/**
+ * Secrets and card numbers only (no email / phone masking): what the outbound response guard
+ * treats as "must never leave". Returns the masked text and how many values were masked.
+ */
+function scrubSecrets(value) {
+    let hits = 0;
+    let out = value;
+    for (const re of SECRET_PATTERNS) {
+        out = out.replace(re, () => {
+            hits++;
+            return exports.REDACTED_SECRET;
+        });
+    }
+    out = out.replace(CARD_CANDIDATE, (m) => {
+        if (!looksLikeCard(m.replace(/[ -]/g, "")))
+            return m;
+        hits++;
+        return exports.REDACTED_CARD;
+    });
+    return { text: out, hits };
 }
 function normKey(key) {
     return key.toLowerCase().replace(/[_\-.\s]/g, "");

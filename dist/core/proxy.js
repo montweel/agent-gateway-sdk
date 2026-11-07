@@ -64,10 +64,11 @@ async function readCapped(upstream, max = constants_1.MAX_UPSTREAM_BYTES) {
  *   - If the client disconnects while the upstream call is in flight, the upstream call is aborted.
  *   - The whole upstream response is read (and size-capped) BEFORE any status or header is
  *     written, so an upstream that dies mid-response becomes a clean 502/504, never a
- *     truncated 200 that an agent could mistake for success.
+ *     truncated 200 that an agent could mistake for success. That is also what lets the
+ *     response guard inspect it.
  */
-async function proxyToTarget(req, res, targetUrl, config) {
-    const url = targetUrl + req.originalUrl;
+async function proxyToTarget(req, res, targetUrl, config, options = {}) {
+    const url = targetUrl + (options.forwardUrl ?? req.originalUrl);
     // Identity headers (the standard ones plus whatever this install configured for
     // SSO) and gateway credentials are removed, so the upstream never sees a value
     // a caller could have forged or a secret that was meant for the gateway.
@@ -78,8 +79,8 @@ async function proxyToTarget(req, res, targetUrl, config) {
         if (value === undefined || constants_1.HOP_BY_HOP.has(k) || strip.has(k))
             continue;
         const v = Array.isArray(value) ? value.join(", ") : value;
-        // "Authorization: Bearer agk_..." is the gateway's own credential, not the upstream's.
-        if (k === "authorization" && v.toLowerCase().startsWith(`bearer ${constants_1.AGENT_KEY_PREFIX}`))
+        // "Authorization: Bearer agk_... / mws_..." is the gateway's own credential, not the upstream's.
+        if (k === "authorization" && (v.toLowerCase().startsWith(`bearer ${constants_1.AGENT_KEY_PREFIX}`) || v.toLowerCase().startsWith(`bearer ${constants_1.WORKSPACE_KEY_PREFIX}`)))
             continue;
         headers.set(k, v);
     }
@@ -110,14 +111,36 @@ async function proxyToTarget(req, res, targetUrl, config) {
         });
         // Read (and size-check) the whole body before committing to a status, so an
         // oversized or broken response can still become a clean 502/504.
-        const payload = await readCapped(upstream);
+        let payload = await readCapped(upstream);
+        let guarded = null;
+        if (options.inspectResponse) {
+            const verdict = await options.inspectResponse(upstream.status, upstream.headers.get("content-type"), payload);
+            if (verdict.action === "block") {
+                if (clientGone())
+                    return;
+                res.setHeader("x-mont-response-guard", "blocked");
+                (0, utils_1.sendError)(res, 502, "Response Policy Violation", verdict.message, { violations: verdict.violations });
+                return;
+            }
+            if (verdict.action === "modified") {
+                payload = verdict.body;
+                guarded = "scrubbed";
+            }
+        }
         if (clientGone())
             return;
         res.status(upstream.status);
         upstream.headers.forEach((value, key) => {
-            if (!SKIP_RESPONSE_HEADERS.has(key.toLowerCase()))
-                res.setHeader(key, value);
+            const k = key.toLowerCase();
+            if (SKIP_RESPONSE_HEADERS.has(k))
+                return;
+            // A changed body invalidates validators computed over the original bytes.
+            if (guarded && (k === "etag" || k === "content-md5" || k === "digest"))
+                return;
+            res.setHeader(key, value);
         });
+        if (guarded)
+            res.setHeader("x-mont-response-guard", guarded);
         const withCookies = upstream.headers;
         const cookies = withCookies.getSetCookie?.() ?? [];
         if (cookies.length > 0)

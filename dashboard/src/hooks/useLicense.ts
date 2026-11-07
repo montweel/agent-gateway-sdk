@@ -28,5 +28,6 @@ export function useLicense(): LicenseApi {
     void refresh()
   }, [refresh])
 
-  return { license, isPro: license?.tier === 'PRO', refresh, setLicense }
+  // PRO and AGENCY (and the Pro trial) unlock the paid features.
+  return { license, isPro: license !== null && license.tier !== 'COMMUNITY', refresh, setLicense }
 }

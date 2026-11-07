@@ -15,6 +15,7 @@ import {
 } from "../utils";
 import type { BudgetSpec, DedupeSpec, PolicyTier, Rule } from "../types";
 import { validateBudget, validateDedupe, validatePolicies } from "../policy";
+import { requireWorkspace } from "./scope";
 
 /** Adds rateLimit to a rule only when it is a real limit, so rules.json stays clean. */
 function withRateLimit(rule: Rule, rateLimit: number | null | undefined): Rule {
@@ -58,7 +59,7 @@ function parseHeaderName(
 
 /** Gateway settings (/config) and access rules (/rules). */
 export function registerSettingsRoutes(router: Router, ctx: GatewayContext): void {
-  const { config: configStore, rules: rulesStore, port, license } = ctx;
+  const { config: configStore, port, license } = ctx;
 
   // ---- Config ----
   router.get("/config", (req: AuthenticatedRequest, res: Response) => {
@@ -172,12 +173,16 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
     }
   });
 
-  // ---- Rules ----
-  router.get("/rules", (_req: Request, res: Response) => {
-    res.json(rulesStore.load());
+  // ---- Rules (per workspace: x-mont-workspace header, default workspace = rules.json) ----
+  router.get("/rules", (req: Request, res: Response) => {
+    const ws = requireWorkspace(ctx, req, res);
+    if (!ws) return;
+    res.json(ctx.workspaces.rules(ws.id));
   });
 
-  router.post("/rules", (req: Request, res: Response) => {
+  router.post("/rules", async (req: Request, res: Response) => {
+    const ws = requireWorkspace(ctx, req, res);
+    if (!ws) return;
     const body = req.body as unknown;
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
       sendError(res, 400, "Bad Request", 'Body must be a JSON object like { "/api/some-path": { "mode": "ALLOW" } }.');
@@ -189,7 +194,7 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
       return;
     }
 
-    const current = rulesStore.load();
+    const current = ctx.workspaces.rules(ws.id);
     const updates: Rules = {};
 
     for (const [rawKey, value] of entries) {
@@ -223,7 +228,7 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
       } else if (typeof value === "object" && value !== null && !Array.isArray(value)) {
         const v = value as { mode?: unknown; description?: unknown; rateLimit?: unknown; policies?: unknown; budget?: unknown; dedupe?: unknown };
         if (typeof v.mode !== "string" || !RULE_MODES.includes(v.mode as RuleMode)) {
-          sendError(res, 400, "Bad Request", `mode for "${endpoint}" must be ALLOW, BLOCK or REQUIRE_APPROVAL.`);
+          sendError(res, 400, "Bad Request", `mode for "${endpoint}" must be ALLOW, BLOCK, REQUIRE_APPROVAL, SHADOW_BLOCK or SHADOW_APPROVAL.`);
           return;
         }
         const desc = v.description;
@@ -296,7 +301,7 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
 
     try {
       const rules: Rules = { ...current, ...updates };
-      rulesStore.save(rules);
+      await ctx.workspaces.saveRules(ws.id, rules);
       const warnings = Object.entries(updates)
         .filter(([, r]) => r.policies && r.policies.length > 0 && r.mode === "ALLOW")
         .map(
@@ -304,13 +309,21 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
             `"${k}" falls back to ALLOW when no policy tier matches (for example when a field is missing). ` +
             "Use REQUIRE_APPROVAL or BLOCK as the fallback for fail-closed behaviour."
         );
-      res.json({ success: true, rules, warnings });
+      for (const [k, r] of Object.entries(updates)) {
+        const shadowTiers = (r.policies ?? []).some((t) => t.mode === "SHADOW_BLOCK" || t.mode === "SHADOW_APPROVAL");
+        if (r.mode === "SHADOW_BLOCK" || r.mode === "SHADOW_APPROVAL" || shadowTiers) {
+          warnings.push(`"${k}" uses a SHADOW mode: matching requests are let through and only logged as "would have been blocked / held". Switch to BLOCK or REQUIRE_APPROVAL to enforce it.`);
+        }
+      }
+      res.json({ success: true, rules, warnings, workspace: ws.slug });
     } catch (err) {
-      sendInternalError(res, "Failed to save rules", err, "Could not write rules.json.");
+      sendInternalError(res, "Failed to save rules", err, "Could not save the rules.");
     }
   });
 
-  router.delete("/rules", (req: Request, res: Response) => {
+  router.delete("/rules", async (req: Request, res: Response) => {
+    const ws = requireWorkspace(ctx, req, res);
+    if (!ws) return;
     const bodyPath = (req.body as { path?: unknown } | undefined)?.path;
     const queryPath = req.query.path;
     const raw = typeof bodyPath === "string" ? bodyPath : typeof queryPath === "string" ? queryPath : "";
@@ -326,7 +339,7 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
       return;
     }
     const endpoint = ruleKey(parsedKey.method, parsedKey.path);
-    const rules = rulesStore.load();
+    const rules = ctx.workspaces.rules(ws.id);
     if (!Object.prototype.hasOwnProperty.call(rules, endpoint)) {
       sendError(res, 404, "Not Found", `No rule exists for "${endpoint}".`);
       return;
@@ -334,10 +347,10 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
 
     try {
       delete rules[endpoint];
-      rulesStore.save(rules);
-      res.json({ success: true, rules });
+      await ctx.workspaces.saveRules(ws.id, rules);
+      res.json({ success: true, rules, workspace: ws.slug });
     } catch (err) {
-      sendInternalError(res, "Failed to save rules", err, "Could not write rules.json.");
+      sendInternalError(res, "Failed to save rules", err, "Could not save the rules.");
     }
   });
 }

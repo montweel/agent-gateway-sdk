@@ -3,14 +3,20 @@ import type { Db } from "./db";
 import { defaultAnchorPath, readStateFile, writeStateFile } from "./installAnchor";
 
 /**
- * Offline Mont Pro licensing. A license is `MONT-<base64url payload>.<base64url signature>`:
- * an Ed25519 signature over the base64url payload string, checked against the embedded
- * public key. Nothing is ever sent over the network. Keys are minted with
- * scripts/license-tool.ts.
+ * Offline, zero-phone-home Mont licensing (Ed25519, node:crypto only).
  *
- * Resolution order: a signed key (MONT_LICENSE_KEY env, else the stored one), then the
- * free 7-day trial that starts on first boot. Community Edition is the fallback and
- * only ever gates the extras listed in the admin routes, never the proxy itself.
+ * Two key formats are accepted, both verified against the embedded public key:
+ *   v2  MONT-V2.<base64url payload>.<base64url signature>
+ *       payload  = { v: 2, tier: "PRO" | "AGENCY", orgName, maxWorkspaces, expiresAt, iat, email? }
+ *       signature = Ed25519 over the ASCII string "MONT-V2.<base64url payload>" (version-bound)
+ *       minted with scripts/keygen.ts
+ *   v1  MONT-<base64url payload>.<base64url signature>   (Mont Pro keys issued before v2)
+ *       payload  = { org, email, tier: "PRO" | "TRIAL", iat, exp }, signature over the payload string
+ *       minted with scripts/license-tool.ts
+ *
+ * Resolution order: a signed key (host option, then MONT_LICENSE_KEY env, then the one activated
+ * in the dashboard), then the free 7-day trial that starts on first boot. COMMUNITY is the
+ * fallback; it never gates the proxy itself, only the Pro / Agency extras (see LicenseFeatures).
  */
 
 /**
@@ -49,32 +55,74 @@ const TRIAL_KEY_WINDOW_REASON =
   "Free 90-day trial keys must be activated within 100 days of first install, and that window has passed. Upgrade to a paid Team Pro key at https://montweel.com.";
 const TRIAL_EXPIRED_REASON = `Your 7-day instant Pro trial has ended. ${FREE_TRIAL_CTA}`;
 
+export type LicenseTier = "COMMUNITY" | "PRO" | "AGENCY";
+export const LICENSE_TIERS: LicenseTier[] = ["COMMUNITY", "PRO", "AGENCY"];
+
+/** What a tier unlocks. COMMUNITY keeps local approvals, payload rules, budgets, redaction and CSV export. */
+export interface LicenseFeatures {
+  /** More than one workspace (client store) on this installation. */
+  multiWorkspace: boolean;
+  /** Zero-tunnel Telegram / Slack Approve & Reject buttons (long-polling / Socket Mode) and bot commands. */
+  interactiveApprovals: boolean;
+  /** Compensating rollback webhook on Revoke. */
+  rollbackWebhooks: boolean;
+  /** Edit & Approve: change the body / query of a held request before it runs. */
+  payloadPatching: boolean;
+  /** GET /audit/verify: prove the hash-chained audit ledger was not modified. */
+  auditVerification: boolean;
+}
+
+export const COMMUNITY_MAX_WORKSPACES = 1;
+export const PRO_DEFAULT_MAX_WORKSPACES = 3;
+export const AGENCY_DEFAULT_MAX_WORKSPACES = 25;
+export const MAX_LICENSED_WORKSPACES = 10_000;
+
+export function featuresFor(tier: LicenseTier, maxWorkspaces: number): LicenseFeatures {
+  const paid = tier !== "COMMUNITY";
+  return {
+    multiWorkspace: paid && maxWorkspaces > 1,
+    interactiveApprovals: paid,
+    rollbackWebhooks: paid,
+    payloadPatching: paid,
+    auditVerification: paid,
+  };
+}
+
 export interface LicenseStatus {
   valid: boolean;
   expired: boolean;
   isTrial: boolean;
-  tier: "COMMUNITY" | "PRO";
+  tier: LicenseTier;
   org?: string;
   email?: string;
   issuedAt?: string;
   expiresAt?: string;
   daysRemaining?: number;
-  source: "ENV" | "DB" | "TRIAL" | "TRIAL_EXPIRED";
+  source: "OPTION" | "ENV" | "DB" | "TRIAL" | "TRIAL_EXPIRED";
   reason?: string;
   renewalUrl: string;
+  /** Workspaces this installation may serve (default workspace included). */
+  maxWorkspaces: number;
+  features: LicenseFeatures;
+  /** 1 = MONT-..., 2 = MONT-V2.... Absent for the trial / Community. */
+  keyVersion?: 1 | 2;
 }
 
 export interface LicensePayload {
   org: string;
   email: string;
-  tier: "PRO";
+  tier: "PRO" | "AGENCY";
   /** Free 90-day trial key (signed as `trial: true` or `tier: "TRIAL"`): one per machine, see statusFromKey. */
   trial: boolean;
   iat: number;
   exp: number;
+  maxWorkspaces: number;
+  version: 1 | 2;
 }
 
 export type VerifyResult = { ok: true; payload: LicensePayload } | { ok: false; reason: string };
+
+const V2_PREFIX = "MONT-V2.";
 
 let publicKeyCache: { raw: string; key: crypto.KeyObject } | undefined;
 
@@ -89,9 +137,63 @@ function getPublicKey(): crypto.KeyObject {
   return publicKeyCache.key;
 }
 
+const B64URL = /^[A-Za-z0-9_-]+$/;
+
+/** MONT-V2.<payload>.<signature>; the signature covers "MONT-V2.<payload>". */
+function verifyV2(key: string): VerifyResult {
+  const rest = key.slice(V2_PREFIX.length);
+  const parts = rest.split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1] || !B64URL.test(parts[0]) || !B64URL.test(parts[1])) {
+    return { ok: false, reason: "The license key is incomplete. A v2 key looks like MONT-V2.<payload>.<signature>." };
+  }
+  const [encoded, signature] = parts;
+  try {
+    const sig = Buffer.from(signature, "base64url");
+    // Canonical encoding only: a re-encoded signature must be byte-identical.
+    if (sig.length !== 64 || sig.toString("base64url") !== signature) return { ok: false, reason: "The license key signature is not valid." };
+    if (!crypto.verify(null, Buffer.from(`${V2_PREFIX}${encoded}`), getPublicKey(), sig)) {
+      return { ok: false, reason: "The license key signature is not valid." };
+    }
+    const p = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as Record<string, unknown>;
+    const tier = p.tier;
+    const maxWorkspaces = p.maxWorkspaces;
+    if (
+      p.v !== 2 ||
+      (tier !== "PRO" && tier !== "AGENCY") ||
+      typeof p.orgName !== "string" ||
+      p.orgName.trim() === "" ||
+      typeof p.expiresAt !== "number" ||
+      !Number.isFinite(p.expiresAt) ||
+      typeof p.iat !== "number" ||
+      !Number.isInteger(maxWorkspaces) ||
+      (maxWorkspaces as number) < 1 ||
+      (maxWorkspaces as number) > MAX_LICENSED_WORKSPACES ||
+      (p.email !== undefined && typeof p.email !== "string")
+    ) {
+      return { ok: false, reason: "The license key payload is malformed." };
+    }
+    return {
+      ok: true,
+      payload: {
+        org: p.orgName,
+        email: typeof p.email === "string" ? p.email : "",
+        tier,
+        trial: p.trial === true,
+        iat: p.iat,
+        exp: p.expiresAt,
+        maxWorkspaces: maxWorkspaces as number,
+        version: 2,
+      },
+    };
+  } catch {
+    return { ok: false, reason: "The license key could not be read." };
+  }
+}
+
 /** Checks format, signature and payload shape. Does NOT check expiry. */
 export function verifyLicenseKey(licenseKey: string): VerifyResult {
   const key = licenseKey.trim();
+  if (key.startsWith(V2_PREFIX)) return verifyV2(key);
   const dot = key.indexOf(".");
   if (!key.startsWith(LICENSE_PREFIX) || dot < 0) {
     return { ok: false, reason: "That is not a Mont license key. It should look like MONT-<payload>.<signature>." };
@@ -117,17 +219,69 @@ export function verifyLicenseKey(licenseKey: string): VerifyResult {
       return { ok: false, reason: "The license key payload is malformed." };
     }
     const trial = p.tier === "TRIAL" || p.trial === true;
-    return { ok: true, payload: { org: p.org, email: p.email, tier: "PRO", trial, iat: p.iat, exp: p.exp } };
+    return {
+      ok: true,
+      payload: { org: p.org, email: p.email, tier: "PRO", trial, iat: p.iat, exp: p.exp, maxWorkspaces: PRO_DEFAULT_MAX_WORKSPACES, version: 1 },
+    };
   } catch {
     return { ok: false, reason: "The license key could not be read." };
   }
+}
+
+export interface LicenseV2Input {
+  tier: "PRO" | "AGENCY";
+  orgName: string;
+  maxWorkspaces: number;
+  /** ms since epoch */
+  expiresAt: number;
+  /** ms since epoch; default now */
+  iat?: number;
+  email?: string;
+}
+
+/**
+ * Signs a v2 license (used by scripts/keygen.ts and the test suite). Needs the Ed25519 private
+ * key (PKCS#8 DER, base64url, or a KeyObject): the gateway itself only ever holds the public key.
+ */
+export function signLicenseV2(input: LicenseV2Input, privateKey: crypto.KeyObject | string): string {
+  if (input.tier !== "PRO" && input.tier !== "AGENCY") throw new Error('tier must be "PRO" or "AGENCY".');
+  if (!input.orgName.trim()) throw new Error("orgName is required.");
+  if (!Number.isInteger(input.maxWorkspaces) || input.maxWorkspaces < 1 || input.maxWorkspaces > MAX_LICENSED_WORKSPACES) {
+    throw new Error(`maxWorkspaces must be a whole number from 1 to ${MAX_LICENSED_WORKSPACES}.`);
+  }
+  if (!Number.isFinite(input.expiresAt)) throw new Error("expiresAt must be a timestamp in ms.");
+  const key =
+    typeof privateKey === "string" ? crypto.createPrivateKey({ key: Buffer.from(privateKey.trim(), "base64url"), format: "der", type: "pkcs8" }) : privateKey;
+  const payload: Record<string, unknown> = {
+    v: 2,
+    tier: input.tier,
+    orgName: input.orgName.trim(),
+    maxWorkspaces: input.maxWorkspaces,
+    expiresAt: Math.trunc(input.expiresAt),
+    iat: Math.trunc(input.iat ?? Date.now()),
+  };
+  if (input.email) payload.email = input.email;
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto.sign(null, Buffer.from(`${V2_PREFIX}${encoded}`), key).toString("base64url");
+  return `${V2_PREFIX}${encoded}.${signature}`;
 }
 
 const daysLeft = (expMs: number, now: number): number => Math.max(0, Math.ceil((expMs - now) / DAY_MS));
 
 export interface LicenseService {
   resolveLicenseStatus(): Promise<LicenseStatus>;
+  /** True for PRO and AGENCY (trial included). */
   isPro(): Promise<boolean>;
+  /**
+   * Hot-path view: the last resolved status (refreshed in the background and after every key
+   * change). Before the first resolution it is COMMUNITY, so nothing paid is ever granted early.
+   */
+  current(): LicenseStatus;
+  /** Re-resolves now and updates current(). */
+  refresh(): Promise<LicenseStatus>;
+  /** Background refresh (other processes may activate a key; keys expire). */
+  start(intervalMs?: number): void;
+  stop(): void;
   /** Stores a key that already passed verifyLicenseKey. */
   saveLicenseKey(licenseKey: string): Promise<void>;
   removeLicenseKey(): Promise<void>;
@@ -142,11 +296,34 @@ export interface LicenseServiceOptions {
   licenseFile: string;
   /** Machine anchor location (default: ~/.montweel/anchor.json). */
   anchorFile?: string;
+  /** Key supplied by the host application; checked before MONT_LICENSE_KEY. */
+  licenseKey?: string;
 }
+
+const COMMUNITY_FEATURES = featuresFor("COMMUNITY", COMMUNITY_MAX_WORKSPACES);
 
 export function createLicenseService(db: Db, options: LicenseServiceOptions): LicenseService {
   const licenseFile = options.licenseFile;
   const anchorFile = options.anchorFile ?? defaultAnchorPath();
+  let cached: LicenseStatus = {
+    valid: false,
+    expired: false,
+    isTrial: false,
+    tier: "COMMUNITY",
+    source: "TRIAL_EXPIRED",
+    renewalUrl: MONT_LICENSE_PORTAL_URL,
+    maxWorkspaces: COMMUNITY_MAX_WORKSPACES,
+    features: COMMUNITY_FEATURES,
+  };
+  let refreshTimer: NodeJS.Timeout | undefined;
+
+  /** Community fields for any status that grants nothing. */
+  const community = (s: Omit<LicenseStatus, "maxWorkspaces" | "features" | "tier"> & { tier?: LicenseTier }): LicenseStatus => ({
+    ...s,
+    tier: "COMMUNITY",
+    maxWorkspaces: COMMUNITY_MAX_WORKSPACES,
+    features: COMMUNITY_FEATURES,
+  });
 
   async function getSetting(key: string): Promise<string | undefined> {
     return (await db.get<{ value: string }>("SELECT value FROM system_settings WHERE key = ?", [key]))?.value;
@@ -219,7 +396,7 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
 
   async function statusFromKey(
     licenseKey: string,
-    source: "ENV" | "DB",
+    source: "OPTION" | "ENV" | "DB",
     now: number,
     install: { firstSeenAt: number; trialKeyHash?: string }
   ): Promise<LicenseStatus | undefined> {
@@ -245,11 +422,10 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
         }
       }
     }
-    return {
+    const base = {
       valid: active,
       expired: !active,
       isTrial: false,
-      tier: active ? "PRO" : "COMMUNITY",
       org: payload.org,
       email: payload.email,
       issuedAt: new Date(payload.iat).toISOString(),
@@ -258,15 +434,25 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
       source,
       reason,
       renewalUrl: MONT_LICENSE_PORTAL_URL,
+      keyVersion: payload.version,
     };
+    if (!active) return community(base);
+    return { ...base, tier: payload.tier, maxWorkspaces: payload.maxWorkspaces, features: featuresFor(payload.tier, payload.maxWorkspaces) };
   }
 
   async function resolveLicenseStatus(): Promise<LicenseStatus> {
+    const status = await resolveUncached();
+    cached = status;
+    return status;
+  }
+
+  async function resolveUncached(): Promise<LicenseStatus> {
     const now = Date.now();
     const install = await syncInstallState(now);
 
     // Priority 1: a signed key. An active one wins; otherwise report the expired one.
-    const candidates: { key: string | undefined; source: "ENV" | "DB" }[] = [
+    const candidates: { key: string | undefined; source: "OPTION" | "ENV" | "DB" }[] = [
+      { key: options.licenseKey?.trim(), source: "OPTION" },
       { key: process.env.MONT_LICENSE_KEY?.trim(), source: "ENV" },
       { key: await getSetting(SETTING_LICENSE_KEY), source: "DB" },
     ];
@@ -282,7 +468,7 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
 
     // Tampered install records: no trial, a valid license key is required.
     if (install.tampered) {
-      return {
+      return community({
         valid: false,
         expired: true,
         isTrial: true,
@@ -291,7 +477,7 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
         source: "TRIAL_EXPIRED",
         reason: TAMPERED_REASON,
         renewalUrl: MONT_LICENSE_PORTAL_URL,
-      };
+      });
     }
 
     // Priority 2: the free trial that began on first boot (earliest trusted timestamp).
@@ -308,9 +494,11 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
         daysRemaining: daysLeft(trialExpiresAt, now),
         source: "TRIAL",
         renewalUrl: MONT_LICENSE_PORTAL_URL,
+        maxWorkspaces: PRO_DEFAULT_MAX_WORKSPACES,
+        features: featuresFor("PRO", PRO_DEFAULT_MAX_WORKSPACES),
       };
     }
-    return {
+    return community({
       valid: false,
       expired: true,
       isTrial: true,
@@ -320,7 +508,7 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
       source: "TRIAL_EXPIRED",
       reason: TRIAL_EXPIRED_REASON,
       renewalUrl: MONT_LICENSE_PORTAL_URL,
-    };
+    });
   }
 
   /** Rewrites every store from scratch (dev helper and key changes); clears any tamper flag. */
@@ -333,7 +521,20 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
 
   return {
     resolveLicenseStatus,
-    isPro: async () => (await resolveLicenseStatus()).tier === "PRO",
+    isPro: async () => (await resolveLicenseStatus()).tier !== "COMMUNITY",
+    current: () => cached,
+    refresh: resolveLicenseStatus,
+    start(intervalMs = 60_000) {
+      if (refreshTimer) return;
+      refreshTimer = setInterval(() => {
+        resolveLicenseStatus().catch((err: unknown) => console.error("License refresh failed:", err));
+      }, intervalMs);
+      refreshTimer.unref();
+    },
+    stop() {
+      if (refreshTimer) clearInterval(refreshTimer);
+      refreshTimer = undefined;
+    },
     restoreState: async () => {
       await syncInstallState(Date.now());
     },
@@ -341,15 +542,22 @@ export function createLicenseService(db: Db, options: LicenseServiceOptions): Li
       const key = licenseKey.trim();
       await setSetting(SETTING_LICENSE_KEY, key);
       const lic = readStateFile(licenseFile);
-      if (lic.state === "tampered") return; // leave the evidence; the DB copy still applies
-      const { firstSeenAt, trialKeyHash } = await syncInstallState(Date.now());
-      writeStateFile(licenseFile, { firstSeenAt, licenseKey: key, trialKeyHash });
+      if (lic.state !== "tampered") {
+        // (a tampered file is left as evidence; the DB copy still applies)
+        const { firstSeenAt, trialKeyHash } = await syncInstallState(Date.now());
+        writeStateFile(licenseFile, { firstSeenAt, licenseKey: key, trialKeyHash });
+      }
+      await resolveLicenseStatus();
     },
     removeLicenseKey: async () => {
       await db.run("DELETE FROM system_settings WHERE key = ?", [SETTING_LICENSE_KEY]);
       const lic = readStateFile(licenseFile);
       if (lic.state === "ok") writeStateFile(licenseFile, { firstSeenAt: lic.firstSeenAt, trialKeyHash: lic.trialKeyHash });
+      await resolveLicenseStatus();
     },
-    simulateTrial: (expired) => overwriteAll(Date.now() - (expired ? 8 * DAY_MS : 0), undefined),
+    simulateTrial: async (expired) => {
+      await overwriteAll(Date.now() - (expired ? 8 * DAY_MS : 0), undefined);
+      await resolveLicenseStatus();
+    },
   };
 }

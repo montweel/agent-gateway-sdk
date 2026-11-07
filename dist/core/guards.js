@@ -13,6 +13,7 @@ Object.defineProperty(exports, "validateBudget", { enumerable: true, get: functi
 Object.defineProperty(exports, "validateDedupe", { enumerable: true, get: function () { return policy_1.validateDedupe; } });
 const policy_2 = require("./policy");
 const utils_1 = require("./utils");
+const workspaces_1 = require("./workspaces");
 /**
  * Stateful guards that look across requests (policies only see one request at a time):
  *
@@ -129,7 +130,9 @@ function createGuards(ctx) {
                     if (used + amount.value > spec.max) {
                         current = { mode: spec.onExceed, matched: "budget" };
                         reason = `Spending budget reached: ${used} of ${spec.max} used in the last ${spec.windowMinutes} minutes; this request adds ${amount.value}.`;
-                        ctx.alerts.event("budget", ruleKey, `Spending budget reached on ${ruleKey}`, [
+                        const wsMatch = /^ws:(\d+)\|(.*)$/.exec(ruleKey);
+                        const label = wsMatch ? `${wsMatch[2]} (${ctx.workspaces.get(Number(wsMatch[1]))?.name ?? `workspace ${wsMatch[1]}`})` : ruleKey;
+                        ctx.alerts.event("budget", ruleKey, `Spending budget reached on ${label}`, [
                             `Used ${used} of ${spec.max} in the last ${spec.windowMinutes} min${spec.per === "caller" ? ` by ${callerId}` : ""}.`,
                             `Requests over budget now ${spec.onExceed === "BLOCK" ? "are blocked" : "need your approval"}.`,
                         ]);
@@ -186,23 +189,37 @@ function createGuards(ctx) {
             Date.now(),
         ]);
     }
-    async function usage() {
-        const rules = ctx.rules.load();
+    async function usage(workspaceId) {
+        const workspaces = workspaceId === undefined || workspaceId === null ? ctx.workspaces.list() : [ctx.workspaces.get(workspaceId)].filter((w) => w !== undefined);
         const out = [];
-        for (const [key, rule] of Object.entries(rules)) {
-            if (!rule.budget)
-                continue;
-            const spec = rule.budget;
-            const since = Date.now() - spec.windowMinutes * 60000;
-            let used;
-            if (spec.per === "global") {
-                used = await spent(key, spec, null);
+        for (const ws of workspaces) {
+            for (const [key, rule] of Object.entries(ctx.workspaces.rules(ws.id))) {
+                if (!rule.budget)
+                    continue;
+                const spec = rule.budget;
+                const ledgerKey = (0, workspaces_1.scopedRuleKey)(ws.id, key);
+                const since = Date.now() - spec.windowMinutes * 60000;
+                let used;
+                if (spec.per === "global") {
+                    used = await spent(ledgerKey, spec, null);
+                }
+                else {
+                    const row = await ctx.db.get("SELECT MAX(t) AS s FROM (SELECT SUM(amount) AS t FROM guard_ledger WHERE rule_key = ? AND kind = 'spend' AND ts >= ? GROUP BY caller)", [ledgerKey, since]);
+                    used = row?.s ?? 0;
+                }
+                out.push({
+                    ruleKey: key,
+                    workspaceId: ws.id,
+                    workspaceSlug: ws.slug,
+                    field: spec.field,
+                    max: spec.max,
+                    windowMinutes: spec.windowMinutes,
+                    per: spec.per,
+                    onExceed: spec.onExceed,
+                    spent: used,
+                    remaining: Math.max(0, spec.max - used),
+                });
             }
-            else {
-                const row = await ctx.db.get("SELECT MAX(t) AS s FROM (SELECT SUM(amount) AS t FROM guard_ledger WHERE rule_key = ? AND kind = 'spend' AND ts >= ? GROUP BY caller)", [key, since]);
-                used = row?.s ?? 0;
-            }
-            out.push({ ruleKey: key, field: spec.field, max: spec.max, windowMinutes: spec.windowMinutes, per: spec.per, onExceed: spec.onExceed, spent: used, remaining: Math.max(0, spec.max - used) });
         }
         return out;
     }

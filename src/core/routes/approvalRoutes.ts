@@ -1,14 +1,12 @@
 import type { Response, Router } from "express";
 import type { GatewayContext } from "../context";
 import type { AuthenticatedRequest, PendingRow } from "../types";
-import type { Decision } from "../approvals";
+import type { ApprovalEdits, Decision } from "../approvals";
 import { sendError, sendInternalError } from "../utils";
+import { workspaceFilter } from "../protection";
+import { actorOf, readScope } from "./scope";
 
 const MASKED = "[hidden for viewers]";
-
-function actorOf(req: AuthenticatedRequest): string {
-  return req.user ? (req.user.sso ? `sso:${req.user.username}` : req.user.username) : "admin";
-}
 
 function parseId(raw: unknown): number | null {
   const id = Number(raw);
@@ -20,30 +18,40 @@ export function registerApprovalRoutes(router: Router, ctx: GatewayContext): voi
   const { db, approvals, blocklist } = ctx;
 
   router.get("/approvals", async (req: AuthenticatedRequest, res: Response) => {
+    const scoped = readScope(ctx, req, res);
+    if (scoped === undefined) return;
     try {
       await approvals.expireStale();
-      // Explicit columns: encrypted_payload must never leave the server.
+      const wf = workspaceFilter(scoped?.id ?? null);
+      // Explicit columns: encrypted_payload / patch_encrypted must never leave the server.
       const rows = await db.all<PendingRow>(
         `SELECT id, timestamp, method, path, headers, body, status, response_preview, decided_by, expires_at, agent_key,
                 query_json, caller_ip, caller_ua, agent_key_id, agent_key_prefix, agent_reason, matched_policy,
-                revoked_at, revoked_by, rollback_status, kind
-         FROM pending_actions ORDER BY id DESC LIMIT 100`
+                revoked_at, revoked_by, rollback_status, kind, workspace_id, modified_body, modified_query
+         FROM pending_actions WHERE 1=1${wf.sql} ORDER BY id DESC LIMIT 100`,
+        wf.params
       );
+      const withWorkspace = rows.map((r) => {
+        const ws = ctx.workspaces.get(r.workspace_id ?? 1);
+        return { ...r, workspace_slug: ws?.slug ?? null, workspace_name: ws?.name ?? null };
+      });
       // Request bodies, query strings, agent justifications and upstream responses can contain
       // customer data: viewers see that they exist, not what they hold.
       if (req.user?.role === "viewer") {
         res.json(
-          rows.map((r) => ({
+          withWorkspace.map((r) => ({
             ...r,
             body: r.body === null ? null : MASKED,
             query_json: r.query_json === null ? null : JSON.stringify({ hidden: MASKED }),
             agent_reason: r.agent_reason === null ? null : MASKED,
             response_preview: r.response_preview === null ? null : MASKED,
+            modified_body: r.modified_body === null ? null : MASKED,
+            modified_query: r.modified_query === null ? null : JSON.stringify({ hidden: MASKED }),
           }))
         );
         return;
       }
-      res.json(rows);
+      res.json(withWorkspace);
     } catch (err) {
       sendInternalError(res, "Approvals error", err, "Could not load approvals.");
     }
@@ -74,7 +82,12 @@ export function registerApprovalRoutes(router: Router, ctx: GatewayContext): voi
         return;
       }
 
-      const result = await approvals.decide(id, decision, actorOf(req));
+      // "Edit & Approve": { decision: "APPROVE", modifiedBody?: <JSON>, modifiedQuery?: { name: "value" } }
+      const b = (req.body ?? {}) as { modifiedBody?: unknown; modifiedQuery?: unknown };
+      const edits: ApprovalEdits | undefined =
+        b.modifiedBody !== undefined || b.modifiedQuery !== undefined ? { body: b.modifiedBody, query: b.modifiedQuery } : undefined;
+
+      const result = await approvals.decide(id, decision, actorOf(req), edits);
       res.status(result.status).json(result.body);
     } catch (err) {
       sendInternalError(res, "Decide error", err, "Could not record the decision.");

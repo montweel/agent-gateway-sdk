@@ -1,13 +1,17 @@
 import type { GatewayContext } from "./context";
 import type { Rule } from "./types";
-import { AGENT_KEY_PREFIX, MCP_RULE_METHOD, MCP_TOOL_PATH_PREFIX } from "./constants";
-import { evaluateRule } from "./policy";
+import { AGENT_KEY_PREFIX, MCP_RULE_METHOD, MCP_TOOL_PATH_PREFIX, WORKSPACE_KEY_PREFIX } from "./constants";
+import { evaluateRule, splitShadow } from "./policy";
+import type { PolicyDecision } from "./policy";
 import { bucketIp } from "./rateLimit";
-import { createAudit, discardPending, queuePending } from "./pendingQueue";
+import { buildSnapshot, createAudit, discardPending, queuePending } from "./pendingQueue";
 import type { Caller } from "./pendingQueue";
 import { withTimeout } from "./utils";
 import { applyOperatingMode } from "./operatingMode";
 import { callerIdOf, extractAmount } from "./guards";
+import { resolveWorkspace, scopedRuleKey } from "./workspaces";
+import { decryptPayload } from "./crypto";
+import { describeFindings, inspectMcpResult } from "./responseGuard";
 
 /**
  * Guard for MCP `tools/call` (JSON-RPC 2.0). Transport-agnostic: mcpProxy.ts uses it for
@@ -28,15 +32,32 @@ export interface ToolCallRequest {
   toolName: string;
   /** params.arguments */
   arguments: unknown;
+  /** agentKey: an agk_ agent key or a workspace's mws_ key. */
   caller: { ip: string; userAgent: string; agentKey?: string | null };
   agentReason?: string | null;
+  /** Workspace slug (x-mont-workspace header, /w/<slug>/ mount, or the proxy's --workspace option). */
+  workspace?: string | null;
 }
 
 export type GuardResult =
-  | { decision: "ALLOW"; ruleKey: string }
+  | { decision: "ALLOW"; ruleKey: string; workspaceId: number }
   | { decision: "BLOCK"; reason: string }
   | { decision: "RATE_LIMITED"; retryAfterSec: number; reason: string }
-  | { decision: "PENDING"; actionId: number; expiresAt: number };
+  | { decision: "PENDING"; actionId: number; expiresAt: number; workspaceId: number };
+
+/** The approver's edited tool arguments ("Edit & Approve"). */
+export interface ExecuteOverride {
+  arguments: unknown;
+}
+
+/** Outbound guard verdict for a tool result. */
+export interface ResultInspection {
+  action: "pass" | "modified" | "block";
+  /** The (possibly scrubbed) result to return when not blocked. */
+  result: unknown;
+  /** Explanation for the model when blocked. */
+  message: string | null;
+}
 
 export type WaitResult<T> =
   | { status: "APPROVED"; value: T }
@@ -56,20 +77,26 @@ export interface McpWaiter {
   reserve(): boolean;
   /** Undo reserve() when the DB claim lost a race. */
   unreserve(): void;
-  onDecision(decision: "APPROVE" | "REJECT"): Promise<{ ok: boolean; preview: string }>;
+  onDecision(decision: "APPROVE" | "REJECT", override?: ExecuteOverride): Promise<{ ok: boolean; preview: string }>;
 }
 
 export interface McpGuard {
   check(req: ToolCallRequest): Promise<GuardResult>;
   /**
    * Waits for a human decision on a PENDING tool call. `execute` runs only on APPROVE and
-   * must perform the original call; its outcome is recorded on the approval row.
+   * must perform the call, with `override.arguments` instead of the original arguments when the
+   * approver edited them; its outcome is recorded on the approval row.
    */
   awaitDecision<T>(
     actionId: number,
     opts: { timeoutMs: number; signal?: AbortSignal },
-    execute: () => Promise<ExecuteOutcome<T>>
+    execute: (override?: ExecuteOverride) => Promise<ExecuteOutcome<T>>
   ): Promise<WaitResult<T>>;
+  /**
+   * Outbound response guard for a tool's result (bulk dumps, secrets). Synchronous so transports
+   * can keep message order; the audit row is written in the background.
+   */
+  inspectResult(info: { toolName: string; workspaceId: number; callerIp: string; userAgent: string }, result: unknown): ResultInspection;
   /** "MCP /api/mcp/tools/<name>" */
   ruleKeyFor(toolName: string): string;
 }
@@ -97,52 +124,82 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
       }
 
       const config = ctx.config.load();
-      const entry = ctx.rules.lookupEntry(MCP_RULE_METHOD, path);
+      caller = { ip: bucketIp(req.caller.ip), userAgent: req.caller.userAgent, agentKeyName: null, agentKeyId: null, agentKeyPrefix: null };
+
+      // Workspace: the proxy's selector (header / mount / option) and/or the caller's mws_ key.
+      const rawCredential = req.caller.agentKey ?? null;
+      const workspaceKey = rawCredential && rawCredential.startsWith(WORKSPACE_KEY_PREFIX) ? rawCredential : null;
+      const rawKey = workspaceKey ? null : rawCredential;
+      const resolved = resolveWorkspace(ctx.workspaces, { pathSlug: null, headerSlug: req.workspace ?? null, key: workspaceKey });
+      if (!resolved.ok) {
+        await audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "BLOCKED", caller, userAgent: caller.userAgent, detail: `mcp ${resolved.reason}` });
+        return { decision: "BLOCK", reason: resolved.message };
+      }
+      const workspace = resolved.workspace;
+      const wsId = workspace.id;
+      if (!ctx.workspaces.isEntitled(wsId, ctx.license.current().maxWorkspaces)) {
+        await audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "BLOCKED", caller, userAgent: caller.userAgent, detail: "mcp workspace over the license limit", workspaceId: wsId });
+        return { decision: "BLOCK", reason: `Workspace "${workspace.slug}" is beyond this installation's Mont license.` };
+      }
+      const entry = ctx.workspaces.lookupEntry(wsId, MCP_RULE_METHOD, path);
 
       // Rate limit (per caller, per rule when the rule sets one).
       const custom = typeof entry?.rule.rateLimit === "number" && entry.rule.rateLimit > 0 ? entry.rule.rateLimit : null;
       const rate = custom
-        ? ctx.limiters.checkRateLimit(req.caller.ip, custom, entry!.key)
+        ? ctx.limiters.checkRateLimit(req.caller.ip, custom, scopedRuleKey(wsId, entry!.key))
         : ctx.limiters.checkRateLimit(req.caller.ip, config.rateLimitPerMinute);
-      caller = { ip: bucketIp(req.caller.ip), userAgent: req.caller.userAgent, agentKeyName: null, agentKeyId: null, agentKeyPrefix: null };
       if (rate.limited) {
-        if (rate.firstLimited) void audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "RATE_LIMITED", caller, userAgent: caller.userAgent, detail: "mcp tools/call" });
+        if (rate.firstLimited) {
+          void audit.logRefusal({
+            method: MCP_RULE_METHOD,
+            path,
+            status: "RATE_LIMITED",
+            caller,
+            userAgent: caller.userAgent,
+            detail: "mcp tools/call",
+            workspaceId: wsId,
+            snapshot: buildSnapshot(ctx, { kind: "mcp", body: args, query: {}, headers: {}, callerId: callerIdOf(caller) }),
+          });
+        }
         return { decision: "RATE_LIMITED", retryAfterSec: rate.retryAfterSec, reason: `Rate limit of ${custom ?? config.rateLimitPerMinute} calls per minute exceeded.` };
       }
 
-      // Agent key.
-      const rawKey = req.caller.agentKey ?? null;
-      if (rawKey || config.requireAgentApiKey) {
+      // Agent key (a workspace's own mws_ key also authenticates the caller for that workspace).
+      if (rawKey || (config.requireAgentApiKey && !resolved.authenticatedByKey)) {
         const info = rawKey ? await timed(ctx.agentKeys.verify(rawKey), "agent key lookup") : null;
         if (info && rawKey) {
           caller.agentKeyName = info.name;
           caller.agentKeyId = info.id;
           caller.agentKeyPrefix = rawKey.slice(0, AGENT_KEY_PREFIX.length + 4);
-        } else if (config.requireAgentApiKey) {
-          await audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "BLOCKED", caller, userAgent: caller.userAgent, detail: "missing or invalid agent key" });
+        } else if (config.requireAgentApiKey && !resolved.authenticatedByKey) {
+          await audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "BLOCKED", caller, userAgent: caller.userAgent, detail: "missing or invalid agent key", workspaceId: wsId });
           return { decision: "BLOCK", reason: "A valid agent API key is required." };
         }
       }
+      if (resolved.authenticatedByKey && caller.agentKeyName === null) caller.agentKeyName = `workspace:${workspace.slug}`;
 
       // Kill-switch.
       const blocked = ctx.blocklist.match({ ip: req.caller.ip, agentKeyId: caller.agentKeyId });
       if (blocked) {
-        await audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "BLOCKED", caller, userAgent: caller.userAgent, detail: `caller blocked (${blocked.kind})` });
+        await audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "BLOCKED", caller, userAgent: caller.userAgent, detail: `caller blocked (${blocked.kind})`, workspaceId: wsId });
         return { decision: "BLOCK", reason: "This caller has been blocked by a gateway administrator." };
       }
 
       // Rules + payload policies on params.arguments (default deny).
       const rule: Rule = entry?.rule ?? { mode: "BLOCK", description: "" };
-      const ruleVerdict = entry ? evaluateRule(rule, { body: args, query: {}, headers: {} }) : { mode: "BLOCK" as const, matched: "default-deny" };
-      const moded = applyOperatingMode(ctx, ruleVerdict, MCP_RULE_METHOD, "mcp");
-      const guard = await ctx.guards.evaluate(entry?.key ?? null, entry?.rule ?? null, moded, args, callerIdOf(caller));
+      const rawVerdict: PolicyDecision = entry ? evaluateRule(rule, { body: args, query: {}, headers: {} }) : { mode: "BLOCK", matched: "default-deny" };
+      const { decision: ruleVerdict, shadow } = splitShadow(rawVerdict);
+      const moded = applyOperatingMode(ctx, ruleVerdict, MCP_RULE_METHOD, "mcp", workspace);
+      const callerId = callerIdOf(caller);
+      const guard = await ctx.guards.evaluate(entry ? scopedRuleKey(wsId, entry.key) : null, entry?.rule ?? null, moded, args, callerId);
       const amount = extractAmount(args);
+      const snapshot = (): string => buildSnapshot(ctx, { kind: "mcp", body: args, query: {}, headers: {}, callerId });
       try {
         const verdict = guard.decision;
         const why = guard.reason ? `${verdict.matched}: ${guard.reason}` : verdict.matched;
 
         if (verdict.mode === "BLOCK") {
-          await audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "BLOCKED", caller, userAgent: caller.userAgent, detail: `mcp ${why}`, amount });
+          await audit.logRefusal({ method: MCP_RULE_METHOD, path, status: "BLOCKED", caller, userAgent: caller.userAgent, detail: `mcp ${why}`, amount, workspaceId: wsId, snapshot: snapshot() });
           let reason: string;
           if (verdict.matched === "default-deny") reason = `Tool "${req.toolName}" is not allowed by gateway rules.`;
           else if (verdict.matched === "lockdown") reason = "The gateway is in emergency lockdown: no tool calls are being accepted right now.";
@@ -165,6 +222,8 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
             agentReason: req.agentReason ?? null,
             matched: why,
             amount,
+            workspace,
+            snapshot: snapshot(),
           });
           if (!queued.ok) return { decision: "BLOCK", reason: queued.message };
           try {
@@ -173,7 +232,7 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
             await discardPending(ctx, queued.id, "Discarded: the duplicate-protection record could not be written.").catch(() => undefined);
             throw err;
           }
-          return { decision: "PENDING", actionId: queued.id, expiresAt: queued.expiresAt };
+          return { decision: "PENDING", actionId: queued.id, expiresAt: queued.expiresAt, workspaceId: wsId };
         }
 
         await guard.commit(null);
@@ -183,10 +242,17 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
           status: "ALLOWED",
           caller,
           userAgent: caller.userAgent,
-          detail: verdict.matched === "rule" ? "mcp" : `mcp ${verdict.matched}`,
+          detail: shadow
+            ? `mcp shadow: would have ${shadow === "BLOCK" ? "blocked" : "held for approval"} (${ruleVerdict.matched})`
+            : verdict.matched === "rule"
+              ? "mcp"
+              : `mcp ${verdict.matched}`,
           amount,
+          workspaceId: wsId,
+          shadow,
+          snapshot: snapshot(),
         });
-        return { decision: "ALLOW", ruleKey: entry!.key };
+        return { decision: "ALLOW", ruleKey: entry!.key, workspaceId: wsId };
       } finally {
         guard.release();
       }
@@ -199,7 +265,7 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
   function awaitDecision<T>(
     actionId: number,
     opts: { timeoutMs: number; signal?: AbortSignal },
-    execute: () => Promise<ExecuteOutcome<T>>
+    execute: (override?: ExecuteOverride) => Promise<ExecuteOutcome<T>>
   ): Promise<WaitResult<T>> {
     return new Promise((resolve) => {
       let settled = false;
@@ -217,10 +283,10 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
         resolve(r);
       };
 
-      /** Runs the original call once a decision to APPROVE is final. */
-      const run = async (): Promise<{ ok: boolean; preview: string }> => {
+      /** Runs the call (with the approver's edited arguments, if any) once a decision to APPROVE is final. */
+      const run = async (override?: ExecuteOverride): Promise<{ ok: boolean; preview: string }> => {
         try {
-          const out = await execute();
+          const out = await execute(override);
           finish(out.ok ? { status: "APPROVED", value: out.value } : { status: "FAILED", value: out.value, error: out.preview });
           return { ok: out.ok, preview: out.preview };
         } catch (err) {
@@ -233,10 +299,31 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
       /** Approved by another process: it marked the row EXECUTING; we run the call and record it. */
       const runForRemoteApproval = async (): Promise<void> => {
         decided = true;
-        const out = await run();
+        // The approver may have edited the arguments: they travel encrypted on the row.
+        let override: ExecuteOverride | undefined;
+        try {
+          const row = await ctx.db.get<{ patch_encrypted: string | null }>("SELECT patch_encrypted FROM pending_actions WHERE id = ?", [actionId]);
+          if (row?.patch_encrypted) {
+            const parsed = JSON.parse(decryptPayload(row.patch_encrypted, ctx.config.replayEncryptionKey())) as { arguments?: unknown };
+            override = { arguments: parsed.arguments };
+          }
+        } catch (err) {
+          // Fail closed: never run the unedited call when the approver asked for an edited one.
+          console.error("Could not read the approver's edits for an MCP tool call:", err);
+          const message = "The approver's edits could not be read, so the tool call was not executed.";
+          finish({ status: "FAILED", error: message });
+          await ctx.db
+            .run("UPDATE pending_actions SET status = 'FAILED', response_preview = ?, encrypted_payload = NULL, patch_encrypted = NULL WHERE id = ? AND status = 'EXECUTING'", [
+              message,
+              actionId,
+            ])
+            .catch(() => undefined);
+          return;
+        }
+        const out = await run(override);
         const preview = ctx.redactor.text(out.preview).slice(0, 500);
         await ctx.db
-          .run("UPDATE pending_actions SET status = ?, response_preview = ?, encrypted_payload = NULL WHERE id = ? AND status = 'EXECUTING'", [
+          .run("UPDATE pending_actions SET status = ?, response_preview = ?, encrypted_payload = NULL, patch_encrypted = NULL WHERE id = ? AND status = 'EXECUTING'", [
             out.ok ? "APPROVED" : "FAILED",
             preview,
             actionId,
@@ -323,7 +410,7 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
             decided = false;
           }
         },
-        async onDecision(decision) {
+        async onDecision(decision, override) {
           if (settled || (decided && !reserved)) return { ok: false, preview: "The agent was no longer waiting." };
           reserved = false;
           decided = true;
@@ -331,11 +418,36 @@ export function createMcpGuard(ctx: GatewayContext): McpGuard {
             finish({ status: "REJECTED", reason: "Rejected by an approver." });
             return { ok: true, preview: "rejected" };
           }
-          return run();
+          return run(override);
         },
       });
     });
   }
 
-  return { check, awaitDecision, ruleKeyFor: (name) => `${MCP_RULE_METHOD} ${MCP_TOOL_PATH_PREFIX}${name}` };
+  function inspectResult(info: { toolName: string; workspaceId: number; callerIp: string; userAgent: string }, result: unknown): ResultInspection {
+    const settings = ctx.settings.peek().responseGuard;
+    try {
+      const v = inspectMcpResult(result, settings);
+      if (v.action === "pass") return { action: "pass", result, message: null };
+      const summary = describeFindings(v.findings);
+      const blocked = v.action === "block";
+      void audit.logRefusal({
+        method: MCP_RULE_METHOD,
+        path: `${MCP_TOOL_PATH_PREFIX}${info.toolName}`,
+        status: blocked ? "RESPONSE_BLOCKED" : "RESPONSE_SCRUBBED",
+        caller: { ip: bucketIp(info.callerIp), userAgent: info.userAgent, agentKeyName: null, agentKeyId: null, agentKeyPrefix: null },
+        userAgent: info.userAgent,
+        detail: `mcp result ${blocked ? "withheld" : "scrubbed"}: ${summary}`,
+        workspaceId: info.workspaceId,
+      });
+      return blocked
+        ? { action: "block", result, message: `Response Policy Violation: the tool result contained ${summary}, so the Mont gateway withheld it.` }
+        : { action: "modified", result: v.result, message: null };
+    } catch (err) {
+      console.error("[agent-gateway] FAIL-CLOSED (mcp response guard):", err);
+      return { action: "block", result, message: "Response Policy Violation: the tool result could not be inspected, so it was withheld." };
+    }
+  }
+
+  return { check, awaitDecision, inspectResult, ruleKeyFor: (name) => `${MCP_RULE_METHOD} ${MCP_TOOL_PATH_PREFIX}${name}` };
 }

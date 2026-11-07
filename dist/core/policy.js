@@ -5,6 +5,7 @@ exports.parseFieldPath = parseFieldPath;
 exports.resolveField = resolveField;
 exports.evaluateCondition = evaluateCondition;
 exports.evaluateRule = evaluateRule;
+exports.splitShadow = splitShadow;
 exports.policiesReadBody = policiesReadBody;
 exports.validatePolicies = validatePolicies;
 exports.normalizePolicies = normalizePolicies;
@@ -214,6 +215,17 @@ function evaluateRule(rule, input) {
         console.error("Policy evaluation failed, blocking the request:", err);
         return { mode: "BLOCK", matched: "error" };
     }
+}
+/**
+ * Shadow ("dry run") modes are enforced as ALLOW; the verdict they would have given is returned
+ * separately so the audit row can record it and the dashboard can count "would have blocked".
+ */
+function splitShadow(d) {
+    if (d.mode === "SHADOW_BLOCK")
+        return { decision: { mode: "ALLOW", matched: d.matched }, shadow: "BLOCK" };
+    if (d.mode === "SHADOW_APPROVAL")
+        return { decision: { mode: "ALLOW", matched: d.matched }, shadow: "APPROVAL" };
+    return { decision: d, shadow: null };
 }
 /** True when any condition in the rule reads the request body. */
 function policiesReadBody(rule) {

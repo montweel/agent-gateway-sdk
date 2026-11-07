@@ -115,6 +115,27 @@ export function looksLikeCard(digits: string): boolean {
   return /^[2-6]/.test(digits) && luhnValid(digits);
 }
 
+/**
+ * Secrets and card numbers only (no email / phone masking): what the outbound response guard
+ * treats as "must never leave". Returns the masked text and how many values were masked.
+ */
+export function scrubSecrets(value: string): { text: string; hits: number } {
+  let hits = 0;
+  let out = value;
+  for (const re of SECRET_PATTERNS) {
+    out = out.replace(re, () => {
+      hits++;
+      return REDACTED_SECRET;
+    });
+  }
+  out = out.replace(CARD_CANDIDATE, (m) => {
+    if (!looksLikeCard(m.replace(/[ -]/g, ""))) return m;
+    hits++;
+    return REDACTED_CARD;
+  });
+  return { text: out, hits };
+}
+
 function normKey(key: string): string {
   return key.toLowerCase().replace(/[_\-.\s]/g, "");
 }

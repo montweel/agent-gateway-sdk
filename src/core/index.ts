@@ -26,6 +26,11 @@
  *   callerBlocklist.ts  persistent kill-switch list of agent keys / IPs
  *   adminRouter.ts  admin API; handlers live in routes/*
  *   discovery.ts    GET /.well-known/agent.json
+ *   workspaces.ts   v2.0 multi-tenant workspaces (client stores): rules, upstream, mode, routing, keys
+ *   auditLedger.ts  v2.0 SHA-256 hash-chained, tamper-evident audit ledger
+ *   simulator.ts    v2.0 policy time-machine (replay history through a ruleset)
+ *   responseGuard.ts v2.0 outbound exfiltration breaker (bulk dumps, secrets in responses)
+ *   payloadPatch.ts v2.0 Edit & Approve merge of approver edits into the original request
  */
 import crypto from "crypto";
 import path from "path";
@@ -57,6 +62,8 @@ import { createRulesStore } from "./rules";
 import { createInterceptor } from "./interceptor";
 import { createAdminRouter } from "./adminRouter";
 import { createDiscoveryRouter } from "./discovery";
+import { createWorkspaceStore } from "./workspaces";
+import { createAuditLedger } from "./auditLedger";
 
 export type {
   AgentGateway,
@@ -78,7 +85,14 @@ export { readPersistedListenPort } from "./settingsStore";
 export { createRedactor } from "./redactor";
 export type { Redactor } from "./redactor";
 export { POLICY_PRESETS, applyPreset } from "./presets";
-export type { McpGuard, GuardResult, WaitResult, ToolCallRequest } from "./toolGuard";
+export type { McpGuard, GuardResult, WaitResult, ToolCallRequest, ExecuteOverride } from "./toolGuard";
+export { verifyLicenseKey, signLicenseV2, featuresFor } from "./license";
+export type { LicenseStatus, LicenseTier, LicenseFeatures } from "./license";
+export { computeRowHash, GENESIS_HASH } from "./auditLedger";
+export type { VerifyReport } from "./auditLedger";
+export type { Workspace } from "./workspaces";
+export type { SimulationReport } from "./simulator";
+export { inspectResponseBody, inspectMcpResult } from "./responseGuard";
 
 export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGateway {
   const port = options.port ?? 3000;
@@ -91,7 +105,17 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
   const rules = createRulesStore(rulesPath);
   const limiters = createLimiters();
   const userCount = createUserCountCache(db);
-  const license = createLicenseService(db, { licenseFile: path.join(path.dirname(dbPath), "mont-state.json") });
+  const license = createLicenseService(db, {
+    licenseFile: path.join(path.dirname(dbPath), "mont-state.json"),
+    anchorFile: options.licenseAnchorFile,
+    licenseKey: options.licenseKey,
+  });
+  const workspaces = createWorkspaceStore(
+    db,
+    rules,
+    typeof options.workspaceRefreshMs === "number" && options.workspaceRefreshMs >= 50 ? options.workspaceRefreshMs : 2_000
+  );
+  const ledger = createAuditLedger(db);
   const auth = createAuthService(db, config, userCount, limiters, license);
   const agentKeys = createAgentKeyStore(db);
   const settings = createSettingsStore(db);
@@ -103,7 +127,7 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
     telegramPollTimeoutSec:
       typeof options.telegramPollTimeoutSec === "number" && options.telegramPollTimeoutSec >= 0 ? Math.min(50, options.telegramPollTimeoutSec) : 25,
   };
-  const notifier = createNotifier(settings, redactor, endpoints);
+  const notifier = createNotifier(settings, redactor, endpoints, () => license.current().features);
   const instanceId = newInstanceId();
   const emergency = createEmergencyStore(
     db,
@@ -128,10 +152,12 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
     await db.init();
     // Restore trial start + license key from mont-state.json / ~/.montweel/anchor.json if logs.db was deleted.
     await license.restoreState();
+    await license.refresh();
     // If either of these cannot be read, `ready` rejects and every /api/* request fails closed (503).
     await settings.load();
     await blocklist.load();
     await emergency.load();
+    await workspaces.load();
     // Held MCP calls of processes that died can never run: expire them (live processes' calls are kept).
     await reapOrphanedMcp(db, instanceId);
 
@@ -191,6 +217,8 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
     mcpWaiters: new Map(),
     instanceId,
     emergency,
+    workspaces,
+    ledger,
   } as Omit<GatewayContext, "approvals" | "bridges" | "guards" | "alerts"> as GatewayContext;
   ctx.approvals = createApprovalService(ctx);
   ctx.bridges = createApprovalBridges(ctx, endpoints);
@@ -205,6 +233,13 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
       state.mode === "normal" ? "Agent traffic is flowing under your normal rules again." : "Send /resume (Telegram) or use the dashboard to return to normal.",
     ]);
   });
+  workspaces.onModeChange((ws, previous) => {
+    console.log(`[agent-gateway] Workspace "${ws.slug}" mode: ${previous} -> ${ws.mode}${ws.modeChangedBy ? ` (by ${ws.modeChangedBy})` : ""}`);
+    ctx.alerts.event("emergency", `!ws:${ws.id}:${ws.modeChangedAt ?? Date.now()}`, `[${ws.name}] mode changed: ${modeLabel(ws.mode)}`, [
+      `By ${ws.modeChangedBy ?? "unknown"}${ws.modeReason ? `: ${ws.modeReason}` : ""}`,
+      ws.mode === "normal" ? `${ws.name}'s agents are running under their normal rules again.` : `Only ${ws.name} is affected; other clients are unchanged.`,
+    ]);
+  });
   // Background workers start once the database is ready (Telegram / Slack idle until configured).
   let closed = false;
   ready.then(
@@ -213,6 +248,10 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
       ctx.bridges.start();
       emergency.start();
       ctx.alerts.start();
+      workspaces.start();
+      license.start();
+      ledger.start(1_000);
+      ledger.kick(); // seal anything written before this start (e.g. a v1.x database)
     },
     () => undefined
   );
@@ -224,17 +263,12 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
     const now = Date.now();
     const quiet = (err: unknown): void => console.error("Cleanup error:", err);
     void db.run("DELETE FROM sessions WHERE expires_at <= ?", [now]).catch(quiet);
-    // Keep only the newest MAX_LOG_ROWS audit rows.
+    // Keep only the newest MAX_LOG_ROWS audit rows, through the ledger's retention checkpoint so
+    // the hash chain still verifies after old rows are removed.
+    void ledger.prune(MAX_LOG_ROWS).catch(quiet);
     void db
       .run(
-        `DELETE FROM agent_logs
-         WHERE id <= (SELECT id FROM agent_logs ORDER BY id DESC LIMIT 1 OFFSET ?)`,
-        [MAX_LOG_ROWS]
-      )
-      .catch(quiet);
-    void db
-      .run(
-        `UPDATE pending_actions SET status = 'EXPIRED', encrypted_payload = NULL
+        `UPDATE pending_actions SET status = 'EXPIRED', encrypted_payload = NULL, patch_encrypted = NULL
          WHERE status IN ('PENDING', 'FAILED') AND expires_at IS NOT NULL AND expires_at <= ?`,
         [now]
       )
@@ -269,6 +303,8 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
       clearInterval(cleanupTimer);
       emergency.stop();
       ctx.alerts.stop();
+      workspaces.stop();
+      license.stop();
       await ctx.bridges.stop();
       // Held MCP calls die with this process: make sure they can never be approved later.
       for (const id of [...ctx.mcpWaiters.keys()]) {
@@ -280,6 +316,9 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
           .catch(() => undefined);
       }
       ctx.mcpWaiters.clear();
+      // Seal what this process wrote, then stop the sealer before the database closes.
+      await ready.then(() => ledger.sealPending()).catch(() => undefined);
+      ledger.stop();
       await db.close();
     },
   };

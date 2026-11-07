@@ -56,14 +56,18 @@ Options for mcp-http:
   --host <addr>        bind address (default 127.0.0.1)
   --path <p>           endpoint path (default /mcp)
   --wait-seconds <n>   how long a tool call needing approval is held (default 300)
+  --workspace <slug>   default workspace for calls that do not name one (header x-mont-workspace,
+                       a mws_ key, or the /w/<slug><path> endpoint)
   --admin-port, --admin-host, --data-dir   as for start
+  Legacy MCP clients (HTTP+SSE, 2024-11-05) connect to http://<host>:<port><path>/sse
 
 Options for mcp-stdio:
   --wait-seconds <n>   as above
   --admin-port <n>     admin console port (default 3000; skipped if busy, e.g. a second session)
   --no-admin           do not start the admin console
   --data-dir <dir>     as for start (share it between sessions to share rules and approvals)
-  MONT_AGENT_KEY       optional agent key identifying this client
+  --workspace <slug>   the client workspace these tool calls belong to (rules, budgets, approvals)
+  MONT_AGENT_KEY       optional agent key (agk_...) or workspace key (mws_...) identifying this client
   Tool rules use the MCP method: "MCP /api/mcp/tools/<tool name>" (wildcards allowed).
 
 Options for start:
@@ -176,6 +180,7 @@ async function mcpHttp(argv) {
             "admin-port": { type: "string" },
             "admin-host": { type: "string" },
             "data-dir": { type: "string" },
+            workspace: { type: "string" },
         },
         strict: true,
     });
@@ -198,14 +203,18 @@ async function mcpHttp(argv) {
     await gateway.ready;
     const app = (0, host_1.createBaseApp)();
     app.use(gateway.approvalCallbackRouter);
-    app.use(mountPath, (0, mcpProxy_1.createMcpHttpProxy)(gateway, { upstreamUrl: upstream.toString(), approvalWaitMs: waitMs(values["wait-seconds"]) }));
-    app.use((_req, res) => (0, utils_1.sendError)(res, 404, "Not Found", `The MCP endpoint is ${mountPath}.`));
+    const mcpRouter = (0, mcpProxy_1.createMcpHttpProxy)(gateway, { upstreamUrl: upstream.toString(), approvalWaitMs: waitMs(values["wait-seconds"]), workspace: values.workspace });
+    app.use(mountPath, mcpRouter);
+    // Path-prefix workspace routing: http://<host>:<port>/w/<slug><path>
+    app.use(`/w/:slug${mountPath}`, mcpRouter);
+    app.use((_req, res) => (0, utils_1.sendError)(res, 404, "Not Found", `The MCP endpoint is ${mountPath} (or /w/<workspace>${mountPath}).`));
     const admin = (0, host_1.createBaseApp)();
     (0, host_1.mountAdmin)(admin, gateway, process.env.NODE_ENV === "production");
     admin.get("/", (_req, res) => res.redirect("/agent-admin/"));
     const servers = [await (0, host_1.listen)(app, port, host, "Mont MCP proxy"), await (0, host_1.listen)(admin, adminPort, adminHost, "Mont admin console")];
     console.log("");
-    console.log(`  MCP clients connect to: http://${host}:${port}${mountPath}`);
+    console.log(`  MCP clients connect to: http://${host}:${port}${mountPath}   (legacy SSE clients: ${mountPath}/sse)`);
+    console.log(`  Per client workspace:   http://${host}:${port}/w/<slug>${mountPath}`);
     console.log(`  Forwarding to:          ${upstream.toString()}`);
     console.log(`  Admin console:          http://${adminHost}:${adminPort}/agent-admin/`);
     console.log(`  Data folder:            ${dataDir}`);
@@ -228,6 +237,7 @@ async function mcpStdio(argv) {
             "admin-host": { type: "string" },
             "no-admin": { type: "boolean" },
             "data-dir": { type: "string" },
+            workspace: { type: "string" },
         },
         strict: true,
     });
@@ -257,6 +267,7 @@ async function mcpStdio(argv) {
         shell: process.platform === "win32",
         approvalWaitMs: waitMs(values["wait-seconds"]),
         agentKey: process.env.MONT_AGENT_KEY?.trim() || null,
+        workspace: values.workspace ?? null,
     });
     const code = await proxy.exited;
     await Promise.all(servers.map((s) => new Promise((r) => s.close(() => r()))));

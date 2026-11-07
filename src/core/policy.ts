@@ -210,6 +210,18 @@ export function evaluateRule(rule: Rule, input: PolicyInput): PolicyDecision {
   }
 }
 
+export type ShadowVerdict = "BLOCK" | "APPROVAL";
+
+/**
+ * Shadow ("dry run") modes are enforced as ALLOW; the verdict they would have given is returned
+ * separately so the audit row can record it and the dashboard can count "would have blocked".
+ */
+export function splitShadow(d: PolicyDecision): { decision: PolicyDecision; shadow: ShadowVerdict | null } {
+  if (d.mode === "SHADOW_BLOCK") return { decision: { mode: "ALLOW", matched: d.matched }, shadow: "BLOCK" };
+  if (d.mode === "SHADOW_APPROVAL") return { decision: { mode: "ALLOW", matched: d.matched }, shadow: "APPROVAL" };
+  return { decision: d, shadow: null };
+}
+
 /** True when any condition in the rule reads the request body. */
 export function policiesReadBody(rule: Rule): boolean {
   return (rule.policies ?? []).some((t) => t.when.some((c) => c.field.trim().startsWith("body.")));

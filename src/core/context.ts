@@ -15,6 +15,8 @@ import type { McpWaiter } from "./toolGuard";
 import type { Guards } from "./guards";
 import type { EmergencyStore } from "./operatingMode";
 import type { Alerts } from "./alerts";
+import type { WorkspaceStore } from "./workspaces";
+import type { AuditLedger } from "./auditLedger";
 
 /** First-boot owner creation key. Lives in memory only; cleared once an owner exists. */
 export interface SetupState {
@@ -31,6 +33,7 @@ export interface GatewayContext {
   dbTimeoutMs: number;
   db: Db;
   config: ConfigStore;
+  /** rules.json: the default workspace's rules. Other workspaces' rules live in SQLite (ctx.workspaces). */
   rules: RulesStore;
   limiters: Limiters;
   auth: AuthService;
@@ -58,4 +61,8 @@ export interface GatewayContext {
   emergency: EmergencyStore;
   /** Security alerts and the daily digest. */
   alerts: Alerts;
+  /** v2.0 multi-tenant workspaces (client stores). */
+  workspaces: WorkspaceStore;
+  /** v2.0 hash-chained, tamper-evident audit ledger over agent_logs. */
+  ledger: AuditLedger;
 }

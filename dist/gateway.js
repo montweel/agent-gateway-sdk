@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.gateToolCall = exports.startMcpStdioProxy = exports.createMcpHttpProxy = exports.applyPreset = exports.POLICY_PRESETS = exports.createRedactor = exports.readPersistedListenPort = exports.signWebhookBody = exports.validatePolicies = exports.evaluateRule = exports.createAgentGateway = void 0;
+exports.parseSse = exports.gateToolCall = exports.startMcpStdioProxy = exports.createMcpHttpProxy = exports.inspectMcpResult = exports.inspectResponseBody = exports.GENESIS_HASH = exports.computeRowHash = exports.featuresFor = exports.signLicenseV2 = exports.verifyLicenseKey = exports.applyPreset = exports.POLICY_PRESETS = exports.createRedactor = exports.readPersistedListenPort = exports.signWebhookBody = exports.validatePolicies = exports.evaluateRule = exports.createAgentGateway = void 0;
 /**
  * agent-gateway-sdk: public entry point.
  *
@@ -54,7 +54,15 @@ Object.defineProperty(exports, "readPersistedListenPort", { enumerable: true, ge
 Object.defineProperty(exports, "createRedactor", { enumerable: true, get: function () { return core_1.createRedactor; } });
 Object.defineProperty(exports, "POLICY_PRESETS", { enumerable: true, get: function () { return core_1.POLICY_PRESETS; } });
 Object.defineProperty(exports, "applyPreset", { enumerable: true, get: function () { return core_1.applyPreset; } });
+Object.defineProperty(exports, "verifyLicenseKey", { enumerable: true, get: function () { return core_1.verifyLicenseKey; } });
+Object.defineProperty(exports, "signLicenseV2", { enumerable: true, get: function () { return core_1.signLicenseV2; } });
+Object.defineProperty(exports, "featuresFor", { enumerable: true, get: function () { return core_1.featuresFor; } });
+Object.defineProperty(exports, "computeRowHash", { enumerable: true, get: function () { return core_1.computeRowHash; } });
+Object.defineProperty(exports, "GENESIS_HASH", { enumerable: true, get: function () { return core_1.GENESIS_HASH; } });
+Object.defineProperty(exports, "inspectResponseBody", { enumerable: true, get: function () { return core_1.inspectResponseBody; } });
+Object.defineProperty(exports, "inspectMcpResult", { enumerable: true, get: function () { return core_1.inspectMcpResult; } });
 var mcpProxy_1 = require("./mcpProxy");
 Object.defineProperty(exports, "createMcpHttpProxy", { enumerable: true, get: function () { return mcpProxy_1.createMcpHttpProxy; } });
 Object.defineProperty(exports, "startMcpStdioProxy", { enumerable: true, get: function () { return mcpProxy_1.startMcpStdioProxy; } });
 Object.defineProperty(exports, "gateToolCall", { enumerable: true, get: function () { return mcpProxy_1.gateToolCall; } });
+Object.defineProperty(exports, "parseSse", { enumerable: true, get: function () { return mcpProxy_1.parseSse; } });

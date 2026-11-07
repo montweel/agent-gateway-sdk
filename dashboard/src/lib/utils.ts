@@ -81,7 +81,7 @@ export function suggestedMode(method: string): Mode {
 export const INPUT_CLASS =
   'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 disabled:bg-slate-50 disabled:text-slate-500 disabled:cursor-not-allowed'
 
-export const MODE_ORDER: Mode[] = ['ALLOW', 'REQUIRE_APPROVAL', 'BLOCK']
+export const MODE_ORDER: Mode[] = ['ALLOW', 'REQUIRE_APPROVAL', 'BLOCK', 'SHADOW_BLOCK', 'SHADOW_APPROVAL']
 export const READ_ONLY_HINT = 'Read-only viewers cannot modify rules, settings, or approve actions.'
 
 export const MODE_META: Record<Mode, { label: string; title: string; active: string }> = {
@@ -100,4 +100,18 @@ export const MODE_META: Record<Mode, { label: string; title: string; active: str
     title: 'Requests are rejected with 403',
     active: 'bg-red-500 text-white shadow-sm',
   },
+  SHADOW_BLOCK: {
+    label: 'Shadow: Block',
+    title: 'Dry run: requests go through, but the log records that they would have been blocked',
+    active: 'bg-slate-700 text-white shadow-sm ring-1 ring-red-400',
+  },
+  SHADOW_APPROVAL: {
+    label: 'Shadow: Hold',
+    title: 'Dry run: requests go through, but the log records that they would have needed approval',
+    active: 'bg-slate-700 text-white shadow-sm ring-1 ring-amber-400',
+  },
 }
+
+/** Shadow (dry-run) modes: enforced as Allow, logged as what they would have done. */
+export const SHADOW_MODES: Mode[] = ['SHADOW_BLOCK', 'SHADOW_APPROVAL']
+export const isShadowMode = (m: Mode): boolean => SHADOW_MODES.includes(m)

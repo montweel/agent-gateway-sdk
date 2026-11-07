@@ -9,6 +9,8 @@ import path from "path";
 import express from "express";
 import type { Express, Request, Response } from "express";
 import sqlite3 from "sqlite3";
+// Must run before any gateway exists: test public key + no ambient license.
+import { TEST_AGENCY_KEY } from "./testLicense";
 import { createAgentGateway } from "../src/gateway";
 import type { AgentGateway, AgentGatewayOptions, Rules } from "../src/gateway";
 
@@ -57,7 +59,7 @@ export interface Harness {
   app: Express;
   gateway: AgentGateway;
   hits: Array<{ key: string; body: unknown; headers: http.IncomingHttpHeaders }>;
-  admin(method: string, p: string, body?: unknown): Promise<{ status: number; data: any }>;
+  admin(method: string, p: string, body?: unknown, headers?: Record<string, string>): Promise<{ status: number; data: any }>;
   close(): Promise<void>;
 }
 
@@ -75,6 +77,8 @@ export async function makeHarness(opts: {
   rateLimitPerMinute?: number;
   gatewayOptions?: Partial<AgentGatewayOptions>;
   mount?: (app: Express, gateway: AgentGateway) => void;
+  /** License key for this gateway. Default: a test AGENCY key. null = none (7-day trial on a fresh anchor). */
+  license?: string | null;
 }): Promise<Harness> {
   const dir = opts.dir ?? tempDir();
   const rulesPath = path.join(dir, "rules.json");
@@ -88,7 +92,17 @@ export async function makeHarness(opts: {
   const app = express();
   const server = http.createServer(app);
   const port = await listen(server);
-  const gateway = createAgentGateway({ port, rulesPath, configPath, dbPath, adminToken: ADMIN_TOKEN, ...opts.gatewayOptions });
+  const license = opts.license === undefined ? TEST_AGENCY_KEY : opts.license;
+  const gateway = createAgentGateway({
+    port,
+    rulesPath,
+    configPath,
+    dbPath,
+    adminToken: ADMIN_TOKEN,
+    licenseAnchorFile: path.join(dir, "anchor.json"),
+    ...(license ? { licenseKey: license } : {}),
+    ...opts.gatewayOptions,
+  });
   await gateway.ready;
 
   const hits: Harness["hits"] = [];
@@ -111,10 +125,10 @@ export async function makeHarness(opts: {
     app,
     gateway,
     hits,
-    async admin(method, p, body) {
+    async admin(method, p, body, headers = {}) {
       const res = await fetch(`${base}/api/agent-admin${p}`, {
         method,
-        headers: { "x-admin-token": ADMIN_TOKEN, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+        headers: { "x-admin-token": ADMIN_TOKEN, ...(body !== undefined ? { "content-type": "application/json" } : {}), ...headers },
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
       return { status: res.status, data: await res.json().catch(() => null) };

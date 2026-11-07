@@ -1,76 +1,48 @@
-# Mont (`agent-gateway-sdk`) — Zero-Infrastructure AI Agent API Gateway & Firewall
+# Mont (`agent-gateway-sdk`) — The Firewall Between AI Agents and Your APIs
 [![npm version](https://img.shields.io/npm/v/agent-gateway-sdk?style=flat-square&color=cb3837)](https://www.npmjs.com/package/agent-gateway-sdk)
 [![Website](https://img.shields.io/badge/Website-montweel.com-6366f1?style=flat-square)](https://montweel.com)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20.17-10b981?style=flat-square)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-3b82f6?style=flat-square)](https://www.typescriptlang.org/)
 [![Database](https://img.shields.io/badge/Storage-Embedded%20SQLite%20WAL-f59e0b?style=flat-square)](https://www.sqlite.org/)
+[![Docker](https://img.shields.io/badge/Docker-ready-0ea5e9?style=flat-square)](#deploy-with-docker)
 [![License](https://img.shields.io/badge/License-Open--Core%20(See%20TERMS.md)-64748b?style=flat-square)](./TERMS.md)
+
 ![Mont Gateway Dashboard](https://montweel.com/media/dashboard.png)
 
-**Open your product and APIs to autonomous AI agents—safely, visibly, and in under 60 seconds.**
+**Let AI agents use your store and APIs without letting them empty it.**
 
-**Mont** (`agent-gateway-sdk`) is a lightweight, **local-first API gateway, reverse proxy, and human-in-the-loop firewall for AI agent traffic**. It drops into your existing Node.js / Express application as middleware—or runs as a standalone reverse proxy in front of any backend (Python, Go, Java, Next.js, FastAPI, Rails)—with **zero external infrastructure**. No Redis, no external Postgres, and no complex DevOps required.
+Mont is a local-first, fail-closed API gateway and human-in-the-loop firewall for AI agent traffic: REST calls and MCP tool calls alike. You can use it in three ways:
 
-🌐 **Website & Free 90-Day Pro Trial Key:** [https://montweel.com](https://montweel.com)
-⚖️ **Terms & License:** [TERMS.md](./TERMS.md)
-    Local-first alternative to cloud AI proxies
----
+- as **Express middleware** inside your app
+- as a **no-code reverse proxy** in front of any backend (Python, Go, Java, Rails, Next.js…)
+- as an **MCP proxy** between Claude, Cursor or your agent framework and its tools
 
-## Why Mont?
+It needs no Redis, no Postgres and no cloud account: everything lives in an embedded SQLite (WAL) database next to your app.
 
-Autonomous AI agents, LLM tool-callers, and MCP clients are rapidly replacing traditional browser sessions. Opening your APIs to agentic traffic without a dedicated governance layer exposes your backend to runaway loops, unauthorized mutations, and billing spikes.
-
-Mont sits between AI agents and your routes to give you instant control:
-
-- **Zero Infrastructure by Default:** Powered by embedded **SQLite in WAL (Write-Ahead Logging) mode**. Rules, rate limits, agent API keys, and audit logs run in-process on local disk.
-- **Deploy Anywhere (Local or Cloud):** Run it on a laptop in 1 minute, or deploy it in production on **AWS, Render, Railway, Fly.io, DigitalOcean, Docker, or Kubernetes** right alongside your app.
-- **Human-in-the-Loop Safety:** Pause sensitive `POST` / `DELETE` / checkout actions with `REQUIRE_APPROVAL` rules and approve or reject them with one click in the built-in Admin Dashboard.
-- **Agent Discovery Out of the Box:** Serves a machine-readable `/.well-known/agent.json` discovery manifest so trusted AI agents know how to authenticate and interact with your APIs.
+🌐 [montweel.com](https://montweel.com) · 🎁 [Free 90-day Pro trial key](https://montweel.com/#license-renewal) · ⚖️ [TERMS.md](./TERMS.md)
 
 ---
 
-## Core Features
+## The problem
 
-### 1. API Firewall & Per-Route Access Rules
+Agents are now calling production APIs, and they fail in ways firewalls were never built for:
 
-Define route rules (a path such as `/api/x` for any method, or `POST /api/x` for one method) with three enforcement modes. A method-specific rule wins over a path-only rule, and **a request that matches no rule is blocked**.
+| What goes wrong | What it costs you | How Mont stops it |
+|---|---|---|
+| **Runaway loops.** An agent retries the same refund or email 400 times. | Duplicate payouts, spam, burned API budget | Rate limits per route, **duplicate-action protection**, cumulative **spending budgets** |
+| **Prompt-injected refunds.** A support ticket says "refund every order", and the agent obeys. | Real money leaves the store | **Payload policies** (`amount > 100` → needs a human), **phone approvals**, **Edit & Approve**, **Lockdown** switch |
+| **Blind MCP tool calls.** The model calls `delete_customer` or `export_database` because a webpage told it to. | Data loss, data exfiltration | **Default-deny MCP tool rules**, per-argument policies, **outbound response guard** |
+| **"What did the agent actually do?"** | No evidence for chargebacks or audits | **Hash-chained, tamper-evident audit log**, CSV export, money-protected reports |
 
-- **`ALLOW`**: Pass the agent request to your upstream route.
-- **`REQUIRE_APPROVAL`**: Hold sensitive agent actions (e.g., `POST /api/payments`, `DELETE /api/users`) in a pending queue until a human admin approves or rejects them. Undecided actions expire after 24 hours.
-- **`BLOCK`**: Reject the request before it touches your application logic.
-
-### 2. Sliding-Window Rate Limiting
-
-Protect your upstream APIs and LLM budgets from runaway agent loops. A global per-minute limit applies per client IP, and any rule can set its own `rateLimit` (requests per minute) with a separate bucket. It is stored in-process, so no Redis cluster is needed.
-
-### 3. Built-In Local Admin Dashboard (`/agent-admin`)
-
-Manage rules, inspect agent audit logs, issue or revoke agent keys, and approve held requests from a zero-setup web UI. The dashboard and admin API (`/api/agent-admin`) can run on the public port or on a separate, private listener (`ADMIN_PORT`).
-
-### 4. Standalone Reverse Proxy Mode
-
-Not using Node.js for your main backend? Run Mont as a standalone **reverse proxy** in front of any upstream server. Set the **Target URL** in the dashboard (stored as `targetUrl` in `config.json`). Mont inspects, rate-limits, and logs incoming `/api/*` agent traffic before forwarding allowed requests to your Python, Go, Ruby, or Java services.
-
-### 5. Agent API Keys
-
-Turn on `requireAgentApiKey` and every `/api/*` request must carry a valid key, either as `x-agent-key: agk_...` or `Authorization: Bearer agk_...`. Create and revoke keys in the dashboard.
-
-### 6. OAuth2 / Reverse-Proxy SSO Authentication *(Team Pro)*
-
-Deploying behind **Cloudflare Access, OAuth2 Proxy, Nginx, Traefik, Authelia, or Okta**? Enable *Trust identity proxy headers* in Settings. Mont then reads the user from `x-forwarded-user` and the role from `x-forwarded-role` (`admin`, anything else is a read-only viewer). Both header names are configurable. Mont generates a random `ssoSharedSecret`, and your proxy **must send it in the `x-gateway-sso-secret` header**, otherwise the identity headers are ignored.
-
-### 7. Multi-User RBAC & Prometheus `/metrics` *(Team Pro)*
-
-- **Role-Based Access Control:** Give full rule/approval control to **Admins** and **Read-Only Auditor** accounts to security and compliance teammates.
-- **Prometheus Metrics:** `GET /api/agent-admin/metrics` exposes `agent_gateway_requests_total` (by outcome) and `agent_gateway_pending_approvals` for Grafana, Datadog, or Zabbix. It requires an authenticated admin/viewer session or static token.
+Every decision is **fail-closed**. A request reaches your API only after every check passed *and* its audit row is durably written. A database error, timeout, malformed body or policy error ends in a 4xx/503, never in a forwarded request.
 
 ---
 
-## 60-Second Quick Start
+## Quickstart
 
-Requires **Node.js 20.17+**.
+Requires **Node.js 20.17+** (or [Docker](#deploy-with-docker)).
 
-### Option A: Install as an SDK in Your Node.js / Express App
+### (a) Express middleware: inside your Node.js app
 
 ```bash
 npm install agent-gateway-sdk
@@ -80,100 +52,128 @@ npm install agent-gateway-sdk
 import express from "express";
 import { createAgentGateway } from "agent-gateway-sdk";
 
-const PORT = 3000;
 const app = express();
+const gateway = createAgentGateway({ port: 3000 });
+await gateway.ready;                                // database open and migrated
 
-const gateway = createAgentGateway({ port: PORT });
-await gateway.ready; // database is open and migrated
+app.use(gateway.discoveryRouter);                   // GET /.well-known/agent.json
+app.use(gateway.approvalCallbackRouter);            // signed Approve / Reject links
+app.use("/api/agent-admin", gateway.adminRouter);   // admin API (mount BEFORE the gateway)
+app.use("/api", gateway.agentGateway);              // the firewall
 
-app.use(gateway.discoveryRouter);                  // GET /.well-known/agent.json
-app.use("/api/agent-admin", gateway.adminRouter);  // admin API: mount BEFORE the gateway
-app.use("/api", gateway.agentGateway);             // the firewall / interceptor
-
-app.use(express.json());
-app.get("/api/get-flights", (_req, res) => res.json({ flights: [] })); // your routes
-
-app.listen(PORT, () => console.log(`Mont gateway on http://localhost:${PORT}`));
+app.post("/api/refund", express.json(), (req, res) => res.json({ refunded: req.body.amount })); // your routes
+app.listen(3000);
 ```
 
-Rules and config are stored in `rules.json` / `config.json` and the SQLite database in `logs.db`, all in the working directory (override with the `rulesPath`, `configPath`, and `dbPath` options). Call `await gateway.close()` on shutdown.
-
-The `adminRouter` is the admin **API**. The prebuilt dashboard UI is in `dashboard/dist`; `src/server.ts` shows how to serve it at `/agent-admin` with a strict Content-Security-Policy.
-
-### Option B: Run as a Standalone Reverse Proxy (Any Language / Cloud Stack)
-
-Clone the repository and run Mont in front of any existing API server:
-
-```bash
-git clone https://github.com/montweel/agent-gateway-sdk.git
-cd agent-gateway-sdk
-npm install
-npm start
-```
-
-Open `http://127.0.0.1:3000/agent-admin/` to create the owner account (the first-boot setup key is printed in the console banner), set your **Target URL**, create your first agent API key, and add route rules.
-
-Or, with no clone at all:
+### (b) Standalone no-code proxy: in front of any backend
 
 ```bash
 npx agent-gateway-sdk start --target https://api.mystore.com
-# agents call  http://127.0.0.1:8080/api/...   admin console  http://127.0.0.1:3000/agent-admin/
+# agents call      http://127.0.0.1:8080/api/...
+# admin console    http://127.0.0.1:3000/agent-admin/   (first-boot setup key is printed in the console)
 ```
+
+### (c) MCP proxy: between your AI client and its tools
+
+```bash
+# stdio: put this in your MCP client config as the server "command"
+npx agent-gateway-sdk mcp-stdio --data-dir ~/.mont -- npx -y @modelcontextprotocol/server-filesystem /data
+# Streamable HTTP (+ legacy HTTP+SSE at /mcp/sse) in front of a remote MCP server
+npx agent-gateway-sdk mcp-http --upstream http://127.0.0.1:9000/mcp
+```
+
+Then open the admin console. **Gateway Setup** walks you through the rest without code:
+- your upstream URL
+- a one-click policy pack (E-commerce, FinTech, CRUD)
+- phone approvals
+- budgets
+- business hours
+
+**Try the disaster first:** run `npm run demo:shopify` in a clone of this repo. It shows a prompt-injected support bot refunding every order, first without Mont and then with it.
 
 ---
 
-## v1.1: Payload Policies, Phone Approvals, Revoke & Kill-Switch
+## Feature & tier overview
 
-**Fail-closed guarantee.** A request is forwarded only after every check passed *and* its audit row is durably written. SQLite errors, lock waits longer than `dbOperationTimeoutMs` (default 4 s), malformed JSON, policy evaluation errors and client disconnects all end in 4xx/503, never in `next()` or an upstream call. Upstream responses are fully read before anything is sent back, so an upstream that dies mid-response becomes a clean 502, not a truncated 200.
+Licenses are offline Ed25519 keys and nothing phones home. Every new install gets an instant 7-day Pro trial, and a [free 90-day Pro trial key](https://montweel.com/#license-renewal) needs no credit card.
 
-**Payload policies.** Tiers on any rule inspect `body.*`, `query.*` and `headers.*` with `> < >= <= === !== contains in regex exists`. First matching tier wins; otherwise the rule's own mode applies. Body numbers are never coerced (`"250"` is not 250), and routes whose policies read the body only accept `application/json`.
+| | **Community** (free forever) | **Pro** | **Agency** |
+|---|:---:|:---:|:---:|
+| Fail-closed firewall, reverse proxy, MCP proxy (stdio, Streamable HTTP, legacy SSE) | ✅ | ✅ | ✅ |
+| Route rules, wildcard rules, payload policies, rate limits | ✅ | ✅ | ✅ |
+| **Spending Budgets** & duplicate-action protection | ✅ | ✅ | ✅ |
+| Approval queue + dashboard approvals, signed approval links | ✅ | ✅ | ✅ |
+| Lockdown / Approval-only switch, business hours, alerts & daily digest | ✅ | ✅ | ✅ |
+| PII & secret scrubber, outbound response guard, CSV export | ✅ | ✅ | ✅ |
+| Shadow (dry-run) rules & Policy Time-Machine replay | ✅ | ✅ | ✅ |
+| **Hash-Chained Audit Ledger**: every row chained | ✅ | ✅ | ✅ |
+| Hash-Chained Audit Ledger: one-click integrity **verification** | — | ✅ | ✅ |
+| **Zero-Tunnel Telegram / Slack buttons** & Telegram bot commands | — (alerts arrive; approve in the dashboard) | ✅ | ✅ |
+| **Edit & Approve** (change a payload before it runs) | — | ✅ | ✅ |
+| Compensating rollback webhook on Revoke | — | ✅ | ✅ |
+| **Multi-Workspace** (one install, many client stores) | 1 workspace | 3 workspaces | 25 workspaces (or as licensed) |
+| Agent API keys | 2 | 500 | 500 |
+| Team accounts (Admin / Read-only auditor), SSO header trust, Prometheus metrics, 7-day analytics | — | ✅ | ✅ |
+| Price | $0 | $30/mo or $250/yr | [montweel.com](https://montweel.com) |
+
+Activate a key in **Gateway Setup → License & Plan** and it takes effect immediately. You can also set `MONT_LICENSE_KEY`, or pass `licenseKey` to `createAgentGateway()`. If a license lapses, paid features switch off cleanly. Workspaces beyond the plan are refused (`402`), and their traffic is never forwarded unguarded.
+
+---
+
+## How it protects you
+
+### 1. Rules: default deny, decided per route and per payload
+
+Rule keys are `"/api/x"` (any method), `"POST /api/x"` (one method), or wildcards such as `"POST /api/*refund*"`. MCP tools use the pseudo-method `MCP` (`"MCP /api/mcp/tools/refund_order"`). A request that matches no rule is **blocked**.
+
+| Mode | Effect |
+|---|---|
+| `ALLOW` | Forward to your API |
+| `REQUIRE_APPROVAL` | Hold until a human approves (expires after 24 h) |
+| `BLOCK` | Refuse with 403 |
+| `SHADOW_BLOCK` / `SHADOW_APPROVAL` | **Dry run:** forward, but log what the rule *would* have done |
+
+**Payload policies** inspect `body.*`, `query.*` and `headers.*` with `> < >= <= === !== contains in regex exists`. The first matching tier wins. Numbers are never coerced (`"250"` is not 250), and routes whose policies read the body only accept JSON.
 
 ```json
 "POST /api/refund": {
   "mode": "REQUIRE_APPROVAL",
+  "rateLimit": 30,
   "policies": [
     { "name": "small", "when": [{ "field": "body.amount", "op": "<=", "value": 100 }],  "mode": "ALLOW" },
     { "name": "huge",  "when": [{ "field": "body.amount", "op": ">",  "value": 1000 }], "mode": "BLOCK" }
-  ]
+  ],
+  "budget": { "field": "body.amount", "max": 300, "windowMinutes": 60, "per": "global", "onExceed": "REQUIRE_APPROVAL" },
+  "dedupe": { "fields": ["body.orderId"], "windowMinutes": 1440, "onDuplicate": "BLOCK" }
 }
 ```
 
-**Payload inspector.** Pending approvals show the redacted body and query in a collapsible JSON tree with `amount`, `price`, `delete`, `email` and `destination` fields flagged, plus the caller's agent key, IP, User-Agent and the agent's `x-agent-reason` header.
+- **Spending budgets** cap the *total* an agent can move on its own. Twenty $90 refunds all pass an "≤ $100" tier; a $300/hour budget stops the fourth. Budgets can be global or per agent, are stored in SQLite, and are race-free under bursts. A missing or text amount counts as over budget.
+- **Duplicate protection** refuses (or holds) a second action with the same field values while the first is allowed, waiting or done. A rejected attempt doesn't block a legitimate retry.
+- **Starter policy packs** (E-commerce & Shopify, Stripe & FinTech, Internal CRUD) install in one click.
 
-**Revoke & Block Caller.** On any approved action (Approvals or Audit Logs): blocks the agent key and/or IP in a persistent kill-switch list, auto-rejects that caller's queued requests, and optionally POSTs `{ "event": "approval.revoked", "originalRequestId", "method", "path", "body", ... }` to your rollback webhook (HMAC-signed `x-mont-signature`, `Idempotency-Key: mont-revoke-<id>`).
+### 2. Humans in the loop, from anywhere
 
-**Phone approvals.** Slack, Telegram or a custom webhook receive every `REQUIRE_APPROVAL` request with a payload summary and HMAC-SHA256-signed Approve / Reject links (`/_mont/approvals/:id/confirm`). Links open a confirmation page; only the button press acts, so chat link previews can never approve anything. Configure it in the **Gateway Setup (No-Code)** tab, together with the upstream URL, listen port, rate limits and payload rules.
+- **Approval queue with a payload inspector.** You see the redacted body and query, high-risk fields flagged (`amount`, `email`, `destination`…), the caller's key, IP and User-Agent, and the agent's own `x-agent-reason`.
+- **Phone approvals:**
+  - *Zero-tunnel (Pro):* Telegram inline buttons via outbound long-polling, or Slack buttons via Socket Mode. No public URL, ngrok or open port.
+  - *Signed links:* Slack, Telegram or a custom webhook with HMAC-signed Approve / Reject links. Links open a confirmation page, so chat link previews can't approve anything.
+- **Edit & Approve (Pro).** Lower a hallucinated `"amount": 250` to `50`, fix an address, change a query parameter, or edit MCP tool arguments, then approve.
+  - Fields you didn't touch keep their *real* values, even the ones shown masked.
+  - The rule is re-checked against your edit.
+  - The edited body goes out with a fresh `Content-Length`.
+  - The original and modified payloads are both audited (redacted).
+- **Revoke & Block Caller.** On any approved action, this blocks the agent key and/or IP, auto-rejects its queued requests, and (Pro) calls your **compensating rollback webhook** (HMAC-signed, idempotency key included).
+- **Emergency switch.**
+  - **Lockdown** refuses every agent request (nothing waiting can be approved).
+  - **Approval-only** holds every write and lets reads through.
+  - Flip it from the dashboard, the API or Telegram (`/lockdown`, `/approvalonly`, `/resume`, `/status`, `/pending`). Every gateway process sharing the database follows within about 2 seconds.
+- **Business hours.** Outside your opening hours (time-zone and DST aware), writes wait for a human.
+- **Alerts & daily digest.** You're told about attack bursts, budgets reached and mode changes, and get a morning summary of money protected vs executed. Each alert is sent once, even across processes.
 
-Mount the link handler on your public app in middleware mode: `app.use(gateway.approvalCallbackRouter)`.
+### 3. MCP tool-call firewall
 
-**Try it:** `npm run demo:shopify` (simulated refund-injection demo, see `examples/shopify-refund-demo`) and `npm test` (fail-closed and chaos suite).
-
----
-
-## v1.2: Zero-Tunnel Approvals, Policy Packs, PII Scrubber, MCP Proxy
-
-**Approve from your phone with no tunnel.** In **Gateway Setup → Approve from your phone**:
-- **Telegram (Buttons mode):** paste a @BotFather token and your chat id. Mont long-polls `getUpdates` *outbound* and sends Approve / Reject inline buttons, so you need no public URL, ngrok or open port.
-- **Slack (Socket Mode):** a Slack app with Socket Mode and Interactivity on, a bot token (`xoxb-`, `chat:write`), an app-level token (`xapp-`, `connections:write`) and a channel id.
-
-Each button carries an HMAC bound to that exact queued request. Taps are accepted only from the configured chat or channel and, optionally, only from listed approver user ids. If several gateway processes share one data folder, a SQLite lease makes sure only one of them polls.
-
-**1-click Starter Policy Packs** (Setup → Payload rules): *E-Commerce & Shopify*, *Stripe & FinTech*, *Internal CRUD*. Packs use the new `*` wildcard rule keys, e.g. `"POST /api/*refund*"` or `"DELETE /api/*"`. Precedence is exact key, then method wildcard, then any-method wildcard, with the more specific pattern winning. You can add a pack to your rules or replace them; everything else stays default-deny. API: `GET /api/agent-admin/setup/presets`, `POST /api/agent-admin/setup/presets/:id/apply {"mode":"merge"|"replace"}`.
-
-**PII & secret scrubber.** Nothing is written to SQLite or sent to Slack, Telegram or a webhook before it passes through it:
-- **Always removed:** auth headers, cookies, API keys, passwords, tokens, known key formats (Stripe, GitHub, Slack, AWS, JWT, Telegram, OpenAI/Anthropic) and Luhn-valid card numbers.
-- **On by default, can be switched off:** emails (`j***@example.com`) and phone numbers.
-
-Payload rules still evaluate the real values, and approved requests replay from the encrypted original.
-
-**MCP tool-call proxy.** Guards every JSON-RPC `tools/call` with the same rules, payload policies, rate limits, kill-switch, audit log and approvals:
-
-```bash
-# Streamable HTTP (clients connect to http://127.0.0.1:8090/mcp)
-npx agent-gateway-sdk mcp-http --upstream http://127.0.0.1:9000/mcp
-# stdio: use this as the "command" in your MCP client config
-npx agent-gateway-sdk mcp-stdio --data-dir ~/.mont -- npx -y @modelcontextprotocol/server-filesystem /data
-```
+Every JSON-RPC `tools/call` gets the same rules, payload policies (on `params.arguments` as `body.*`), budgets, approvals and audit trail.
 
 ```json
 "MCP /api/mcp/tools/search_orders": { "mode": "ALLOW" },
@@ -182,148 +182,146 @@ npx agent-gateway-sdk mcp-stdio --data-dir ~/.mont -- npx -y @modelcontextprotoc
 "MCP /api/mcp/tools/*delete*":      { "mode": "BLOCK" }
 ```
 
-How it behaves:
-- `params.arguments` is checked as `body.*`.
-- Tools without a rule are blocked. HTTP rules such as `/api/*` never apply to MCP tools.
-- Refusals come back as tool results with `isError: true`, so the model can read why the call didn't run.
-- A call that needs approval is held open until someone decides (default wait 5 minutes). If the wait runs out or the agent disconnects, the call expires and can never run later.
-- Approvals work from any gateway process sharing the data folder, from the dashboard, and from Telegram or Slack.
+- Unlisted tools are blocked. HTTP rules such as `/api/*` never apply to MCP tools.
+- Refusals come back as tool results with `isError: true`, so the model can read why.
+- A call that needs approval is held open until a human decides. If the wait times out or the agent disconnects, the call expires and can never run later.
+- **Transports:**
+  - stdio: `mcp-stdio`
+  - Streamable HTTP: `mcp-http`
+  - legacy HTTP+SSE for older clients: `GET /mcp/sse` + `POST /mcp/messages?sessionId=…`
+- **Programmatic use:** `createMcpHttpProxy(gateway, { upstreamUrl })`, `startMcpStdioProxy(gateway, { command, args })`, or `gateway.mcp.check(...)`.
 
-Programmatic use: `createMcpHttpProxy(gateway, { upstreamUrl })`, `startMcpStdioProxy(gateway, { command, args })`, or `gateway.mcp.check(...)` for custom transports.
+### 4. Data protection in both directions
 
----
+- **PII & secret scrubber.** Nothing is stored in SQLite or sent to Slack, Telegram or webhooks without passing through it.
+  - *Always removed:* auth headers, cookies, passwords, tokens, API keys (Stripe, GitHub, Slack, AWS, OpenAI/Anthropic, JWT…) and Luhn-valid card numbers.
+  - *Masked by default:* emails and phone numbers.
+  - Rules still evaluate the real values, and approved requests replay from an AES-256-GCM encrypted original.
+- **Outbound response guard** (opt-in). Mont inspects what your API or MCP tool sends *back* before the agent sees it.
+  - **Bulk dumps:** a JSON array longer than your limit (e.g. 1,000 customer rows) is withheld with `502 Response Policy Violation`, or truncated.
+  - **Secrets:** they are scrubbed in-flight, or the response is withheld.
+  - It works in proxy mode, middleware mode and on every MCP transport.
 
-## v1.3: Shop-Owner Safety Kit
+### 5. Proof: a tamper-evident audit ledger
 
-Per-request limits stop one big bad action. These features stop the slow, repeated and after-hours ones, and keep you in control from your phone.
+- **Hash chain.** Every audit row is chained:
+  `row_hash = SHA-256(prev_hash + id, timestamp, caller, route, decision, redacted payload, …)`.
+  - **Verify Ledger Integrity** (Pro) re-hashes the chain and pinpoints any edited, deleted, inserted or truncated row.
+  - Retention pruning keeps the chain verifiable.
+  - Several gateway processes can share one database safely.
+  - The daily digest carries the chain head, giving you an off-box copy.
+- **Money protected** shows how much agents tried to move and were stopped, next to what was executed.
+- **CSV export** for accounting and chargeback disputes (formula-injection safe).
+- **Shadow rules & Policy Time-Machine.** Try a policy as `SHADOW_*` on live traffic, or click **Test Rules Against History**. The last N real requests are replayed through your rules, including rate limits, budgets and duplicate protection, and you see exactly which ones would now be blocked, held or rate-limited.
 
-### Spending budgets (cumulative caps)
-Twenty refunds of $90 each all pass an "amount ≤ $100" rule. A budget caps the **total** an agent can move on its own:
+### 6. Agencies: many client stores, one install (Agency)
 
-```json
-"POST /api/*refund*": {
-  "mode": "ALLOW",
-  "budget": { "field": "body.amount", "max": 300, "windowMinutes": 60, "per": "global", "onExceed": "REQUIRE_APPROVAL" }
-}
-```
+Each **workspace** has its own rules, budgets, upstream URL, emergency switch, business hours, approval chat or Slack channel, and `mws_…` API key. That key is required by default, so one client's agent can never act on another client's store.
 
-- `per`: `"global"` (all agents together) or `"caller"` (each agent key or IP has its own allowance).
-- `onExceed`: what happens to a request that would go over the cap, either `REQUIRE_APPROVAL` or `BLOCK`.
-- A missing amount, or an amount sent as text, counts as over budget (fail-closed).
-- Approved requests count toward the budget too.
-- Budgets are stored in SQLite, so they survive restarts.
-- A burst of 50 concurrent requests can't overspend: each rule's check-and-record runs under a lock.
-- Live usage: dashboard top bar, `GET /api/agent-admin/guards/usage`, Telegram `/status`.
-
-### Duplicate-action protection
-```json
-"dedupe": { "fields": ["body.orderId"], "windowMinutes": 1440, "onDuplicate": "BLOCK" }
-```
-- Refuses (or holds for approval) a second action with the same field values while the first one is allowed, waiting, or executed. That stops looping agents and double refunds, even when 8 identical requests arrive at once.
-- Rejected or expired attempts don't count, so a legitimate retry still works.
-
-### Emergency switch: Lockdown / Approval-only
-- **Lockdown:** refuses every agent request (HTTP and MCP). Nothing already waiting can be approved; rejecting still works.
-- **Approval-only:** every write waits for a human; reads keep working.
-
-Switch from the dashboard's top bar, from `POST /api/agent-admin/emergency {"mode":"lockdown","reason":"..."}`, or from Telegram. The change reaches every gateway process sharing the database within about 2 seconds. Every change is logged and sent as an alert.
-
-### Business hours
-Gateway Setup → Step 5: pick a time zone, business days and opening hours. Outside them, writes your rules would allow wait for your approval; reads stay allowed. Daylight saving and overnight shifts (e.g. 22:00–06:00) are handled.
-
-### Telegram bot commands (Buttons mode)
-| Command | What it does |
+| Agents select a workspace with | Example |
 |---|---|
-| `/status` | Mode, last 24h counts, money protected, budgets |
-| `/pending` | Re-sends waiting requests with Approve / Reject buttons |
-| `/lockdown [reason]` | Emergency lockdown |
-| `/approvalonly [reason]` | Every write needs approval |
-| `/resume` | Back to normal |
+| Path prefix | `POST /api/w/acme/refund` (forwarded upstream as `/api/refund`) |
+| Header | `x-mont-workspace: acme` |
+| Bearer key | `Authorization: Bearer mws_…` |
 
-Commands are accepted only from the configured chat and, if an approver list is set, only from approvers.
-
-### Security alerts & daily digest
-Sent to your Telegram, Slack and/or webhook (event `"alert"`), each at most once even if several gateway processes share the database:
-- **Attack burst:** at least N requests refused within M minutes (default 10 in 5), with the top routes and callers.
-- **Spending budget reached.**
-- **Lockdown / approval-only switched** on or off.
-- **Daily digest** at the hour you choose, in your time zone: counts, money protected, money executed, waiting approvals, budgets, most-blocked routes. "Send digest now" sends it on demand (`POST /api/agent-admin/alerts/digest`).
-
-### "Money protected" & CSV export
-- Every audit row now stores the request's amount. `GET /api/agent-admin/protection/summary?hours=24` (and the dashboard top bar) shows how much money agents tried to move and were stopped, next to what was executed.
-- **Audit Logs → Export CSV** (`GET /api/agent-admin/logs/export.csv`, same filters as the log view) downloads up to 50,000 rows for accounting or chargeback disputes. Text cells starting with `=`, `+`, `-` or `@` are prefixed with `'` so nothing in the file can run as a spreadsheet formula.
-
-The **E-Commerce** starter pack now includes a $300/hour refund budget and one-refund-per-order protection. The **FinTech** pack includes $1,000/day transfer and payout budgets plus a duplicate-payment check (same destination and amount within 10 minutes).
+- **Dashboard:** a **Workspace Switcher** in the top bar and an **All Clients Overview** with mode, money protected, refusals, waiting approvals and shadow hits per client.
+- **Approvals per client:** each client's approvals go to its own chat, and a button tapped in the wrong chat is refused.
+- **MCP:** `mcp-http --workspace <slug>`, `/w/<slug>/mcp`, or `mcp-stdio --workspace <slug>`.
 
 ---
 
-## Configuration (Environment Variables)
+## Deploy with Docker
+
+```bash
+docker compose up -d
+```
+
+`docker-compose.yml` runs the standalone proxy with these defaults:
+- the agent-facing proxy on **:8080**
+- the admin console on **127.0.0.1:3000** (local only by default)
+- data in a named volume mounted at **/data** (SQLite WAL, rules, config)
+- a non-root user, a read-only root filesystem and no Linux capabilities
+- a health check
+
+To run it next to existing containers:
+1. Join their network (see the commented `networks:` block).
+2. Point Mont at `http://your-api:4000` in Gateway Setup.
+
+On first boot, `docker compose logs mont` shows the setup key, or you can set `SETUP_TOKEN`.
+
+```bash
+docker build -t montweel/agent-gateway:2.0.0 .
+docker run -d -p 8080:8080 -p 127.0.0.1:3000:3000 -v mont-data:/data montweel/agent-gateway:2.0.0
+```
+
+The image is multi-stage on Node 20 Alpine. Slack Socket Mode's WebSocket client is enabled with `--experimental-websocket` (it is built in from Node 22).
+
+**Other hosts:** Mont runs anywhere Node does: AWS ECS/EC2, Render, Fly.io, Railway, Kubernetes or a VPS. Mount a persistent volume for the data folder.
+
+**Behind an SSO / OAuth2 proxy (Pro):**
+1. Enable *Trust identity proxy headers* in Settings.
+2. Have the proxy send `x-forwarded-user`, `x-forwarded-role` and the generated `x-gateway-sso-secret`.
+3. Keep the admin listener on a private interface.
+
+---
+
+## Configuration
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `PORT` | Public listen port | `3000` |
-| `HOST` | Bind address (use `0.0.0.0` in Docker or behind a proxy) | `127.0.0.1` |
-| `TRUST_PROXY` | Set to `true` when behind exactly one reverse proxy so client IPs come from `X-Forwarded-For` | off |
-| `CORS_ORIGINS` | Comma-separated browser origins allowed to call the admin API | `http://localhost:5173` in dev, none in production |
-| `ADMIN_PORT` / `ADMIN_HOST` | Serve the admin API and dashboard on a separate listener | off / `127.0.0.1` |
-| `SETUP_TOKEN` | First-boot setup key (needed to create the owner from another machine) | random, printed at startup |
+| `PORT` / `HOST` | Agent-facing listen port / bind address (`0.0.0.0` in containers) | `8080` (CLI) / `127.0.0.1` |
+| `ADMIN_PORT` / `ADMIN_HOST` | Admin API + dashboard listener | `3000` / `127.0.0.1` |
+| `TRUST_PROXY` | `true` behind exactly one reverse proxy (client IPs from `X-Forwarded-For`) | off |
+| `CORS_ORIGINS` | Browser origins allowed to call the admin API | dev: `http://localhost:5173` |
+| `SETUP_TOKEN` | First-boot setup key (create the owner from another machine) | random, printed at startup |
 | `ADMIN_TOKEN` / `VIEWER_TOKEN` | Static tokens for CI/CD and read-only automation | unset |
-| `MONT_LICENSE_KEY` | Team Pro license key | unset |
+| `MONT_LICENSE_KEY` | `MONT-V2.…` Pro / Agency key (or a v1 `MONT-…` Pro key) | unset |
+| `MONT_AGENT_KEY` | (`mcp-stdio`) the local client's `agk_…` agent key or `mws_…` workspace key | unset |
 
----
+**SDK options** (`createAgentGateway({...})`):
+- `port`
+- `rulesPath`, `configPath`, `dbPath`
+- `adminPort`, `adminHost`
+- `adminToken`, `viewerToken`, `setupToken`
+- `dbOperationTimeoutMs`
+- `licenseKey`, `licenseAnchorFile`
+- `telegramApiBase`, `slackApiBase`
 
-## Cloud & Reverse-Proxy SSO Deployment
+**Admin API** (all under `/api/agent-admin`, scoped with `x-mont-workspace`):
 
-Mont needs no external infrastructure, but it is built for production environments (Docker, AWS ECS/EC2, Render, Fly.io, Railway, or a Linux VPS).
+| Area | Endpoints |
+|---|---|
+| Rules & approvals | `rules`, `approvals/:id/decide`, `approvals/:id/revoke` |
+| Logs & ledger | `logs`, `logs/export.csv`, `audit/verify`, `simulate/history` |
+| Protection | `protection/summary`, `emergency`, `guards/usage` |
+| Workspaces & setup | `workspaces`, `setup`, `setup/presets/:id/apply`, `license` |
 
-**Persistent volume (containers):** mount a persistent volume on the working directory so `logs.db` (SQLite WAL), `rules.json`, `config.json`, and `mont-state.json` survive restarts. Set `HOST=0.0.0.0`.
+**Signing license keys** (needs your Ed25519 private key; never leaves your machine):
 
-**Behind OAuth2 / reverse-proxy SSO (Team Pro):** configure your proxy to send verified identity headers *and* the shared secret shown in the dashboard Settings tab:
-
-```nginx
-location /agent-admin/ {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header x-forwarded-user $upstream_http_x_auth_request_email;
-    proxy_set_header x-forwarded-role "admin";          # or "viewer" for Read-Only Auditors
-    proxy_set_header x-gateway-sso-secret "<ssoSharedSecret from Settings>";
-}
-location /api/agent-admin/ {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header x-forwarded-user $upstream_http_x_auth_request_email;
-    proxy_set_header x-forwarded-role "admin";
-    proxy_set_header x-gateway-sso-secret "<ssoSharedSecret from Settings>";
-}
+```bash
+npm run keygen -- sign --tier=AGENCY --org="Acme Automation" --max-workspaces=20 --days=365
+npm run keygen -- verify MONT-V2.eyJ2Ijoy...
 ```
 
-Then enable *Trust identity proxy headers* in Settings. Keep `ADMIN_PORT` on a private interface so the admin API is not reachable around your proxy.
+---
+
+## Development
+
+```bash
+npm install && npm --prefix dashboard install
+npm run typecheck      # gateway + tools
+npm test               # 4 suites, 58 tests: fail-closed chaos, v1.2, v1.3 shop kit, v2.0 enterprise
+npm run build:all      # dist/ + dashboard/dist/
+npm run dev            # gateway with reload; dashboard: npm --prefix dashboard run dev
+```
+
+Tests run real gateways on temporary folders with a throwaway license key pair, and never touch your `~/.montweel` install anchor.
 
 ---
 
-## Community (Free Forever) vs. Team Pro
+## Search keywords
 
-Every new installation includes an instant 7-day Team Pro trial, plus a free 90-day Team Pro trial key at [montweel.com/#license-renewal](https://montweel.com/#license-renewal) (no credit card required). Install state is kept in `logs.db`, `mont-state.json` and `~/.montweel/anchor.json`; tampering with these disables the trial until a valid key is entered.
-
-| Feature | Community Edition ($0 forever) | Team Pro ($30/mo or $250/yr) |
-|---|---|---|
-| Core API firewall & reverse proxy | ✅ | ✅ |
-| Access rules (`ALLOW`, `REQUIRE_APPROVAL`, `BLOCK`) | ✅ | ✅ |
-| Sliding-window rate limiting | ✅ | ✅ |
-| Embedded SQLite WAL persistence | ✅ | ✅ |
-| Local admin dashboard (`/agent-admin`) | ✅ | ✅ |
-| `/.well-known/agent.json` discovery manifest | ✅ | ✅ |
-| Agent API keys | Up to 2 active keys | Up to 500 keys |
-| Dashboard activity window | 24 hours | 24 hours and 7 days |
-| Reverse-proxy SSO (`x-forwarded-user`, `x-forwarded-role`) | — | ✅ |
-| Multi-user RBAC (Admin & Read-Only Auditor) | Single owner account | ✅ |
-| Prometheus `/metrics` endpoint | — | ✅ |
-
-👉 Claim your free 90-day Team Pro trial key: <https://montweel.com/#license-renewal>
-
----
-
-## Search Keywords & Topics
-
-ai-agents · agent-gateway · api-gateway · api-firewall · mcp · autonomous-agents · human-in-the-loop · rate-limiter · reverse-proxy · sqlite · local-first · zero-infrastructure · sso · rbac · prometheus-metrics · nodejs · typescript · express-middleware
+ai-agents · agent-gateway · api-firewall · mcp · mcp-proxy · human-in-the-loop · prompt-injection · ai-safety · rate-limiter · spending-limits · audit-log · tamper-evident · reverse-proxy · sqlite · local-first · zero-infrastructure · multi-tenant · shopify · stripe · nodejs · typescript · express-middleware
 
 ---
 

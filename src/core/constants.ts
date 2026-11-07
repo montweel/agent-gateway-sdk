@@ -1,6 +1,16 @@
 import type { GatewayConfig, RuleMode } from "./types";
 
-export const RULE_MODES: RuleMode[] = ["ALLOW", "BLOCK", "REQUIRE_APPROVAL"];
+export const RULE_MODES: RuleMode[] = ["ALLOW", "BLOCK", "REQUIRE_APPROVAL", "SHADOW_BLOCK", "SHADOW_APPROVAL"];
+
+// v2.0 multi-tenant workspaces
+export const WORKSPACE_HEADER = "x-mont-workspace";
+export const WORKSPACE_KEY_PREFIX = "mws_";
+/** Path-prefix routing: /api/w/<slug>/... is the same request as /api/... in workspace <slug>. */
+export const WORKSPACE_PATH_PREFIX = "/api/w/";
+export const DEFAULT_WORKSPACE_ID = 1;
+export const DEFAULT_WORKSPACE_SLUG = "default";
+/** Largest request snapshot (redacted JSON) kept in the audit log for the policy time-machine. */
+export const MAX_SNAPSHOT_CHARS = 16 * 1024;
 
 // The header NAME is fixed. Its VALUE is a random secret created per gateway
 // instance, so an outside caller cannot bypass the gateway by adding the header.
@@ -106,6 +116,7 @@ export const NEVER_FORWARD = new Set([
   SSO_SECRET_HEADER,
   SETUP_TOKEN_HEADER,
   AGENT_KEY_HEADER,
+  WORKSPACE_HEADER,
   // Identity headers set by an SSO proxy. They must never reach the upstream
   // where they could be mistaken for a verified identity.
   "x-forwarded-user",

@@ -6,6 +6,7 @@ import {
   MAX_UPSTREAM_BYTES,
   NEVER_FORWARD,
   UPSTREAM_TIMEOUT_MS,
+  WORKSPACE_KEY_PREFIX,
 } from "./constants";
 import type { GatewayConfig } from "./types";
 import { extractBody, sendError } from "./utils";
@@ -64,6 +65,21 @@ export async function readCapped(upstream: FetchResponse, max: number = MAX_UPST
   return Buffer.concat(chunks);
 }
 
+export type InspectOutcome =
+  | { action: "pass" }
+  | { action: "modified"; body: Buffer }
+  | { action: "block"; message: string; violations: unknown[] };
+
+export interface ProxyOptions {
+  /** Path + query sent upstream. Default: req.originalUrl (workspace path prefixes are already stripped here). */
+  forwardUrl?: string;
+  /**
+   * Outbound response guard: sees the complete, decompressed upstream body before the agent
+   * does, and may replace it or withhold it (502 Response Policy Violation).
+   */
+  inspectResponse?: (status: number, contentType: string | null, body: Buffer) => Promise<InspectOutcome>;
+}
+
 /**
  * Forwards an ALLOWED request to targetUrl.
  *
@@ -72,15 +88,17 @@ export async function readCapped(upstream: FetchResponse, max: number = MAX_UPST
  *   - If the client disconnects while the upstream call is in flight, the upstream call is aborted.
  *   - The whole upstream response is read (and size-capped) BEFORE any status or header is
  *     written, so an upstream that dies mid-response becomes a clean 502/504, never a
- *     truncated 200 that an agent could mistake for success.
+ *     truncated 200 that an agent could mistake for success. That is also what lets the
+ *     response guard inspect it.
  */
 export async function proxyToTarget(
   req: Request,
   res: Response,
   targetUrl: string,
-  config: GatewayConfig
+  config: GatewayConfig,
+  options: ProxyOptions = {}
 ): Promise<void> {
-  const url = targetUrl + req.originalUrl;
+  const url = targetUrl + (options.forwardUrl ?? req.originalUrl);
 
   // Identity headers (the standard ones plus whatever this install configured for
   // SSO) and gateway credentials are removed, so the upstream never sees a value
@@ -92,8 +110,8 @@ export async function proxyToTarget(
     const k = key.toLowerCase();
     if (value === undefined || HOP_BY_HOP.has(k) || strip.has(k)) continue;
     const v = Array.isArray(value) ? value.join(", ") : (value as string);
-    // "Authorization: Bearer agk_..." is the gateway's own credential, not the upstream's.
-    if (k === "authorization" && v.toLowerCase().startsWith(`bearer ${AGENT_KEY_PREFIX}`)) continue;
+    // "Authorization: Bearer agk_... / mws_..." is the gateway's own credential, not the upstream's.
+    if (k === "authorization" && (v.toLowerCase().startsWith(`bearer ${AGENT_KEY_PREFIX}`) || v.toLowerCase().startsWith(`bearer ${WORKSPACE_KEY_PREFIX}`))) continue;
     headers.set(k, v);
   }
 
@@ -128,13 +146,32 @@ export async function proxyToTarget(
 
     // Read (and size-check) the whole body before committing to a status, so an
     // oversized or broken response can still become a clean 502/504.
-    const payload = await readCapped(upstream);
+    let payload = await readCapped(upstream);
+    let guarded: "scrubbed" | null = null;
+    if (options.inspectResponse) {
+      const verdict = await options.inspectResponse(upstream.status, upstream.headers.get("content-type"), payload);
+      if (verdict.action === "block") {
+        if (clientGone()) return;
+        res.setHeader("x-mont-response-guard", "blocked");
+        sendError(res, 502, "Response Policy Violation", verdict.message, { violations: verdict.violations });
+        return;
+      }
+      if (verdict.action === "modified") {
+        payload = verdict.body;
+        guarded = "scrubbed";
+      }
+    }
 
     if (clientGone()) return;
     res.status(upstream.status);
     upstream.headers.forEach((value: string, key: string) => {
-      if (!SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) res.setHeader(key, value);
+      const k = key.toLowerCase();
+      if (SKIP_RESPONSE_HEADERS.has(k)) return;
+      // A changed body invalidates validators computed over the original bytes.
+      if (guarded && (k === "etag" || k === "content-md5" || k === "digest")) return;
+      res.setHeader(key, value);
     });
+    if (guarded) res.setHeader("x-mont-response-guard", guarded);
     const withCookies = upstream.headers as Headers & { getSetCookie?: () => string[] };
     const cookies = withCookies.getSetCookie?.() ?? [];
     if (cookies.length > 0) res.setHeader("set-cookie", cookies);

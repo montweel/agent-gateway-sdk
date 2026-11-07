@@ -13,6 +13,8 @@ import { registerLicenseRoutes } from "./routes/licenseRoutes";
 import { registerMetricsRoutes } from "./routes/metricsRoutes";
 import { registerSetupRoutes } from "./routes/setupRoutes";
 import { registerProtectionRoutes } from "./routes/protectionRoutes";
+import { registerWorkspaceRoutes } from "./routes/workspaceRoutes";
+import { registerAuditRoutes } from "./routes/auditRoutes";
 
 /**
  * Admin API. Mount it BEFORE the gateway so it is never intercepted.
@@ -56,6 +58,8 @@ export function createAdminRouter(ctx: GatewayContext): Router {
   registerMetricsRoutes(router, ctx);
   registerSetupRoutes(router, ctx);
   registerProtectionRoutes(router, ctx);
+  registerWorkspaceRoutes(router, ctx);
+  registerAuditRoutes(router, ctx);
 
   router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     sendCaughtError(res, err);

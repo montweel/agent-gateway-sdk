@@ -24,6 +24,8 @@ export const LOG_TONES: Record<LogStatus, Tone> = {
   RATE_LIMITED: 'violet',
   APPROVED: 'green',
   REJECTED: 'red',
+  RESPONSE_BLOCKED: 'red',
+  RESPONSE_SCRUBBED: 'amber',
 }
 
 export const APPROVAL_TONES: Record<ApprovalStatus, Tone> = {

@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.compilePathPattern = compilePathPattern;
 exports.isPatternKey = isPatternKey;
 exports.lookupInRules = lookupInRules;
+exports.parseRulesObject = parseRulesObject;
 exports.createRulesStore = createRulesStore;
 exports.matcherFor = matcherFor;
 const fileCache_1 = require("./fileCache");
@@ -57,28 +58,34 @@ function lookupInRules(rules, patterns, method, endpoint) {
     }
     return undefined;
 }
+/**
+ * Normalises a parsed rules object (rules.json, or a workspace's rules in SQLite). Invalid keys
+ * are dropped (= default deny); rules whose policies / guards cannot be trusted load as BLOCK.
+ */
+function parseRulesObject(raw) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw))
+        return {};
+    const rules = {};
+    for (const [rawKey, value] of Object.entries(raw)) {
+        const parsed = (0, utils_1.parseRuleKey)(rawKey);
+        if ("error" in parsed)
+            continue;
+        // Only valid gateway paths are accepted. This also rejects "__proto__",
+        // traversal ("..") and whitespace/control characters in hand-edited files.
+        if ((0, utils_1.validateRulePath)(parsed.path) !== null)
+            continue;
+        const rule = (0, utils_1.normalizeRule)(value);
+        if (rule)
+            rules[(0, utils_1.ruleKey)(parsed.method, parsed.path)] = rule;
+    }
+    return rules;
+}
 function createRulesStore(rulesPath) {
     const cache = (0, fileCache_1.createFileCache)(rulesPath, (text) => {
         if (text === null)
             return {};
         try {
-            const raw = JSON.parse(text);
-            if (typeof raw !== "object" || raw === null || Array.isArray(raw))
-                return {};
-            const rules = {};
-            for (const [rawKey, value] of Object.entries(raw)) {
-                const parsed = (0, utils_1.parseRuleKey)(rawKey);
-                if ("error" in parsed)
-                    continue;
-                // Only valid gateway paths are accepted. This also rejects "__proto__",
-                // traversal ("..") and whitespace/control characters in hand-edited files.
-                if ((0, utils_1.validateRulePath)(parsed.path) !== null)
-                    continue;
-                const rule = (0, utils_1.normalizeRule)(value);
-                if (rule)
-                    rules[(0, utils_1.ruleKey)(parsed.method, parsed.path)] = rule;
-            }
-            return rules;
+            return parseRulesObject(JSON.parse(text));
         }
         catch (err) {
             console.error("Could not read rules.json, treating all paths as blocked:", err);

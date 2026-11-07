@@ -8,6 +8,7 @@ import { formatTime, hasRule, INPUT_CLASS, READ_ONLY_HINT, ruleKey, suggestedMod
 import { Badge, ErrorBanner, LOG_TONES, MethodBadge, PageHeader, RefreshButton, Spinner, SuccessBanner } from '../components/ui'
 import { RevokeModal } from '../components/RevokeModal'
 import type { RevokeTarget } from '../components/RevokeModal'
+import { LedgerVerifyBadge } from '../components/LedgerVerifyBadge'
 
 
 export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: boolean }) {
@@ -28,12 +29,13 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
   const [fromFilter, setFromFilter] = useState('')
   const [toFilter, setToFilter] = useState('')
   const [limitFilter, setLimitFilter] = useState('100')
+  const [shadowOnly, setShadowOnly] = useState(false)
 
   // Typing in the search box should not fire one request per keystroke.
   const debouncedSearch = useDebouncedValue(searchFilter.trim(), 300)
 
   const hasActiveFilters = Boolean(
-    statusFilter || methodFilter || searchFilter.trim() || fromFilter || toFilter || limitFilter !== '100'
+    statusFilter || methodFilter || searchFilter.trim() || fromFilter || toFilter || limitFilter !== '100' || shadowOnly
   )
 
   const load = useCallback(async () => {
@@ -53,6 +55,7 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
         if (!Number.isNaN(d.getTime())) params.to = d.toISOString()
       }
       if (limitFilter) params.limit = limitFilter
+      if (shadowOnly) params.shadow = '1'
 
       const res = await api.get<LogRow[]>('/logs', { params })
       if (thisRequest !== requestId.current) return // a newer request superseded this one
@@ -64,7 +67,7 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
     } finally {
       if (thisRequest === requestId.current) setLoading(false)
     }
-  }, [statusFilter, methodFilter, debouncedSearch, fromFilter, toFilter, limitFilter])
+  }, [statusFilter, methodFilter, debouncedSearch, fromFilter, toFilter, limitFilter, shadowOnly])
 
   useEffect(() => {
     void load()
@@ -81,6 +84,7 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
     setFromFilter('')
     setToFilter('')
     setLimitFilter('100')
+    setShadowOnly(false)
   }
 
   async function quickAdd(path: string, method: string) {
@@ -170,6 +174,8 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
       {notice && <SuccessBanner message={notice} onDismiss={() => setNotice(null)} />}
 
+      <LedgerVerifyBadge />
+
       <div className="mb-5 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
         <div className="mb-3 flex items-center justify-between">
           <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-slate-500">
@@ -199,6 +205,8 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
               <option value="RATE_LIMITED">RATE LIMITED</option>
               <option value="APPROVED">APPROVED</option>
               <option value="REJECTED">REJECTED</option>
+              <option value="RESPONSE_BLOCKED">RESPONSE BLOCKED</option>
+              <option value="RESPONSE_SCRUBBED">RESPONSE SCRUBBED</option>
             </select>
           </label>
 
@@ -211,6 +219,7 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
               <option value="PUT">PUT</option>
               <option value="PATCH">PATCH</option>
               <option value="DELETE">DELETE</option>
+              <option value="MCP">MCP (tool calls)</option>
             </select>
           </label>
 
@@ -250,8 +259,14 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
         </div>
 
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-2.5 text-xs text-slate-500">
-          <span>
-            Showing <strong className="font-semibold text-slate-800">{logs.length}</strong> matching log entries
+          <span className="flex flex-wrap items-center gap-3">
+            <span>
+              Showing <strong className="font-semibold text-slate-800">{logs.length}</strong> matching log entries
+            </span>
+            <label className="inline-flex items-center gap-1.5">
+              <input type="checkbox" checked={shadowOnly} onChange={(e) => setShadowOnly(e.target.checked)} className="h-3.5 w-3.5 rounded border-slate-300" />
+              Only shadow-mode hits (would have been blocked / held)
+            </label>
           </span>
           <div className="flex items-center gap-2">
             <label htmlFor="max-rows">Max rows:</label>
@@ -317,6 +332,22 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
                       <td className="whitespace-nowrap px-6 py-3.5">
                         <div className="flex items-center gap-3">
                           <span className="font-mono text-sm text-slate-900">{log.path}</span>
+                          {log.workspace_slug && log.workspace_slug !== 'default' && (
+                            <span className="rounded-md bg-indigo-50 px-1.5 py-0.5 text-xs font-medium text-indigo-700">{log.workspace_slug}</span>
+                          )}
+                          {log.shadow && (
+                            <span
+                              className="rounded-md bg-slate-800 px-1.5 py-0.5 text-xs font-semibold text-white"
+                              title="A SHADOW rule let this through; enforced, it would have done this"
+                            >
+                              shadow: would {log.shadow === 'BLOCK' ? 'block' : 'hold'}
+                            </span>
+                          )}
+                          {log.modified_payload && (
+                            <span className="rounded-md bg-indigo-100 px-1.5 py-0.5 text-xs font-semibold text-indigo-800" title={log.modified_payload}>
+                              edited by approver
+                            </span>
+                          )}
                           {log.agent_key && (
                             <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-600">
                               {log.agent_key}
@@ -337,7 +368,7 @@ export function LogsTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: 
                         </div>
                       </td>
                       <td className="whitespace-nowrap px-6 py-3.5">
-                        <Badge tone={LOG_TONES[log.status] ?? 'slate'}>{log.status.replace('_', ' ')}</Badge>
+                        <Badge tone={LOG_TONES[log.status] ?? 'slate'}>{log.status.replace(/_/g, ' ')}</Badge>
                       </td>
                       <td className="whitespace-nowrap px-6 py-3.5">
                         <MethodBadge method={log.method} />

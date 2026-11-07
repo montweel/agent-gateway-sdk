@@ -8,8 +8,11 @@ import {
   MAX_PENDING_DISPLAY_CHARS,
   PENDING_TTL_MS,
 } from "./constants";
+import { DEFAULT_WORKSPACE_ID, MAX_SNAPSHOT_CHARS } from "./constants";
 import { encryptPayload } from "./crypto";
 import { DbTimeoutError, redactQueryObject, redactQueryString, truncate, withTimeout } from "./utils";
+import type { Workspace } from "./workspaces";
+import { workspaceNotice } from "./notify";
 
 /**
  * Audit logging and the approval queue, shared by the HTTP interceptor and the MCP tool guard.
@@ -38,6 +41,39 @@ export interface AuditEntry {
   detail?: string | null;
   /** Money value of the request (body.amount etc.), for "money protected" totals. */
   amount?: number | null;
+  /** Workspace (client) the request belongs to. Default workspace when omitted. */
+  workspaceId?: number | null;
+  /** What a SHADOW_* rule would have done ("BLOCK" / "APPROVAL"). */
+  shadow?: string | null;
+  /** Redacted request snapshot (see buildSnapshot) for the policy time-machine. */
+  snapshot?: string | null;
+}
+
+export interface SnapshotInput {
+  kind: "http" | "mcp";
+  body: unknown;
+  /** True when the body was not parsed (e.g. rate-limited before parsing). */
+  bodyUnknown?: boolean;
+  query: unknown;
+  headers: Record<string, string | string[] | undefined>;
+  callerId: string;
+}
+
+/**
+ * The redacted copy of a request kept with its audit row, so "Test rules against history" can
+ * replay it later. Same scrubbing as everything else stored; capped at MAX_SNAPSHOT_CHARS (a
+ * larger request keeps its query and headers but is marked truncated).
+ */
+export function buildSnapshot(ctx: GatewayContext, s: SnapshotInput): string {
+  const headers = ctx.redactor.headers(s.headers);
+  const smallHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers).slice(0, 40)) smallHeaders[k] = v.slice(0, 512);
+  const base = { v: 1, kind: s.kind, query: ctx.redactor.json(redactQueryObject(s.query)), headers: smallHeaders, caller: s.callerId };
+  if (s.bodyUnknown) return JSON.stringify({ ...base, bodyUnknown: true });
+  const full = JSON.stringify({ ...base, body: s.body === undefined ? null : ctx.redactor.json(s.body) });
+  if (full.length <= MAX_SNAPSHOT_CHARS) return full;
+  const lean = JSON.stringify({ ...base, truncated: true });
+  return lean.length <= MAX_SNAPSHOT_CHARS ? lean : JSON.stringify({ v: 1, kind: s.kind, caller: s.callerId, truncated: true });
 }
 
 export interface Audit {
@@ -50,8 +86,8 @@ export interface Audit {
 export function createAudit(ctx: GatewayContext): Audit {
   async function logStrict(e: AuditEntry): Promise<void> {
     const write = ctx.db.run(
-      `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, shadow, request_snapshot)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         new Date().toISOString(),
         e.method,
@@ -63,26 +99,56 @@ export function createAudit(ctx: GatewayContext): Audit {
         e.caller?.ip ?? null,
         e.detail ? ctx.redactor.text(e.detail) : null,
         e.amount ?? null,
+        e.workspaceId ?? DEFAULT_WORKSPACE_ID,
+        e.shadow ?? null,
+        e.snapshot ?? null,
       ]
     );
     try {
       await withTimeout(write, ctx.dbTimeoutMs, "audit log write");
+      ctx.ledger.kick();
     } catch (err) {
       // The request is about to be refused. If the timed-out row still lands later, it must
       // not claim the request was ALLOWED/QUEUED.
       if (err instanceof DbTimeoutError && (e.status === "ALLOWED" || e.status === "QUEUED")) {
         write.then(
-          (r) =>
-            ctx.db
-              .run("UPDATE agent_logs SET status = 'BLOCKED', detail = ? WHERE id = ?", [
-                "Refused (fail-closed): the audit write timed out, so the request was not forwarded.",
-                r.lastID,
-              ])
-              .catch(() => undefined),
+          (r) => void correctLateRow(r.lastID, e),
           () => undefined
         );
       }
       throw err;
+    }
+  }
+
+  /**
+   * A timed-out ALLOWED/QUEUED row that landed late is corrected in place while it is still
+   * unsealed; once the ledger has sealed it (rows are append-only from then on), a correcting
+   * BLOCKED row is appended instead.
+   */
+  async function correctLateRow(id: number, e: AuditEntry): Promise<void> {
+    const note = "Refused (fail-closed): the audit write timed out, so the request was not forwarded.";
+    try {
+      const r = await ctx.db.run("UPDATE agent_logs SET status = 'BLOCKED', detail = ? WHERE id = ? AND row_hash IS NULL", [note, id]);
+      if (r.changes === 0) {
+        await ctx.db.run(
+          `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id)
+           VALUES (?, ?, ?, 'BLOCKED', ?, ?, ?, ?, ?, NULL, ?)`,
+          [
+            new Date().toISOString(),
+            e.method,
+            truncate(ctx.redactor.text(e.path), MAX_LOG_PATH_LENGTH),
+            truncate(ctx.redactor.text(e.userAgent), MAX_LOG_UA_LENGTH),
+            e.caller?.agentKeyName ?? null,
+            e.actionId ?? null,
+            e.caller?.ip ?? null,
+            `Correction for log #${id}: ${note}`,
+            e.workspaceId ?? DEFAULT_WORKSPACE_ID,
+          ]
+        );
+      }
+      ctx.ledger.kick();
+    } catch {
+      // best effort
     }
   }
 
@@ -113,6 +179,9 @@ export interface QueueRequest {
   /** PolicyDecision.matched */
   matched: string;
   amount?: number | null;
+  workspace: Workspace;
+  /** Redacted snapshot for the QUEUED audit row (policy time-machine). */
+  snapshot?: string | null;
 }
 
 export type QueueResult =
@@ -123,18 +192,19 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
   const timed = <T>(p: Promise<T>, label: string): Promise<T> => withTimeout(p, ctx.dbTimeoutMs, label);
   const r = ctx.redactor;
 
+  const wsId = q.workspace.id;
   const pending = await timed(
     ctx.db.get<{ count: number }>("SELECT COUNT(*) as count FROM pending_actions WHERE status = 'PENDING'"),
     "approval queue count"
   );
   if ((pending?.count ?? 0) >= MAX_PENDING_ACTIONS) {
-    await audit.logRefusal({ method: q.method, path: q.cleanPath, status: "BLOCKED", caller: q.caller, userAgent: q.caller.userAgent, detail: "approval queue full" });
+    await audit.logRefusal({ method: q.method, path: q.cleanPath, status: "BLOCKED", caller: q.caller, userAgent: q.caller.userAgent, detail: "approval queue full", workspaceId: wsId });
     return { ok: false, status: 503, error: "Service Unavailable", message: "The approval queue is full. Try again later.", retryAfter: 60 };
   }
 
   // Queued requests are stored until decided, so cap their size.
   if (q.originalBody !== null && Buffer.byteLength(q.originalBody) > MAX_PENDING_BODY_BYTES) {
-    await audit.logRefusal({ method: q.method, path: q.cleanPath, status: "BLOCKED", caller: q.caller, userAgent: q.caller.userAgent, detail: "approval body too large" });
+    await audit.logRefusal({ method: q.method, path: q.cleanPath, status: "BLOCKED", caller: q.caller, userAgent: q.caller.userAgent, detail: "approval body too large", workspaceId: wsId });
     return {
       ok: false,
       status: 413,
@@ -147,7 +217,7 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
   const redactedBody = r.jsonText(q.originalBody);
   const displayBody =
     redactedBody !== null && redactedBody.length > MAX_PENDING_DISPLAY_CHARS
-      ? `${redactedBody.slice(0, MAX_PENDING_DISPLAY_CHARS)}â€¦ [truncated]`
+      ? `${redactedBody.slice(0, MAX_PENDING_DISPLAY_CHARS)}… [truncated]`
       : redactedBody;
   const query = r.json(redactQueryObject(q.query)) as Record<string, unknown>;
   const agentReason = q.agentReason ? r.text(q.agentReason) : null;
@@ -159,8 +229,8 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
   const insert = ctx.db.run(
     `INSERT INTO pending_actions
        (timestamp, method, path, headers, body, status, expires_at, agent_key, encrypted_payload,
-        query_json, caller_ip, caller_ua, agent_key_id, agent_key_prefix, agent_reason, matched_policy, kind, owner)
-     VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        query_json, caller_ip, caller_ua, agent_key_id, agent_key_prefix, agent_reason, matched_policy, kind, owner, workspace_id)
+     VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       queuedAt,
       q.method,
@@ -179,6 +249,7 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
       q.matched,
       q.kind,
       q.kind === "mcp" ? ctx.instanceId : null,
+      wsId,
     ]
   );
 
@@ -211,6 +282,8 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
       actionId: inserted.lastID,
       detail: q.kind === "mcp" ? `mcp ${q.matched}` : q.matched,
       amount: q.amount ?? null,
+      workspaceId: wsId,
+      snapshot: q.snapshot ?? null,
     });
   } catch (err) {
     discard(inserted.lastID);
@@ -232,6 +305,7 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
     agentKeyPrefix: q.caller.agentKeyPrefix,
     agentReason,
     matchedPolicy: q.matched,
+    workspace: workspaceNotice(q.workspace),
   });
 
   return { ok: true, id: inserted.lastID, queuedAt, expiresAt };

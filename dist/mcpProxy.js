@@ -7,7 +7,11 @@ exports.DEFAULT_APPROVAL_WAIT_MS = void 0;
 exports.isToolsCall = isToolsCall;
 exports.toolRefusal = toolRefusal;
 exports.rpcError = rpcError;
+exports.withArguments = withArguments;
 exports.gateToolCall = gateToolCall;
+exports.guardToolReply = guardToolReply;
+exports.parseSse = parseSse;
+exports.formatSse = formatSse;
 exports.createMcpHttpProxy = createMcpHttpProxy;
 exports.startMcpStdioProxy = startMcpStdioProxy;
 /**
@@ -18,7 +22,9 @@ exports.startMcpStdioProxy = startMcpStdioProxy;
  *
  *   rule key   "MCP /api/mcp/tools/<params.name>"     e.g. "MCP /api/mcp/tools/refund_order"
  *   payload    params.arguments  -> "body.*" fields   e.g. { "field": "body.amount", "op": ">", "value": 100 }
- *   plus       rate limits, kill-switch, SQLite audit log, approval queue + phone approvals
+ *   plus       rate limits, kill-switch, SQLite audit log, approval queue + phone approvals,
+ *              workspaces (x-mont-workspace, /w/<slug>/ mount, mws_ key), Edit & Approve,
+ *              and the outbound response guard on tool results
  *
  * Unlisted tools are blocked (default deny). Everything else (initialize, tools/list, resources,
  * prompts, notifications, server->client messages) passes through untouched.
@@ -28,10 +34,13 @@ exports.startMcpStdioProxy = startMcpStdioProxy;
  * approval is held open until someone decides (or approvalWaitMs passes, then it expires and can
  * never run later).
  *
- * Transports:
+ * Transports (client side):
  *   createMcpHttpProxy(gateway, { upstreamUrl })   Streamable HTTP (POST JSON / SSE responses, GET SSE, DELETE)
+ *                                                  + legacy HTTP+SSE (GET /sse + POST /messages?sessionId=...)
  *   startMcpStdioProxy(gateway, { command, args }) newline-delimited JSON-RPC over stdio (spawns the server)
+ * The upstream server is always spoken to over Streamable HTTP (HTTP proxy) or stdio (stdio proxy).
  */
+const crypto_1 = __importDefault(require("crypto"));
 const express_1 = __importDefault(require("express"));
 const child_process_1 = require("child_process");
 const readline_1 = __importDefault(require("readline"));
@@ -41,6 +50,8 @@ const proxy_1 = require("./core/proxy");
 const interceptor_1 = require("./core/interceptor");
 exports.DEFAULT_APPROVAL_WAIT_MS = 5 * 60000;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 120000;
+const SSE_KEEPALIVE_MS = 15000;
+const MAX_LEGACY_SESSIONS = 1000;
 const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 function isToolsCall(m) {
     return isObject(m) && m.method === "tools/call";
@@ -60,9 +71,17 @@ function toolRefusal(id, text, decision, extra = {}) {
 function rpcError(id, code, message) {
     return { jsonrpc: "2.0", id, error: { code, message } };
 }
+/** The same tools/call with the approver's edited arguments. */
+function withArguments(msg, override) {
+    if (!override)
+        return msg;
+    const params = isObject(msg.params) ? msg.params : {};
+    return { ...msg, params: { ...params, arguments: override.arguments } };
+}
 /**
  * Decides one tools/call. "forward" = send it on now; "respond" = answer with this message;
- * "executed" = it was held, approved and already sent upstream by `executeLater`.
+ * "executed" = it was held, approved and already sent upstream by `executeLater` (with the
+ * approver's edited arguments when they changed them).
  */
 async function gateToolCall(guard, msg, caller, opts, executeLater) {
     const id = msg.id ?? null;
@@ -77,10 +96,11 @@ async function gateToolCall(guard, msg, caller, opts, executeLater) {
         arguments: params.arguments,
         caller: { ip: caller.ip, userAgent: caller.userAgent, agentKey: caller.agentKey },
         agentReason: reason,
+        workspace: caller.workspace ?? null,
     });
     switch (verdict.decision) {
         case "ALLOW":
-            return { kind: "forward" };
+            return { kind: "forward", workspaceId: verdict.workspaceId };
         case "BLOCK":
             return { kind: "respond", message: toolRefusal(id, `Blocked by the Mont gateway: ${verdict.reason}`, "BLOCK") };
         case "RATE_LIMITED":
@@ -91,12 +111,12 @@ async function gateToolCall(guard, msg, caller, opts, executeLater) {
                 }),
             };
         case "PENDING": {
-            const waited = await guard.awaitDecision(verdict.actionId, { timeoutMs: opts.approvalWaitMs, signal: opts.signal }, executeLater);
+            const waited = await guard.awaitDecision(verdict.actionId, { timeoutMs: opts.approvalWaitMs, signal: opts.signal }, (override) => executeLater(override, verdict.workspaceId));
             if (waited.status === "APPROVED")
-                return { kind: "executed", value: waited.value };
+                return { kind: "executed", value: waited.value, workspaceId: verdict.workspaceId };
             if (waited.status === "FAILED") {
                 if (waited.value !== undefined)
-                    return { kind: "executed", value: waited.value };
+                    return { kind: "executed", value: waited.value, workspaceId: verdict.workspaceId };
                 return { kind: "respond", message: toolRefusal(id, `Approved, but the tool call failed: ${waited.error}`, "FAILED", { "mont/approvalId": verdict.actionId }) };
             }
             return {
@@ -108,6 +128,81 @@ async function gateToolCall(guard, msg, caller, opts, executeLater) {
         }
     }
 }
+/** Applies the outbound response guard to the reply for one tools/call (null = not that call's reply). */
+function guardToolReply(guard, m, callId, info) {
+    if (!isObject(m) || m.method !== undefined || m.id !== callId || m.result === undefined)
+        return m;
+    const v = guard.inspectResult(info, m.result);
+    if (v.action === "block")
+        return toolRefusal(callId, v.message ?? "Response Policy Violation.", "RESPONSE_BLOCKED");
+    if (v.action === "modified")
+        return { ...m, result: v.result };
+    return m;
+}
+/** Parses a complete text/event-stream body into events (comments and retry lines dropped). */
+function parseSse(text) {
+    const events = [];
+    for (const block of text.replace(/\r\n/g, "\n").split(/\n\n+/)) {
+        let event = null;
+        let id = null;
+        const data = [];
+        for (const line of block.split("\n")) {
+            if (line === "" || line.startsWith(":"))
+                continue;
+            const colon = line.indexOf(":");
+            const field = colon === -1 ? line : line.slice(0, colon);
+            const value = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /, "");
+            if (field === "event")
+                event = value;
+            else if (field === "id")
+                id = value;
+            else if (field === "data")
+                data.push(value);
+        }
+        if (data.length > 0)
+            events.push({ event, id, data: data.join("\n") });
+    }
+    return events;
+}
+function formatSse(e) {
+    return `${e.event ? `event: ${e.event}\n` : ""}${e.id ? `id: ${e.id}\n` : ""}${e.data
+        .split("\n")
+        .map((l) => `data: ${l}`)
+        .join("\n")}\n\n`;
+}
+/** JSON-RPC messages carried by an upstream reply (JSON object / batch, or SSE). */
+function messagesOf(contentType, payload) {
+    const text = payload.toString("utf8");
+    if (/text\/event-stream/i.test(contentType)) {
+        const out = [];
+        for (const e of parseSse(text)) {
+            try {
+                const parsed = JSON.parse(e.data);
+                if (Array.isArray(parsed))
+                    out.push(...parsed);
+                else if (isObject(parsed))
+                    out.push(parsed);
+            }
+            catch {
+                // not JSON: ignore
+            }
+        }
+        return out;
+    }
+    if (text.trim() === "")
+        return [];
+    try {
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed))
+            return parsed;
+        if (isObject(parsed))
+            return [parsed];
+    }
+    catch {
+        // fall through
+    }
+    return [];
+}
 const SKIP_RESPONSE_HEADERS = new Set([...constants_1.HOP_BY_HOP, "content-length", "content-encoding"]);
 function upstreamHeaders(req) {
     const headers = new Headers();
@@ -116,7 +211,8 @@ function upstreamHeaders(req) {
         if (value === undefined || constants_1.HOP_BY_HOP.has(k) || constants_1.NEVER_FORWARD.has(k) || k === constants_1.AGENT_REASON_HEADER)
             continue;
         const v = Array.isArray(value) ? value.join(", ") : value;
-        if (k === "authorization" && v.toLowerCase().startsWith(`bearer ${constants_1.AGENT_KEY_PREFIX}`))
+        const lower = v.toLowerCase();
+        if (k === "authorization" && (lower.startsWith(`bearer ${constants_1.AGENT_KEY_PREFIX}`) || lower.startsWith(`bearer ${constants_1.WORKSPACE_KEY_PREFIX}`)))
             continue;
         headers.set(k, v);
     }
@@ -129,10 +225,19 @@ function agentKeyOf(req) {
     const auth = req.get("authorization")?.trim();
     if (auth && auth.toLowerCase().startsWith("bearer ")) {
         const bearer = auth.slice(7).trim();
-        if (bearer.startsWith(constants_1.AGENT_KEY_PREFIX))
+        if (bearer.startsWith(constants_1.AGENT_KEY_PREFIX) || bearer.startsWith(constants_1.WORKSPACE_KEY_PREFIX))
             return bearer;
     }
     return null;
+}
+/** Workspace selector for an HTTP request: the /w/:slug mount, then the header, then the router option. */
+function workspaceOf(req, fallback) {
+    const fromPath = typeof req.params?.slug === "string" ? req.params.slug : null;
+    const fromHeader = req.get(constants_1.WORKSPACE_HEADER)?.trim() || null;
+    // Conflicting selectors: a name no workspace can have, so the guard refuses the call.
+    if (fromPath && fromHeader && fromPath.toLowerCase() !== fromHeader.toLowerCase())
+        return "(conflicting workspace selectors)";
+    return fromPath ?? fromHeader ?? fallback ?? null;
 }
 function sendReply(res, r) {
     if (res.headersSent)
@@ -148,21 +253,60 @@ function sendRpc(res, message, status = 200) {
         return;
     res.status(status).json(message);
 }
+function headerOf(r, name) {
+    return r.headers.find(([k]) => k.toLowerCase() === name)?.[1] ?? "";
+}
+/** Rewrites an upstream reply so the result of `callId` passes the response guard. */
+function guardReply(guard, r, callId, info) {
+    const ct = headerOf(r, "content-type");
+    const text = r.payload.toString("utf8");
+    const rewrite = (m) => (isObject(m) ? guardToolReply(guard, m, callId, info) : m);
+    if (/text\/event-stream/i.test(ct)) {
+        let changed = false;
+        const events = parseSse(text).map((e) => {
+            try {
+                const parsed = JSON.parse(e.data);
+                const next = Array.isArray(parsed) ? parsed.map(rewrite) : rewrite(parsed);
+                const data = JSON.stringify(next);
+                if (data !== JSON.stringify(parsed))
+                    changed = true;
+                return { ...e, data };
+            }
+            catch {
+                return e;
+            }
+        });
+        return changed ? { ...r, payload: Buffer.from(events.map(formatSse).join(""), "utf8") } : r;
+    }
+    if (!/json/i.test(ct))
+        return r;
+    try {
+        const parsed = JSON.parse(text);
+        const next = Array.isArray(parsed) ? parsed.map(rewrite) : rewrite(parsed);
+        const out = JSON.stringify(next);
+        return out === JSON.stringify(parsed) ? r : { ...r, payload: Buffer.from(out, "utf8") };
+    }
+    catch {
+        return r;
+    }
+}
 function createMcpHttpProxy(gateway, opts) {
-    const router = express_1.default.Router();
+    const router = express_1.default.Router({ mergeParams: true });
     const upstream = new URL(opts.upstreamUrl).toString();
     const waitMs = opts.approvalWaitMs ?? exports.DEFAULT_APPROVAL_WAIT_MS;
     const timeoutMs = opts.upstreamTimeoutMs ?? DEFAULT_UPSTREAM_TIMEOUT_MS;
     const parse = express_1.default.json({ limit: "1mb", type: ["application/json", "application/*+json"] });
-    async function post(req, body) {
-        const headers = upstreamHeaders(req);
+    const sessions = new Map();
+    async function post(headers, body, signal) {
         headers.set("content-type", "application/json");
+        if (!headers.has("accept"))
+            headers.set("accept", "application/json, text/event-stream");
         const up = await fetch(upstream, {
             method: "POST",
             headers,
             body: JSON.stringify(body),
             redirect: "manual",
-            signal: AbortSignal.timeout(timeoutMs),
+            signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
         });
         const payload = await (0, proxy_1.readCapped)(up);
         const outHeaders = [];
@@ -173,6 +317,33 @@ function createMcpHttpProxy(gateway, opts) {
         console.error("[mcp-proxy] upstream error:", err);
         sendRpc(res, rpcError(id, -32603, (0, proxy_1.isTimeoutError)(err) ? "The MCP server did not respond in time." : "Could not reach the MCP server."), 502);
     };
+    /**
+     * Gates one tools/call and returns the upstream reply to send back (guarded), or a JSON-RPC
+     * message when the gateway answers itself.
+     */
+    async function handleToolCall(msg, caller, makeHeaders, signal) {
+        const toolName = isObject(msg.params) && typeof msg.params.name === "string" ? msg.params.name : "";
+        const callId = msg.id ?? null;
+        const outcome = await gateToolCall(gateway.mcp, msg, caller, { approvalWaitMs: waitMs, signal }, async (override) => {
+            try {
+                const reply = await post(makeHeaders(), withArguments(msg, override));
+                return { ok: reply.status < 400, preview: `${reply.status} ${reply.payload.toString("utf8").slice(0, 400)}`, value: reply };
+            }
+            catch (err) {
+                const message = (0, proxy_1.isTimeoutError)(err) ? "the MCP server did not respond in time" : "the MCP server could not be reached";
+                return {
+                    ok: false,
+                    preview: message,
+                    value: { status: 200, headers: [["content-type", "application/json"]], payload: Buffer.from(JSON.stringify(toolRefusal(callId, `Approved, but ${message}.`, "FAILED"))) },
+                };
+            }
+        });
+        if (outcome.kind === "respond")
+            return { message: outcome.message };
+        const info = { toolName, workspaceId: outcome.workspaceId, callerIp: caller.ip, userAgent: caller.userAgent };
+        const reply = outcome.kind === "executed" ? outcome.value : await post(makeHeaders(), msg);
+        return { reply: guardReply(gateway.mcp, reply, callId, info) };
+    }
     router.post("/", (req, res) => {
         parse(req, res, (parseErr) => {
             void (async () => {
@@ -192,7 +363,7 @@ function createMcpHttpProxy(gateway, opts) {
                         return;
                     }
                     try {
-                        sendReply(res, await post(req, body));
+                        sendReply(res, await post(upstreamHeaders(req), body));
                     }
                     catch (err) {
                         upstreamFailure(res, null, err);
@@ -201,7 +372,7 @@ function createMcpHttpProxy(gateway, opts) {
                 }
                 if (!isToolsCall(body)) {
                     try {
-                        sendReply(res, await post(req, body));
+                        sendReply(res, await post(upstreamHeaders(req), body));
                     }
                     catch (err) {
                         upstreamFailure(res, isObject(body) ? (body.id ?? null) : null, err);
@@ -224,31 +395,14 @@ function createMcpHttpProxy(gateway, opts) {
                     userAgent: req.get("user-agent") ?? "mcp-client",
                     agentKey: agentKeyOf(req),
                     reason: (0, interceptor_1.cleanAgentReason)(req.get(constants_1.AGENT_REASON_HEADER)),
+                    workspace: workspaceOf(req, opts.workspace),
                 };
-                const outcome = await gateToolCall(gateway.mcp, msg, caller, { approvalWaitMs: waitMs, signal: clientGone.signal }, async () => {
-                    try {
-                        const reply = await post(req, msg);
-                        return { ok: reply.status < 400, preview: `${reply.status} ${reply.payload.toString("utf8").slice(0, 400)}`, value: reply };
-                    }
-                    catch (err) {
-                        const message = (0, proxy_1.isTimeoutError)(err) ? "the MCP server did not respond in time" : "the MCP server could not be reached";
-                        return {
-                            ok: false,
-                            preview: message,
-                            value: { status: 200, headers: [["content-type", "application/json"]], payload: Buffer.from(JSON.stringify(toolRefusal(msg.id ?? null, `Approved, but ${message}.`, "FAILED"))) },
-                        };
-                    }
-                });
-                if (outcome.kind === "respond") {
-                    sendRpc(res, outcome.message);
-                    return;
-                }
-                if (outcome.kind === "executed") {
-                    sendReply(res, outcome.value);
-                    return;
-                }
                 try {
-                    sendReply(res, await post(req, msg));
+                    const out = await handleToolCall(msg, caller, () => upstreamHeaders(req), clientGone.signal);
+                    if ("message" in out)
+                        sendRpc(res, out.message);
+                    else
+                        sendReply(res, out.reply);
                 }
                 catch (err) {
                     upstreamFailure(res, msg.id ?? null, err);
@@ -257,6 +411,174 @@ function createMcpHttpProxy(gateway, opts) {
                 console.error("[mcp-proxy] FAIL-CLOSED:", err);
                 sendRpc(res, rpcError(null, -32603, "The gateway hit an error; the request was not forwarded."), 503);
             });
+        });
+    });
+    // ---------------- Legacy HTTP+SSE transport (protocol 2024-11-05) ----------------
+    // GET /sse opens the server->client stream; its first event names the POST endpoint.
+    // The client POSTs JSON-RPC to /messages?sessionId=...; every answer travels on the stream.
+    // Upstream, Mont speaks Streamable HTTP, so old clients reach new servers through it unchanged.
+    function writeEvent(s, event, data) {
+        if (s.closed.signal.aborted || s.res.writableEnded)
+            return;
+        s.res.write(formatSse({ event, id: null, data }));
+    }
+    function closeSession(s) {
+        if (s.closed.signal.aborted)
+            return;
+        s.closed.abort();
+        clearInterval(s.keepalive);
+        sessions.delete(s.id);
+        if (!s.res.writableEnded)
+            s.res.end();
+        // Best effort: end the upstream session too.
+        if (s.upstreamSessionId) {
+            void fetch(upstream, { method: "DELETE", headers: { "mcp-session-id": s.upstreamSessionId }, signal: AbortSignal.timeout(5000) })
+                .then((r) => r.body?.cancel())
+                .catch(() => undefined);
+        }
+    }
+    /** Server-initiated messages: the upstream's GET stream, relayed onto the legacy SSE stream. */
+    function startUpstreamStream(s, headers) {
+        if (s.streamStarted || !s.upstreamSessionId)
+            return;
+        s.streamStarted = true;
+        headers.set("accept", "text/event-stream");
+        headers.set("mcp-session-id", s.upstreamSessionId);
+        void (async () => {
+            try {
+                const up = await fetch(upstream, { method: "GET", headers, redirect: "manual", signal: s.closed.signal });
+                if (!up.ok || !up.body || !/text\/event-stream/i.test(up.headers.get("content-type") ?? "")) {
+                    await up.body?.cancel().catch(() => undefined);
+                    return; // the server has no standalone stream (405 is allowed by the spec)
+                }
+                const decoder = new TextDecoder();
+                let buffer = "";
+                for await (const chunk of up.body) {
+                    buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
+                    let cut;
+                    while ((cut = buffer.indexOf("\n\n")) !== -1) {
+                        const block = buffer.slice(0, cut + 2);
+                        buffer = buffer.slice(cut + 2);
+                        for (const e of parseSse(block))
+                            writeEvent(s, "message", e.data);
+                    }
+                }
+            }
+            catch {
+                // stream ended or session closed
+            }
+        })();
+    }
+    router.get("/sse", (req, res) => {
+        if (sessions.size >= MAX_LEGACY_SESSIONS) {
+            res.status(503).json({ error: "Service Unavailable", message: "Too many open MCP SSE sessions." });
+            return;
+        }
+        const id = crypto_1.default.randomUUID();
+        res.status(200);
+        res.setHeader("content-type", "text/event-stream");
+        res.setHeader("cache-control", "no-cache, no-transform");
+        res.setHeader("connection", "keep-alive");
+        res.setHeader("x-accel-buffering", "no");
+        res.flushHeaders();
+        const session = {
+            id,
+            res,
+            closed: new AbortController(),
+            upstreamSessionId: null,
+            agentKey: agentKeyOf(req),
+            workspace: workspaceOf(req, opts.workspace),
+            ip: req.ip ?? req.socket.remoteAddress ?? "unknown",
+            userAgent: req.get("user-agent") ?? "mcp-sse-client",
+            streamStarted: false,
+            keepalive: setInterval(() => {
+                if (!res.writableEnded)
+                    res.write(": keepalive\n\n");
+            }, SSE_KEEPALIVE_MS),
+        };
+        session.keepalive.unref();
+        sessions.set(id, session);
+        res.on("close", () => closeSession(session));
+        writeEvent(session, "endpoint", `${req.baseUrl}/messages?sessionId=${encodeURIComponent(id)}`);
+    });
+    router.post("/messages", (req, res) => {
+        const sessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : "";
+        const s = sessions.get(sessionId);
+        if (!s) {
+            res.status(404).json({ error: "Not Found", message: "Unknown or closed MCP session. Reconnect to GET /sse." });
+            return;
+        }
+        parse(req, res, (parseErr) => {
+            if (parseErr || (!req.is("application/json") && !req.is("application/*+json"))) {
+                res.status(400).json({ error: "Bad Request", message: "The body must be one JSON-RPC message (application/json)." });
+                return;
+            }
+            const body = req.body;
+            if (Array.isArray(body) ? body.some(isToolsCall) : false) {
+                res.status(400).json({ error: "Bad Request", message: "The Mont gateway does not accept tools/call inside a JSON-RPC batch." });
+                return;
+            }
+            if (!Array.isArray(body) && !isObject(body)) {
+                res.status(400).json({ error: "Bad Request", message: "Invalid JSON-RPC message." });
+                return;
+            }
+            // Accepted: the answer (if any) arrives on the event stream.
+            res.status(202).send("Accepted");
+            const msg = body;
+            const postWorkspace = workspaceOf(req, undefined);
+            const caller = {
+                ip: s.ip,
+                userAgent: req.get("user-agent") ?? s.userAgent,
+                agentKey: agentKeyOf(req) ?? s.agentKey,
+                reason: (0, interceptor_1.cleanAgentReason)(req.get(constants_1.AGENT_REASON_HEADER)),
+                workspace: postWorkspace ?? s.workspace,
+            };
+            const makeHeaders = () => {
+                const h = upstreamHeaders(req);
+                h.delete("mcp-session-id");
+                if (s.upstreamSessionId)
+                    h.set("mcp-session-id", s.upstreamSessionId);
+                return h;
+            };
+            const deliver = (reply, requestId) => {
+                const sid = headerOf(reply, "mcp-session-id");
+                if (sid && !s.upstreamSessionId)
+                    s.upstreamSessionId = sid;
+                const messages = messagesOf(headerOf(reply, "content-type"), reply.payload);
+                if (messages.length === 0 && reply.status >= 400 && requestId !== undefined) {
+                    writeEvent(s, "message", JSON.stringify(rpcError(requestId, -32603, `The MCP server answered HTTP ${reply.status}.`)));
+                    return;
+                }
+                for (const m of messages)
+                    writeEvent(s, "message", JSON.stringify(m));
+            };
+            void (async () => {
+                try {
+                    if (!Array.isArray(body) && isToolsCall(msg)) {
+                        if (msg.id === undefined)
+                            return; // a tool call as a notification can never be answered
+                        const out = await handleToolCall(msg, caller, makeHeaders, s.closed.signal);
+                        if ("message" in out)
+                            writeEvent(s, "message", JSON.stringify(out.message));
+                        else
+                            deliver(out.reply, msg.id);
+                        return;
+                    }
+                    const reply = await post(makeHeaders(), body, s.closed.signal);
+                    deliver(reply, Array.isArray(body) ? undefined : msg.id);
+                    // After initialization, relay server-initiated notifications too.
+                    if (!Array.isArray(body) && msg.method === "notifications/initialized")
+                        startUpstreamStream(s, makeHeaders());
+                }
+                catch (err) {
+                    if (s.closed.signal.aborted)
+                        return;
+                    console.error("[mcp-proxy] legacy SSE upstream error:", err);
+                    if (!Array.isArray(body) && msg.id !== undefined) {
+                        writeEvent(s, "message", JSON.stringify(rpcError(msg.id ?? null, -32603, (0, proxy_1.isTimeoutError)(err) ? "The MCP server did not respond in time." : "Could not reach the MCP server.")));
+                    }
+                }
+            })();
         });
     });
     // Server -> client stream (GET) and session termination (DELETE): straight passthrough.
@@ -313,30 +635,48 @@ function startMcpStdioProxy(gateway, opts) {
     };
     // Responses we are waiting for (approved calls), keyed by JSON-encoded id.
     const awaiting = new Map();
-    // Server -> client: pass every line through unchanged; note responses to approved calls.
+    // Allowed / approved tool calls whose results must pass the response guard, keyed by JSON-encoded id.
+    const guarded = new Map();
+    // Server -> client: pass every line through; tool results go through the response guard first.
     readline_1.default.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => {
-        output.write(`${line}\n`);
+        let m = null;
         try {
-            const m = JSON.parse(line);
-            if (isObject(m) && m.method === undefined && m.id !== undefined) {
-                const key = JSON.stringify(m.id);
-                const resolve = awaiting.get(key);
-                if (resolve) {
-                    awaiting.delete(key);
-                    resolve(m);
-                }
-            }
+            const parsed = JSON.parse(line);
+            m = isObject(parsed) ? parsed : null;
         }
         catch {
-            // not JSON: already passed through
+            m = null;
         }
+        if (m && m.method === undefined && m.id !== undefined) {
+            const key = JSON.stringify(m.id);
+            const g = guarded.get(key);
+            if (g) {
+                guarded.delete(key);
+                const out = guardToolReply(gateway.mcp, m, m.id ?? null, { toolName: g.toolName, workspaceId: g.workspaceId, callerIp: "stdio", userAgent: clientName });
+                if (out !== m) {
+                    output.write(`${JSON.stringify(out)}\n`);
+                    awaiting.get(key)?.(out);
+                    awaiting.delete(key);
+                    return;
+                }
+            }
+            output.write(`${line}\n`);
+            const resolve = awaiting.get(key);
+            if (resolve) {
+                awaiting.delete(key);
+                resolve(m);
+            }
+            return;
+        }
+        output.write(`${line}\n`); // not a response (or not JSON): passed through unchanged
     });
     async function handleToolCall(msg) {
-        const caller = { ip: "stdio", userAgent: clientName, agentKey: opts.agentKey ?? null, reason: null };
-        const outcome = await gateToolCall(gateway.mcp, msg, caller, { approvalWaitMs: waitMs, signal: shutdown.signal }, () => {
-            // Approved: send the ORIGINAL call to the server; its response flows back through the passthrough.
+        const caller = { ip: "stdio", userAgent: clientName, agentKey: opts.agentKey ?? null, reason: null, workspace: opts.workspace ?? null };
+        const toolName = isObject(msg.params) && typeof msg.params.name === "string" ? msg.params.name : "";
+        const key = JSON.stringify(msg.id);
+        const outcome = await gateToolCall(gateway.mcp, msg, caller, { approvalWaitMs: waitMs, signal: shutdown.signal }, (override, workspaceId) => {
+            // Approved: send the call (with the approver's edits) to the server; its response flows back through the passthrough.
             return new Promise((resolve) => {
-                const key = JSON.stringify(msg.id);
                 const timer = setTimeout(() => {
                     awaiting.delete(key);
                     resolve({ ok: false, preview: "The MCP server did not answer within 120 s.", value: null });
@@ -347,14 +687,17 @@ function startMcpStdioProxy(gateway, opts) {
                     const failed = m.error !== undefined || (isObject(m.result) && m.result.isError === true);
                     resolve({ ok: !failed, preview: JSON.stringify(m.result ?? m.error).slice(0, 400), value: null });
                 });
-                toServer(msg);
+                guarded.set(key, { toolName, workspaceId });
+                toServer(withArguments(msg, override));
             });
         });
-        if (outcome.kind === "forward")
+        if (outcome.kind === "forward") {
+            guarded.set(key, { toolName, workspaceId: outcome.workspaceId });
             toServer(msg);
+        }
         else if (outcome.kind === "respond")
             toClient(outcome.message);
-        // "executed": the server's own response has already been passed through.
+        // "executed": the server's own (guarded) response has already been passed through.
     }
     // Tool calls still being evaluated / executed. On client EOF they are drained before the
     // server's stdin is closed, so an allowed call is never dropped on the floor.

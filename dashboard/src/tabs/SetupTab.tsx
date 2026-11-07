@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { BellRing, Clock, EyeOff, Package, Plus, Send, Server, ShieldOff, SlidersHorizontal, Trash2, Undo2, Wand2 } from 'lucide-react'
+import { Award, BellRing, Building2, Clock, EyeOff, Package, Plus, ScanSearch, Send, Server, ShieldOff, SlidersHorizontal, Trash2, Undo2, Wand2 } from 'lucide-react'
+import type { LicenseApi } from '../hooks/useLicense'
+import { LicenseCard } from '../components/LicenseCard'
+import { WorkspacesPanel } from '../components/WorkspacesPanel'
+import type { WorkspacesApi } from '../components/WorkspaceSwitcher'
 import { api, errorMessage } from '../lib/api'
 import type { RulesApi } from '../hooks/useRules'
 import type {
@@ -213,7 +217,17 @@ const SECONDARY_BTN =
 // =====================================================================
 // The tab
 // =====================================================================
-export function SetupTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly: boolean }) {
+export function SetupTab({
+  rulesApi,
+  readOnly,
+  licenseApi,
+  workspacesApi,
+}: {
+  rulesApi: RulesApi
+  readOnly: boolean
+  licenseApi: LicenseApi
+  workspacesApi: WorkspacesApi
+}) {
   const { rules, setRules, reload: reloadRules } = rulesApi
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -244,6 +258,7 @@ export function SetupTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly:
   const [savingHours, setSavingHours] = useState(false)
   const [sendingDigest, setSendingDigest] = useState(false)
   const [withinHours, setWithinHours] = useState<boolean | undefined>(undefined)
+  const [savingGuard, setSavingGuard] = useState(false)
 
   const apply = useCallback((data: SetupResponse) => {
     setTargetUrl(data.gateway.targetUrl)
@@ -348,6 +363,16 @@ export function SetupTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly:
     )
   }
 
+  function saveResponseGuard() {
+    if (!settings) return
+    const n = settings.responseGuard.maxArrayItems
+    if (!Number.isInteger(n) || n < 1 || n > 1_000_000) {
+      setError('The array limit must be a whole number from 1 to 1,000,000.')
+      return
+    }
+    void saveSetup({ responseGuard: settings.responseGuard }, 'Response guard saved.', setSavingGuard)
+  }
+
   async function sendDigestNow() {
     setSendingDigest(true)
     setError(null)
@@ -405,6 +430,26 @@ export function SetupTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly:
         <WarningBanner key={w}>{w}</WarningBanner>
       ))}
       {readOnly && <WarningBanner>{READ_ONLY_HINT}</WarningBanner>}
+
+      {/* ---------------- License & Plan ---------------- */}
+      <Section
+        icon={<Award className="h-5 w-5" aria-hidden="true" />}
+        step="License & Plan"
+        title="Your Mont plan"
+        subtitle="Offline Ed25519 license: nothing phones home. Paste a MONT-V2 key to unlock Pro / Agency features instantly, without a restart."
+      >
+        <LicenseCard licenseApi={licenseApi} readOnly={readOnly} />
+      </Section>
+
+      {/* ---------------- Client workspaces ---------------- */}
+      <Section
+        icon={<Building2 className="h-5 w-5" aria-hidden="true" />}
+        step="Agency"
+        title="Client workspaces"
+        subtitle="Protect many client stores from one installation: each workspace has its own rules, budgets, upstream, emergency switch, approval chat and API key. Switch between them in the top bar."
+      >
+        <WorkspacesPanel workspacesApi={workspacesApi} readOnly={readOnly} />
+      </Section>
 
       {/* ---------------- Step 1 ---------------- */}
       <Section icon={<Server className="h-5 w-5" aria-hidden="true" />} step="Step 1" title="Connect your API" subtitle="Where should allowed AI agent requests go?">
@@ -856,6 +901,70 @@ export function SetupTab({ rulesApi, readOnly }: { rulesApi: RulesApi; readOnly:
             </button>
             <p className="w-full text-xs text-slate-500">
               Payload rules still see the real values (redaction happens only on what is stored or sent), and approved requests are replayed from an encrypted copy.
+            </p>
+          </div>
+        )}
+      </Section>
+
+      {/* ---------------- Response guard ---------------- */}
+      <Section
+        icon={<ScanSearch className="h-5 w-5" aria-hidden="true" />}
+        step="Exfiltration"
+        title="Outbound response guard"
+        subtitle="Inspect what your API sends BACK before the agent sees it: stop bulk data dumps (e.g. 1,000 customer rows) and scrub API keys, tokens and card numbers in-flight. Applies to HTTP responses and MCP tool results."
+      >
+        {settings && (
+          <div className="space-y-4">
+            <label className="flex items-center gap-3 text-sm text-slate-700">
+              <Toggle
+                label="Enable the response guard"
+                checked={settings.responseGuard.enabled}
+                onChange={(v) => setSettings({ ...settings, responseGuard: { ...settings.responseGuard, enabled: v } })}
+                disabled={readOnly}
+              />
+              Inspect upstream responses
+            </label>
+            <div className="grid gap-4 md:grid-cols-3">
+              <Field label="Largest allowed JSON array" hint="Any list longer than this counts as a bulk dump.">
+                <input
+                  type="number"
+                  min={1}
+                  max={1000000}
+                  value={settings.responseGuard.maxArrayItems}
+                  disabled={readOnly}
+                  onChange={(e) => setSettings({ ...settings, responseGuard: { ...settings.responseGuard, maxArrayItems: Number(e.target.value) } })}
+                  className={INPUT_CLASS}
+                />
+              </Field>
+              <Field label="When a list is too long">
+                <select
+                  value={settings.responseGuard.onLargeArray}
+                  disabled={readOnly}
+                  onChange={(e) => setSettings({ ...settings, responseGuard: { ...settings.responseGuard, onLargeArray: e.target.value as 'block' | 'truncate' } })}
+                  className={INPUT_CLASS}
+                >
+                  <option value="block">Withhold the response (502 Response Policy Violation)</option>
+                  <option value="truncate">Cut the list to the limit</option>
+                </select>
+              </Field>
+              <Field label="When a secret is found">
+                <select
+                  value={settings.responseGuard.onSecret}
+                  disabled={readOnly}
+                  onChange={(e) => setSettings({ ...settings, responseGuard: { ...settings.responseGuard, onSecret: e.target.value as 'scrub' | 'block' } })}
+                  className={INPUT_CLASS}
+                >
+                  <option value="scrub">Mask it and deliver the rest</option>
+                  <option value="block">Withhold the response (502)</option>
+                </select>
+              </Field>
+            </div>
+            <button type="button" onClick={saveResponseGuard} disabled={readOnly || savingGuard} className={PRIMARY_BTN}>
+              {savingGuard && <Spinner />}
+              Save response guard
+            </button>
+            <p className="text-xs text-slate-500">
+              Every withheld or scrubbed response is written to the audit log (RESPONSE_BLOCKED / RESPONSE_SCRUBBED). Pagination cursors are never treated as secrets.
             </p>
           </div>
         )}

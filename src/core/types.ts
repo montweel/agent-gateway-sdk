@@ -3,7 +3,12 @@ import type { Request, RequestHandler, Router } from "express";
 // =====================================================================
 // Public types
 // =====================================================================
-export type RuleMode = "ALLOW" | "BLOCK" | "REQUIRE_APPROVAL";
+/**
+ * SHADOW_BLOCK / SHADOW_APPROVAL ("dry run"): the request is ALLOWED and forwarded, but the
+ * audit row records what the rule would have done, so a new policy can be watched against
+ * live traffic before it is enforced.
+ */
+export type RuleMode = "ALLOW" | "BLOCK" | "REQUIRE_APPROVAL" | "SHADOW_BLOCK" | "SHADOW_APPROVAL";
 export type UserRole = "admin" | "viewer";
 
 /**
@@ -148,6 +153,19 @@ export interface GatewaySettings {
   timezone: string;
   schedule: ScheduleSettings;
   alerts: AlertSettings;
+  /** Outbound exfiltration breaker for upstream responses (see responseGuard.ts). */
+  responseGuard: ResponseGuardSettings;
+}
+
+export interface ResponseGuardSettings {
+  /** Off by default: turning it on can change what agents receive. */
+  enabled: boolean;
+  /** Any JSON array longer than this is a "bulk dump" (e.g. 1,000 customer rows). */
+  maxArrayItems: number;
+  /** "block": 502 Response Policy Violation. "truncate": cut the array to maxArrayItems. */
+  onLargeArray: "block" | "truncate";
+  /** "scrub": mask secrets / card numbers in-flight. "block": 502 Response Policy Violation. */
+  onSecret: "scrub" | "block";
 }
 
 export interface PrivacySettings {
@@ -233,6 +251,15 @@ export interface AgentGatewayOptions {
   alertCheckIntervalMs?: number;
   /** How often the emergency mode is re-read from SQLite (other processes may change it). Default: 2000 ms. */
   emergencyRefreshMs?: number;
+  /**
+   * Mont license key supplied by the host application (e.g. from a secret manager).
+   * Takes precedence over MONT_LICENSE_KEY and a key activated in the dashboard.
+   */
+  licenseKey?: string;
+  /** Machine install anchor used by the trial clock. Default: ~/.montweel/anchor.json */
+  licenseAnchorFile?: string;
+  /** How often workspaces (rules, modes, keys) are re-read from SQLite for other processes' changes. Default: 2000 ms. */
+  workspaceRefreshMs?: number;
 }
 
 export interface AgentGateway {
@@ -260,7 +287,19 @@ export interface AgentGateway {
 // =====================================================================
 // Internal types
 // =====================================================================
-export type LogStatus = "ALLOWED" | "BLOCKED" | "QUEUED" | "RATE_LIMITED" | "APPROVED" | "REJECTED";
+export type LogStatus =
+  | "ALLOWED"
+  | "BLOCKED"
+  | "QUEUED"
+  | "RATE_LIMITED"
+  | "APPROVED"
+  | "REJECTED"
+  /** The request ran, but its upstream response was withheld (502 Response Policy Violation). */
+  | "RESPONSE_BLOCKED"
+  /** The request ran; secrets were masked / bulk arrays truncated in the response. */
+  | "RESPONSE_SCRUBBED";
+
+export const LOG_STATUSES: LogStatus[] = ["ALLOWED", "BLOCKED", "QUEUED", "RATE_LIMITED", "APPROVED", "REJECTED", "RESPONSE_BLOCKED", "RESPONSE_SCRUBBED"];
 
 export type PendingStatus = "PENDING" | "EXECUTING" | "APPROVED" | "REJECTED" | "FAILED" | "EXPIRED";
 
@@ -296,6 +335,14 @@ export interface PendingRow {
   kind: string | null;
   /** "<hostname>:<pid>:<nonce>" of the process holding an MCP call open. */
   owner: string | null;
+  /** Workspace (client) the request belongs to. NULL on rows from before v2 (= default workspace). */
+  workspace_id: number | null;
+  /** Redacted JSON of the body the approver edited ("Edit & Approve"), or NULL. */
+  modified_body: string | null;
+  /** Redacted JSON of the query the approver edited, or NULL. */
+  modified_query: string | null;
+  /** AES-256-GCM copy of the approver's edited payload, for the process that executes it. Wiped once decided. */
+  patch_encrypted: string | null;
 }
 
 export interface BlockedCallerRow {

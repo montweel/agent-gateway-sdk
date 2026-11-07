@@ -35,7 +35,17 @@ function createAlerts(ctx, intervalMs) {
     }
     async function sendDigest() {
         const s = await (0, protection_1.buildSummary)(ctx, 24);
-        return ctx.notifier.sendAlert("Mont daily digest", (0, protection_1.summaryLines)(s));
+        const lines = (0, protection_1.summaryLines)(s);
+        // An off-box copy of the audit chain's head: if the database is ever rewritten wholesale,
+        // the hash in yesterday's message will no longer match GET /audit/verify.
+        await ctx.ledger.sealPending().catch(() => undefined);
+        const head = await ctx.ledger.head().catch(() => null);
+        if (head)
+            lines.push(`Audit ledger head: #${head.id} ${head.hash.slice(0, 16)}…`);
+        const workspaces = ctx.workspaces.list();
+        if (workspaces.length > 1)
+            lines.push(`Workspaces: ${workspaces.length} (per-client numbers in the dashboard's All Clients view)`);
+        return ctx.notifier.sendAlert("Mont daily digest", lines);
     }
     async function checkNow(now = new Date()) {
         const settings = ctx.settings.peek();

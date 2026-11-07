@@ -2,6 +2,8 @@ import type { Request, Response, Router } from "express";
 import type { GatewayContext } from "../context";
 import type { LogStatus } from "../types";
 import { escapeLike, sendInternalError } from "../utils";
+import { workspaceFilter } from "../protection";
+import { readScope } from "./scope";
 
 // window -> total span and bucket size (both in ms)
 const WINDOWS: Record<string, { spanMs: number; stepMs: number }> = {
@@ -11,7 +13,7 @@ const WINDOWS: Record<string, { spanMs: number; stepMs: number }> = {
   "1w": { spanMs: 7 * 24 * 60 * 60_000, stepMs: 24 * 60 * 60_000 },
 };
 
-const LOG_STATUSES: LogStatus[] = ["ALLOWED", "BLOCKED", "QUEUED", "RATE_LIMITED", "APPROVED", "REJECTED"];
+const LOG_STATUSES: LogStatus[] = ["ALLOWED", "BLOCKED", "QUEUED", "RATE_LIMITED", "APPROVED", "REJECTED", "RESPONSE_BLOCKED", "RESPONSE_SCRUBBED"];
 
 interface AnalyticsBucket {
   hour: string;
@@ -21,6 +23,8 @@ interface AnalyticsBucket {
   RATE_LIMITED: number;
   APPROVED: number;
   REJECTED: number;
+  RESPONSE_BLOCKED: number;
+  RESPONSE_SCRUBBED: number;
   total: number;
 }
 
@@ -29,10 +33,14 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
   const { db, license } = ctx;
 
   router.get("/logs", async (req: Request, res: Response) => {
+    const scoped = readScope(ctx, req, res);
+    if (scoped === undefined) return;
     try {
-      const { status, method, search, from, to, limit } = req.query;
-      let sql = "SELECT * FROM agent_logs WHERE 1=1";
-      const params: unknown[] = [];
+      const { status, method, search, from, to, limit, shadow } = req.query;
+      const wf = workspaceFilter(scoped?.id ?? null);
+      let sql = `SELECT * FROM agent_logs WHERE 1=1${wf.sql}`;
+      const params: unknown[] = [...wf.params];
+      if (shadow === "1" || shadow === "true") sql += " AND shadow IS NOT NULL";
 
       if (typeof status === "string" && status.trim() !== "") {
         sql += " AND status = ?";
@@ -65,7 +73,19 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
       sql += " ORDER BY id DESC LIMIT ?";
       params.push(parsedLimit);
 
-      res.json(await db.all(sql, params));
+      const rows = await db.all<Record<string, unknown>>(sql, params);
+      // The chain fields are for /audit/verify; the snapshot can be large: keep list responses lean.
+      res.json(
+        rows.map((row) => {
+          const r: Record<string, unknown> = { ...row };
+          r.has_snapshot = row.request_snapshot !== null;
+          r.sealed = row.row_hash !== null;
+          r.workspace_slug = ctx.workspaces.get((row.workspace_id as number | null) ?? 1)?.slug ?? null;
+          delete r.request_snapshot;
+          delete r.prev_hash;
+          return r;
+        })
+      );
     } catch (err) {
       sendInternalError(res, "Logs error", err, "Could not load audit logs.");
     }
@@ -74,6 +94,9 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
   // Traffic analytics. Rows are bucketed in SQL by integer-dividing the unix time
   // by the bucket size, so the buckets line up exactly with the ones built below.
   router.get("/logs/analytics", async (req: Request, res: Response) => {
+    const scoped = readScope(ctx, req, res);
+    if (scoped === undefined) return;
+    const wf = workspaceFilter(scoped?.id ?? null);
     try {
       const requested = typeof req.query.window === "string" ? req.query.window.toLowerCase() : "24h";
       // The 7-day window is Pro. Community falls back to 24h and says so, rather than failing.
@@ -91,23 +114,24 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
       const rows = await db.all<{ bucket: number; status: LogStatus; count: number }>(
         `SELECT CAST(strftime('%s', timestamp) AS INTEGER) / ? AS bucket, status, COUNT(*) AS count
          FROM agent_logs
-         WHERE timestamp >= ? AND status != 'QUEUED'
+         WHERE timestamp >= ? AND status != 'QUEUED'${wf.sql}
          GROUP BY bucket, status`,
-        [stepSec, cutoffIso]
+        [stepSec, cutoffIso, ...wf.params]
       );
 
       // 2. Get ONLY currently pending requests bucketed by when they were queued
       const pendingBuckets = await db.all<{ bucket: number; count: number }>(
         `SELECT CAST(strftime('%s', timestamp) AS INTEGER) / ? AS bucket, COUNT(*) AS count
          FROM pending_actions
-         WHERE status = 'PENDING' AND timestamp >= ?
+         WHERE status = 'PENDING' AND timestamp >= ?${wf.sql}
          GROUP BY bucket`,
-        [stepSec, cutoffIso]
+        [stepSec, cutoffIso, ...wf.params]
       );
 
       // 3. Get total live pending count for the top KPI card
       const pendingCountRow = await db.get<{ count: number }>(
-        `SELECT COUNT(*) as count FROM pending_actions WHERE status = 'PENDING'`
+        `SELECT COUNT(*) as count FROM pending_actions WHERE status = 'PENDING'${wf.sql}`,
+        wf.params
       );
       const actualPendingCount = pendingCountRow?.count ?? 0;
 
@@ -126,14 +150,14 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
            SUM(CASE WHEN status IN ('ALLOWED', 'APPROVED') THEN 1 ELSE 0 END) AS allowed,
            SUM(CASE WHEN status IN ('BLOCKED', 'RATE_LIMITED', 'REJECTED', 'PENDING') THEN 1 ELSE 0 END) AS intervened
          FROM (
-           SELECT method, path, status FROM agent_logs WHERE timestamp >= ? AND status != 'QUEUED'
+           SELECT method, path, status FROM agent_logs WHERE timestamp >= ? AND status != 'QUEUED'${wf.sql}
            UNION ALL
-           SELECT method, path, status FROM pending_actions WHERE status = 'PENDING' AND timestamp >= ?
+           SELECT method, path, status FROM pending_actions WHERE status = 'PENDING' AND timestamp >= ?${wf.sql}
          )
          GROUP BY method, path
          ORDER BY total DESC, intervened DESC
          LIMIT 8`,
-        [cutoffIso, cutoffIso]
+        [cutoffIso, ...wf.params, cutoffIso, ...wf.params]
       );
 
       // 5. Top Active AI Agents / Callers
@@ -149,11 +173,11 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
            SUM(CASE WHEN status IN ('ALLOWED', 'APPROVED') THEN 1 ELSE 0 END) AS allowed,
            SUM(CASE WHEN status IN ('BLOCKED', 'RATE_LIMITED', 'REJECTED') THEN 1 ELSE 0 END) AS intervened
          FROM agent_logs
-         WHERE timestamp >= ? AND status != 'QUEUED'
+         WHERE timestamp >= ? AND status != 'QUEUED'${wf.sql}
          GROUP BY agent
          ORDER BY total DESC, intervened DESC
          LIMIT 8`,
-        [cutoffIso]
+        [cutoffIso, ...wf.params]
       );
 
       const buckets = new Map<number, AnalyticsBucket>();
@@ -166,6 +190,8 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
           RATE_LIMITED: 0,
           APPROVED: 0,
           REJECTED: 0,
+          RESPONSE_BLOCKED: 0,
+          RESPONSE_SCRUBBED: 0,
           total: 0,
         });
       }
@@ -177,6 +203,8 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
         RATE_LIMITED: 0,
         APPROVED: 0,
         REJECTED: 0,
+        RESPONSE_BLOCKED: 0,
+        RESPONSE_SCRUBBED: 0,
       };
 
       for (const r of rows) {

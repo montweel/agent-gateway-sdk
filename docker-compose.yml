@@ -1,0 +1,45 @@
+# Mont Agent Gateway next to your existing containers:  docker compose up -d
+#
+#   Agents call:     http://<host>:8080/api/...            (or http://mont:8080/api/... from other containers)
+#   Admin console:   http://127.0.0.1:3000/agent-admin/    (first boot: the setup key is in `docker compose logs mont`)
+#
+# Point Mont at your API in the admin console (Gateway Setup -> Step 1), or per client in Client workspaces.
+
+services:
+  mont:
+    build: .
+    image: montweel/agent-gateway:2.0.0
+    container_name: mont
+    restart: unless-stopped
+    ports:
+      - "8080:8080"             # agent-facing proxy
+      - "127.0.0.1:3000:3000"   # admin console: local only; put SSO / a VPN in front before exposing it
+    volumes:
+      - mont-data:/data         # logs.db (SQLite WAL), rules.json, config.json, mont-state.json
+      - mont-anchor:/home/node/.montweel   # license install anchor (kept across image upgrades)
+    environment:
+      TZ: UTC
+      # Uncomment as needed (do not leave them set to empty strings):
+      # MONT_LICENSE_KEY: "MONT-V2...."     # Pro / Agency license
+      # SETUP_TOKEN: "choose-a-long-random-setup-key"
+      # ADMIN_TOKEN: "static-token-for-ci-scripts"
+      # TRUST_PROXY: "true"                 # behind exactly one reverse proxy
+    # To pin the upstream at start-up instead of setting it in the console:
+    # command: ["start", "--data-dir", "/data", "--target", "http://shop-api:4000"]
+    # Join the network your API already runs on:
+    # networks: [default, shop]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  mont-data:
+  mont-anchor:
+
+# networks:
+#   shop:
+#     external: true

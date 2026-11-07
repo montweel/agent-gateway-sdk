@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.TEST_BUTTON_TOKEN = void 0;
+exports.workspaceNotice = workspaceNotice;
 exports.signWebhookBody = signWebhookBody;
 exports.createNotifier = createNotifier;
 exports.noticeFromRow = noticeFromRow;
@@ -13,6 +14,15 @@ const constants_1 = require("./constants");
 const approvalSigning_1 = require("./approvalSigning");
 const utils_1 = require("./utils");
 const protection_1 = require("./protection");
+function workspaceNotice(ws) {
+    if (!ws)
+        return null;
+    return { id: ws.id, name: ws.name, slug: ws.slug, isDefault: ws.isDefault, telegramChatId: ws.telegramChatId, slackChannel: ws.slackChannel };
+}
+/** "[Acme Outfitters] " for client workspaces, "" for the default one. */
+function wsLabel(n) {
+    return n.workspace && !n.workspace.isDefault ? `[${n.workspace.name}] ` : "";
+}
 exports.TEST_BUTTON_TOKEN = "mont:test";
 // ---------------------------------------------------------------------------
 // Formatting
@@ -102,7 +112,7 @@ function slackText(n) {
 }
 function slackBlocks(n, actions, footer) {
     const blocks = [
-        { type: "header", text: { type: "plain_text", text: n.id === 0 ? "Test notification" : `Approval needed: #${n.id}`, emoji: false } },
+        { type: "header", text: { type: "plain_text", text: n.id === 0 ? "Test notification" : `${wsLabel(n)}Approval needed: #${n.id}`.slice(0, 150), emoji: false } },
         { type: "section", text: { type: "mrkdwn", text: slackText(n) } },
         { type: "section", text: { type: "mrkdwn", text: "```" + escSlack(prettyBody(n.body)).replace(/```/g, "'''") + "```" } },
     ];
@@ -114,7 +124,7 @@ function slackBlocks(n, actions, footer) {
 }
 function telegramText(n, footer) {
     const risks = riskLines(n.body);
-    return (`<b>${n.id === 0 ? "Test notification" : `Approval needed: #${n.id}`}</b>\n` +
+    return (`<b>${n.id === 0 ? "Test notification" : `${escHtml(wsLabel(n))}Approval needed: #${n.id}`}</b>\n` +
         `<b>${escHtml(n.method)}</b> <code>${escHtml(n.path)}</code>\n` +
         `<b>Caller:</b> ${escHtml(callerLine(n))}\n` +
         (n.agentReason ? `<b>Agent's reason:</b> ${escHtml(n.agentReason.slice(0, 300))}\n` : "") +
@@ -140,22 +150,36 @@ async function sendSlackWebhook(webhookUrl, n, l) {
     const r = await postJson(webhookUrl, { text: `Approval needed: ${n.method} ${n.path} (#${n.id})`, blocks: slackBlocks(n, actions, footer) });
     return slackOk(r);
 }
-async function sendSlackBot(base, s, secret, n) {
+const PRO_BUTTONS_FOOTER = "One-tap Approve / Reject buttons over Telegram polling and Slack Socket Mode are a Mont Pro feature. Approve this request in the dashboard.";
+async function sendSlackBot(base, s, secret, n, interactive) {
     const t = buttonTokens(secret, n);
-    const actions = {
-        type: "actions",
-        block_id: `mont_${n.id}`,
-        elements: [
-            { type: "button", action_id: "mont_approve", text: { type: "plain_text", text: "Approve" }, style: "primary", value: t.approve },
-            { type: "button", action_id: "mont_reject", text: { type: "plain_text", text: "Reject" }, style: "danger", value: t.reject },
-        ],
-    };
-    const r = await postJson(`${base}/chat.postMessage`, { channel: s.channelId, text: `Approval needed: ${n.method} ${n.path} (#${n.id})`, blocks: slackBlocks(n, actions, null), unfurl_links: false }, { authorization: `Bearer ${s.botToken}` });
+    const actions = interactive
+        ? {
+            type: "actions",
+            block_id: `mont_${n.id}`,
+            elements: [
+                { type: "button", action_id: "mont_approve", text: { type: "plain_text", text: "Approve" }, style: "primary", value: t.approve },
+                { type: "button", action_id: "mont_reject", text: { type: "plain_text", text: "Reject" }, style: "danger", value: t.reject },
+            ],
+        }
+        : null;
+    const r = await postJson(`${base}/chat.postMessage`, {
+        channel: n.workspace?.slackChannel || s.channelId,
+        text: `${wsLabel(n)}Approval needed: ${n.method} ${n.path} (#${n.id})`,
+        blocks: slackBlocks(n, actions, interactive ? null : PRO_BUTTONS_FOOTER),
+        unfurl_links: false,
+    }, { authorization: `Bearer ${s.botToken}` });
     return slackOk(r);
 }
-async function sendTelegram(base, s, secret, n, l) {
-    const payload = { chat_id: s.chatId, parse_mode: "HTML", disable_web_page_preview: true };
-    if (s.mode === "polling") {
+async function sendTelegram(base, s, secret, n, l, interactive = true) {
+    const payload = { chat_id: n.workspace?.telegramChatId || s.chatId, parse_mode: "HTML", disable_web_page_preview: true };
+    if (s.mode === "polling" && !interactive) {
+        // Community: the message still arrives; buttons fall back to signed links when a Public URL exists.
+        payload.text = telegramText(n, l ? null : PRO_BUTTONS_FOOTER);
+        if (l)
+            payload.reply_markup = { inline_keyboard: [[{ text: "✅ Approve", url: l.approve }, { text: "⛔ Reject", url: l.reject }]] };
+    }
+    else if (s.mode === "polling") {
         const t = buttonTokens(secret, n);
         payload.text = telegramText(n, null);
         payload.reply_markup = { inline_keyboard: [[{ text: "✅ Approve", callback_data: t.approve }, { text: "⛔ Reject", callback_data: t.reject }]] };
@@ -209,7 +233,9 @@ async function sendWebhook(url, secret, n, l) {
 // ---------------------------------------------------------------------------
 // Notifier
 // ---------------------------------------------------------------------------
-function createNotifier(settingsStore, redactor, endpoints) {
+function createNotifier(settingsStore, redactor, endpoints, 
+/** Current license features (zero-tunnel buttons are Pro / Agency). */
+features) {
     async function dispatch(raw) {
         let settings;
         let secret;
@@ -232,16 +258,18 @@ function createNotifier(settingsStore, redactor, endpoints) {
         };
         const l = links(settings, secret, n);
         const { slack, telegram, webhook } = settings.notifications;
+        const interactive = features().interactiveApprovals;
         const jobs = [];
         const guard = (channel, p) => p.catch((err) => ({ channel, ok: false, error: err instanceof Error ? err.message : String(err) }));
         if (slack.enabled) {
-            if (slack.mode === "socket" && slack.botToken && slack.channelId)
-                jobs.push(guard("slack", sendSlackBot(endpoints.slackApiBase, slack, secret, n)));
+            const channel = n.workspace?.slackChannel || slack.channelId;
+            if (slack.mode === "socket" && slack.botToken && channel)
+                jobs.push(guard("slack", sendSlackBot(endpoints.slackApiBase, slack, secret, n, interactive)));
             else if (slack.mode === "webhook" && slack.webhookUrl)
                 jobs.push(guard("slack", sendSlackWebhook(slack.webhookUrl, n, l)));
         }
-        if (telegram.enabled && telegram.botToken && telegram.chatId) {
-            jobs.push(guard("telegram", sendTelegram(endpoints.telegramApiBase, telegram, secret, n, l)));
+        if (telegram.enabled && telegram.botToken && (n.workspace?.telegramChatId || telegram.chatId)) {
+            jobs.push(guard("telegram", sendTelegram(endpoints.telegramApiBase, telegram, secret, n, l, interactive)));
         }
         if (webhook.enabled && webhook.url)
             jobs.push(guard("webhook", sendWebhook(webhook.url, webhook.secret, n, l)));
@@ -335,7 +363,7 @@ function approverList(raw) {
         .filter(Boolean);
 }
 /** Rebuilds a notification from a stored (already redacted) approval row. */
-function noticeFromRow(row) {
+function noticeFromRow(row, workspace) {
     let query = {};
     try {
         query = row.query_json ? JSON.parse(row.query_json) : {};
@@ -357,16 +385,33 @@ function noticeFromRow(row) {
         agentKeyPrefix: row.agent_key_prefix,
         agentReason: row.agent_reason,
         matchedPolicy: row.matched_policy,
+        workspace: workspaceNotice(workspace),
+    };
+}
+function telegramChatMatcher(chat) {
+    return (configured) => {
+        const c = configured.trim();
+        return c !== "" && (String(chat.id) === c || (c.startsWith("@") && chat.username?.toLowerCase() === c.slice(1).toLowerCase()));
     };
 }
 /** Verifies a button token against its queued row and applies the decision. */
-async function decideFromButton(ctx, token, actor) {
+async function decideFromButton(ctx, token, actor, origin) {
     const parsed = (0, approvalSigning_1.parseButtonToken)(token);
     if (!parsed)
         return { ok: false, text: "This button is not valid." };
-    const row = await ctx.db.get("SELECT id, timestamp FROM pending_actions WHERE id = ?", [parsed.id]);
+    const row = await ctx.db.get("SELECT id, timestamp, workspace_id FROM pending_actions WHERE id = ?", [parsed.id]);
     if (!row || !(0, approvalSigning_1.verifyButtonToken)(ctx.settings.approvalSigningSecret(), parsed, row.timestamp)) {
         return { ok: false, text: "This button is not valid for that request." };
+    }
+    // The request's workspace decides which chat / channel may approve it.
+    const ws = ctx.workspaces.get(row.workspace_id ?? constants_1.DEFAULT_WORKSPACE_ID);
+    const n = ctx.settings.get().notifications;
+    const allowed = origin.channel === "telegram"
+        ? origin.chatMatches(ws?.telegramChatId || n.telegram.chatId)
+        : origin.channelId === (ws?.slackChannel || n.slack.channelId);
+    if (!allowed) {
+        console.error(`[agent-gateway] Refused a ${origin.channel} button for action #${parsed.id} from a chat that does not belong to its workspace.`);
+        return { ok: false, text: `#${parsed.id} belongs to another client workspace; it can only be decided from that workspace's chat or the dashboard.` };
     }
     const result = await ctx.approvals.decide(parsed.id, parsed.decision, actor);
     const body = result.body;
@@ -414,9 +459,10 @@ function createApprovalBridges(ctx, endpoints) {
     async function handleTelegramCallback(token, s, cq) {
         const answer = (text, alert = false) => tg("answerCallbackQuery", token, { callback_query_id: cq.id, text: text.slice(0, 190), show_alert: alert }).catch(() => undefined);
         const chat = cq.message?.chat;
-        const chatMatches = chat !== undefined &&
-            (String(chat.id) === s.chatId.trim() || (s.chatId.startsWith("@") && chat.username?.toLowerCase() === s.chatId.slice(1).toLowerCase()));
-        if (!chatMatches) {
+        const matcher = chat ? telegramChatMatcher(chat) : null;
+        // The global chat, or a client workspace's own chat.
+        const chatMatches = matcher !== null && (matcher(s.chatId) || ctx.workspaces.list().some((w) => w.telegramChatId !== null && matcher(w.telegramChatId)));
+        if (!chatMatches || !matcher) {
             console.error(`[agent-gateway] Ignored a Telegram button from an unexpected chat (${chat?.id ?? "none"}).`);
             await answer("This chat is not allowed to decide gateway approvals.", true);
             return;
@@ -433,7 +479,7 @@ function createApprovalBridges(ctx, endpoints) {
         }
         await answer("Working on it…");
         const actor = `telegram:${cq.from.username ? `@${cq.from.username}` : cq.from.id}`;
-        const outcome = await decideFromButton(ctx, cq.data ?? "", actor);
+        const outcome = await decideFromButton(ctx, cq.data ?? "", actor, { channel: "telegram", chatMatches: matcher });
         if (cq.message) {
             if (outcome.ok) {
                 await tg("editMessageReplyMarkup", token, { chat_id: cq.message.chat.id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => undefined);
@@ -452,8 +498,11 @@ function createApprovalBridges(ctx, endpoints) {
         if (!text.startsWith("/"))
             return;
         const reply = (t) => tg("sendMessage", token, { chat_id: m.chat.id, text: t, reply_to_message_id: m.message_id, disable_web_page_preview: true }).catch(() => undefined);
-        const chatMatches = String(m.chat.id) === s.chatId.trim() || (s.chatId.startsWith("@") && m.chat.username?.toLowerCase() === s.chatId.slice(1).toLowerCase());
-        if (!chatMatches) {
+        const matcher = telegramChatMatcher(m.chat);
+        // A client workspace's own chat controls that workspace; the global chat controls the default
+        // workspace and the global switch.
+        const scoped = ctx.workspaces.list().find((w) => !w.isDefault && w.telegramChatId !== null && matcher(w.telegramChatId));
+        if (!scoped && !matcher(s.chatId)) {
             console.error(`[agent-gateway] Ignored a Telegram command from an unexpected chat (${m.chat.id}).`);
             return;
         }
@@ -467,21 +516,24 @@ function createApprovalBridges(ctx, endpoints) {
         const reason = rest.join(" ").trim() || null;
         const actor = `telegram:${m.from?.username ? `@${m.from.username}` : (m.from?.id ?? "unknown")}`;
         statuses.telegram.lastEventAt = new Date().toISOString();
+        const title = scoped ? `Mont gateway status · ${scoped.name}` : "Mont gateway status";
         switch (command) {
             case "/status": {
-                const summary = await (0, protection_1.buildSummary)(ctx, 24);
-                await reply(["Mont gateway status", ...(0, protection_1.summaryLines)(summary)].join("\n"));
+                const summary = await (0, protection_1.buildSummary)(ctx, 24, scoped?.id ?? null);
+                await reply([title, ...(0, protection_1.summaryLines)(summary)].join("\n"));
                 return;
             }
             case "/pending": {
-                const rows = await ctx.db.all("SELECT * FROM pending_actions WHERE status = 'PENDING' ORDER BY id ASC LIMIT 5");
+                // Workspace chats see only their own client's queue; the global chat sees the default workspace's.
+                const wsId = scoped?.id ?? constants_1.DEFAULT_WORKSPACE_ID;
+                const rows = await ctx.db.all("SELECT * FROM pending_actions WHERE status = 'PENDING' AND COALESCE(workspace_id, 1) = ? ORDER BY id ASC LIMIT 5", [wsId]);
                 if (rows.length === 0) {
                     await reply("Nothing is waiting for approval.");
                     return;
                 }
                 const secret = ctx.settings.approvalSigningSecret();
                 for (const row of rows) {
-                    await sendTelegram(endpoints.telegramApiBase, { ...s, mode: "polling" }, secret, noticeFromRow(row), null).catch(() => undefined);
+                    await sendTelegram(endpoints.telegramApiBase, { ...s, mode: "polling" }, secret, noticeFromRow(row, ctx.workspaces.get(wsId)), null).catch(() => undefined);
                 }
                 return;
             }
@@ -489,6 +541,11 @@ function createApprovalBridges(ctx, endpoints) {
             case "/approvalonly":
             case "/resume": {
                 const mode = command === "/lockdown" ? "lockdown" : command === "/approvalonly" ? "approval_only" : "normal";
+                if (scoped) {
+                    const ws = await ctx.workspaces.setMode(scoped.id, mode, reason, actor);
+                    await reply(`Done. ${ws.name}: ${(0, protection_1.modeLabel)(ws.mode)}${ws.modeReason ? ` · ${ws.modeReason}` : ""}`);
+                    return;
+                }
                 const state = await ctx.emergency.set(mode, reason, actor);
                 await reply(`Done. ${(0, protection_1.modeLabel)(state.mode)}${state.reason ? ` · ${state.reason}` : ""}`);
                 return;
@@ -515,6 +572,12 @@ function createApprovalBridges(ctx, endpoints) {
             const s = ctx.settings.get().notifications.telegram;
             if (!s.enabled || s.mode !== "polling" || !s.botToken || !s.chatId) {
                 set("telegram", "disabled");
+                await releaseLease(ctx, "telegram");
+                await nap(5000);
+                continue;
+            }
+            if (!ctx.license.current().features.interactiveApprovals) {
+                set("telegram", "disabled", "Telegram polling (buttons and bot commands) needs a Mont Pro or Agency license.");
                 await releaseLease(ctx, "telegram");
                 await nap(5000);
                 continue;
@@ -591,13 +654,15 @@ function createApprovalBridges(ctx, endpoints) {
         const action = p.actions?.[0];
         if (!action || (action.action_id !== "mont_approve" && action.action_id !== "mont_reject"))
             return;
-        if (p.channel?.id !== s.channelId) {
+        const channelId = p.channel?.id ?? "";
+        // The global channel, or a client workspace's own channel.
+        if (!channelId || (channelId !== s.channelId && !ctx.workspaces.list().some((w) => w.slackChannel === channelId))) {
             console.error(`[agent-gateway] Ignored a Slack button from an unexpected channel (${p.channel?.id ?? "none"}).`);
             return;
         }
         const userId = p.user?.id ?? "";
         const approvers = approverList(s.approverIds);
-        const reply = (text) => p.message ? slackApi("chat.postMessage", s.botToken, { channel: s.channelId, thread_ts: p.message.ts, text }).catch(() => undefined) : Promise.resolve();
+        const reply = (text) => p.message ? slackApi("chat.postMessage", s.botToken, { channel: channelId, thread_ts: p.message.ts, text }).catch(() => undefined) : Promise.resolve();
         if (approvers.length > 0 && !approvers.includes(userId)) {
             await reply(`<@${userId}> is not on the approver list for this gateway; nothing was changed.`);
             return;
@@ -607,10 +672,10 @@ function createApprovalBridges(ctx, endpoints) {
             return;
         }
         const actor = `slack:${p.user?.username ?? p.user?.name ?? userId}`;
-        const outcome = await decideFromButton(ctx, action.value ?? "", actor);
+        const outcome = await decideFromButton(ctx, action.value ?? "", actor, { channel: "slack", channelId });
         if (outcome.ok && p.message) {
             await slackApi("chat.update", s.botToken, {
-                channel: s.channelId,
+                channel: channelId,
                 ts: p.message.ts,
                 text: outcome.text,
                 blocks: [{ type: "section", text: { type: "mrkdwn", text: escSlack(outcome.text) } }],
@@ -626,6 +691,12 @@ function createApprovalBridges(ctx, endpoints) {
             const s = ctx.settings.get().notifications.slack;
             if (!s.enabled || s.mode !== "socket" || !s.appToken || !s.botToken || !s.channelId) {
                 set("slack", "disabled");
+                await releaseLease(ctx, "slack");
+                await nap(5000);
+                continue;
+            }
+            if (!ctx.license.current().features.interactiveApprovals) {
+                set("slack", "disabled", "Slack Socket Mode buttons need a Mont Pro or Agency license.");
                 await releaseLease(ctx, "slack");
                 await nap(5000);
                 continue;

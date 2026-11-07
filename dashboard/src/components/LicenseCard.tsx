@@ -31,8 +31,45 @@ export function ProLockLink({ onOpen, label = 'Renew free ↗' }: { onOpen: () =
 
 function statusBadge(l: LicenseStatus): { tone: Tone; label: string } {
   if (l.tier === 'PRO' && l.isTrial) return { tone: 'green', label: '7-Day Free Pro Trial' }
+  if (l.tier === 'AGENCY') return { tone: 'violet', label: 'Mont Agency Active' }
   if (l.tier === 'PRO') return { tone: 'violet', label: 'Mont Pro Active' }
+  if (!l.expired) return { tone: 'slate', label: 'Community Edition' }
   return { tone: 'amber', label: l.isTrial ? 'Community Edition (Trial Expired)' : 'Community Edition (Key Expired)' }
+}
+
+const FEATURE_LABELS: { key: keyof NonNullable<LicenseStatus['features']>; label: string }[] = [
+  { key: 'multiWorkspace', label: 'Multiple client workspaces' },
+  { key: 'interactiveApprovals', label: 'Zero-tunnel Telegram / Slack buttons' },
+  { key: 'payloadPatching', label: 'Edit & Approve (payload patching)' },
+  { key: 'rollbackWebhooks', label: 'Compensating rollback webhooks' },
+  { key: 'auditVerification', label: 'Tamper-evident ledger verification' },
+]
+
+/** What the current plan includes. Community always keeps local approvals, rules, budgets, redaction and CSV export. */
+export function PlanFeatures({ license }: { license: LicenseStatus }) {
+  return (
+    <div className="mt-4 grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs sm:grid-cols-2">
+      <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-2 text-slate-600">
+        <span>
+          Plan: <strong className="text-slate-900">{license.tier}</strong>
+          {license.keyVersion ? ` · v${license.keyVersion} key` : ''}
+        </span>
+        <span>
+          Workspaces: <strong className="text-slate-900">{license.maxWorkspaces ?? 1}</strong>
+        </span>
+      </div>
+      {FEATURE_LABELS.map((f) => {
+        const on = Boolean(license.features?.[f.key])
+        return (
+          <span key={f.key} className={`inline-flex items-center gap-1.5 ${on ? 'text-emerald-700' : 'text-slate-400'}`}>
+            <span aria-hidden="true">{on ? '✓' : '○'}</span>
+            {f.label}
+          </span>
+        )
+      })}
+      <span className="sm:col-span-2 text-slate-500">Always included: local approvals, payload rules, budgets, PII redaction, CSV export, shadow mode.</span>
+    </div>
+  )
 }
 
 function formatDate(iso?: string): string {
@@ -57,8 +94,8 @@ export function LicenseCard({ licenseApi, readOnly }: { licenseApi: LicenseApi; 
       setLicense(res.data)
       setKeyInput('')
       setMessage(
-        res.data.tier === 'PRO'
-          ? `Mont Pro is active until ${formatDate(res.data.expiresAt)}.`
+        res.data.tier !== 'COMMUNITY'
+          ? `Mont ${res.data.tier === 'AGENCY' ? 'Agency' : 'Pro'} is active until ${formatDate(res.data.expiresAt)} (${res.data.maxWorkspaces ?? 1} workspaces).`
           : 'That key is valid but has already expired. Get a fresh free 90-day trial key at montweel.com/#license-renewal.'
       )
     } catch (err) {
@@ -126,6 +163,7 @@ export function LicenseCard({ licenseApi, readOnly }: { licenseApi: LicenseApi; 
       </div>
 
       {license?.reason && license.expired && <p className="mt-3 text-xs text-amber-800">{license.reason}</p>}
+      {license && <PlanFeatures license={license} />}
 
       <div className="mt-4">
         {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
@@ -140,7 +178,7 @@ export function LicenseCard({ licenseApi, readOnly }: { licenseApi: LicenseApi; 
             value={keyInput}
             onChange={(e) => setKeyInput(e.target.value)}
             disabled={readOnly}
-            placeholder="MONT-..."
+            placeholder="MONT-V2.... (or a MONT-... Pro key)"
             spellCheck={false}
             autoComplete="off"
             className={`${INPUT_CLASS} font-mono`}
@@ -170,6 +208,11 @@ export function LicenseCard({ licenseApi, readOnly }: { licenseApi: LicenseApi; 
       {license?.source === 'ENV' && (
         <p className="mt-2 text-xs text-slate-500">
           This license comes from the <code className="font-mono">MONT_LICENSE_KEY</code> environment variable.
+        </p>
+      )}
+      {license?.source === 'OPTION' && (
+        <p className="mt-2 text-xs text-slate-500">
+          This license is supplied by the host application (<code className="font-mono">licenseKey</code> option).
         </p>
       )}
     </div>

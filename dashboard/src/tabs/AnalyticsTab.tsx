@@ -88,6 +88,8 @@ export function AnalyticsTab({ isPro, onOpenLicense }: { isPro: boolean; onOpenL
       RATE_LIMITED: 0,
       APPROVED: 0,
       REJECTED: 0,
+      RESPONSE_BLOCKED: 0,
+      RESPONSE_SCRUBBED: 0,
     }
     if (analytics?.statusTotals) {
       for (const item of analytics.statusTotals) {

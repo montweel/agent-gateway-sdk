@@ -1,0 +1,35 @@
+# Rebuilt inside the image
+node_modules
+dashboard/node_modules
+dist
+dashboard/dist
+
+# Secrets and local runtime state: never baked into an image
+.keys
+*.key
+.env
+.env.*
+config.json
+rules.json
+mont-state.json
+logs.db*
+*.db
+*.db-wal
+*.db-shm
+
+# Not needed to build the gateway
+.git
+.github
+.vscode
+.idea
+claude
+tests
+examples
+scripts
+*.tgz
+*.log
+**/*_old*
+**/*_orig*
+Dockerfile
+docker-compose.yml
+.dockerignore

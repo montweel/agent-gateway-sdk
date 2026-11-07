@@ -13,13 +13,44 @@ const CREATE_AGENT_LOGS_SQL = `
     timestamp TEXT NOT NULL,
     method TEXT NOT NULL,
     path TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('ALLOWED', 'BLOCKED', 'QUEUED', 'RATE_LIMITED', 'APPROVED', 'REJECTED')),
+    status TEXT NOT NULL CHECK (status IN ('ALLOWED', 'BLOCKED', 'QUEUED', 'RATE_LIMITED', 'APPROVED', 'REJECTED', 'RESPONSE_BLOCKED', 'RESPONSE_SCRUBBED')),
     user_agent TEXT,
     agent_key TEXT,
     action_id INTEGER,
     caller_ip TEXT,
     detail TEXT,
-    amount REAL
+    amount REAL,
+    workspace_id INTEGER,
+    shadow TEXT,
+    request_snapshot TEXT,
+    original_payload TEXT,
+    modified_payload TEXT,
+    prev_hash TEXT,
+    row_hash TEXT
+  )
+`;
+// v2.0 multi-tenant workspaces. Row 1 is the "default" workspace: rules.json, config.json's
+// targetUrl and the global notification settings, so a v1.x install keeps working unchanged.
+const CREATE_WORKSPACES_SQL = `
+  CREATE TABLE IF NOT EXISTS workspaces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    api_key_hash TEXT UNIQUE,
+    api_key_prefix TEXT,
+    require_key INTEGER NOT NULL DEFAULT 1,
+    upstream_url TEXT,
+    mode TEXT NOT NULL DEFAULT 'normal' CHECK (mode IN ('normal', 'approval_only', 'lockdown')),
+    mode_reason TEXT,
+    mode_changed_by TEXT,
+    mode_changed_at TEXT,
+    telegram_chat_id TEXT,
+    slack_channel TEXT,
+    rules_json TEXT,
+    timezone TEXT,
+    schedule_json TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
   )
 `;
 // Budgets (kind 'spend') and duplicate fingerprints (kind 'dedupe'). See guards.ts.
@@ -42,6 +73,13 @@ const AGENT_LOGS_EXTRA_COLUMNS = {
     caller_ip: "TEXT",
     detail: "TEXT",
     amount: "REAL",
+    workspace_id: "INTEGER",
+    shadow: "TEXT",
+    request_snapshot: "TEXT",
+    original_payload: "TEXT",
+    modified_payload: "TEXT",
+    prev_hash: "TEXT",
+    row_hash: "TEXT",
 };
 const PENDING_EXTRA_COLUMNS = {
     expires_at: "INTEGER",
@@ -59,6 +97,10 @@ const PENDING_EXTRA_COLUMNS = {
     rollback_status: "TEXT",
     kind: "TEXT",
     owner: "TEXT",
+    workspace_id: "INTEGER",
+    modified_body: "TEXT",
+    modified_query: "TEXT",
+    patch_encrypted: "TEXT",
 };
 const CREATE_BLOCKED_CALLERS_SQL = `
   CREATE TABLE IF NOT EXISTS blocked_callers (
@@ -98,7 +140,11 @@ const CREATE_PENDING_ACTIONS_SQL = `
     revoked_by TEXT,
     rollback_status TEXT,
     kind TEXT,
-    owner TEXT
+    owner TEXT,
+    workspace_id INTEGER,
+    modified_body TEXT,
+    modified_query TEXT,
+    patch_encrypted TEXT
   )
 `;
 const CREATE_USERS_SQL = `
@@ -216,7 +262,13 @@ function createDatabase(dbPath) {
         if (logsSql === undefined) {
             await run(CREATE_AGENT_LOGS_SQL);
         }
-        else if (!logsSql.includes("'QUEUED'") || !logsSql.includes("'RATE_LIMITED'") || !logsSql.includes("'APPROVED'") || !logsSql.includes("'REJECTED'")) {
+        else if (!logsSql.includes("'QUEUED'") ||
+            !logsSql.includes("'RATE_LIMITED'") ||
+            !logsSql.includes("'APPROVED'") ||
+            !logsSql.includes("'REJECTED'") ||
+            !logsSql.includes("'RESPONSE_BLOCKED'") ||
+            !logsSql.includes("'RESPONSE_SCRUBBED'")) {
+            // Values are copied unchanged (row hashes included), so a sealed ledger still verifies.
             await rebuildTable("agent_logs", CREATE_AGENT_LOGS_SQL);
         }
         for (const [column, type] of Object.entries(AGENT_LOGS_EXTRA_COLUMNS)) {
@@ -246,7 +298,7 @@ function createDatabase(dbPath) {
         await run("CREATE INDEX IF NOT EXISTS idx_guard_ledger_lookup ON guard_ledger(rule_key, kind, ts)");
         await run("CREATE INDEX IF NOT EXISTS idx_guard_ledger_fp ON guard_ledger(rule_key, fingerprint)");
         // A decided or expired action must not keep its secrets.
-        await run("UPDATE pending_actions SET encrypted_payload = NULL WHERE encrypted_payload IS NOT NULL AND status IN ('APPROVED', 'REJECTED', 'EXPIRED')");
+        await run("UPDATE pending_actions SET encrypted_payload = NULL, patch_encrypted = NULL WHERE (encrypted_payload IS NOT NULL OR patch_encrypted IS NOT NULL) AND status IN ('APPROVED', 'REJECTED', 'EXPIRED')");
         // A request that was mid-replay when the process died has an unknown outcome.
         // (Held MCP calls belong to whichever process holds them; index.ts reaps only orphaned ones.)
         await run("UPDATE pending_actions SET status = 'FAILED', response_preview = 'Interrupted: the gateway restarted while this action was executing. Check the target before retrying.' WHERE status = 'EXECUTING' AND (kind IS NULL OR kind != 'mcp')");
@@ -257,6 +309,19 @@ function createDatabase(dbPath) {
         await run("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_actions(status)");
         await run("CREATE INDEX IF NOT EXISTS idx_pending_caller_ip ON pending_actions(caller_ip)");
         await run("CREATE INDEX IF NOT EXISTS idx_pending_agent_key_id ON pending_actions(agent_key_id)");
+        await run("CREATE INDEX IF NOT EXISTS idx_pending_workspace ON pending_actions(workspace_id, status)");
+        await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_workspace ON agent_logs(workspace_id, timestamp)");
+        // The hash-chain sealer looks for the oldest unsealed rows.
+        await run("CREATE INDEX IF NOT EXISTS idx_agent_logs_unsealed ON agent_logs(id) WHERE row_hash IS NULL");
+        // ---- v2.0 workspaces (row 1 = default workspace, always present) ----
+        await run(CREATE_WORKSPACES_SQL);
+        await run("INSERT OR IGNORE INTO workspaces (id, name, slug, require_key, created_at) VALUES (1, 'Default', 'default', 0, ?)", [
+            new Date().toISOString(),
+        ]);
+        // Rows written before workspaces existed belong to the default workspace. Sealed rows are
+        // never touched (their workspace_id is part of the hash).
+        await run("UPDATE agent_logs SET workspace_id = 1 WHERE workspace_id IS NULL AND row_hash IS NULL");
+        await run("UPDATE pending_actions SET workspace_id = 1 WHERE workspace_id IS NULL");
         await run(CREATE_USERS_SQL);
         if (!(await hasColumn("users", "otp_expires_at"))) {
             await run("ALTER TABLE users ADD COLUMN otp_expires_at INTEGER");

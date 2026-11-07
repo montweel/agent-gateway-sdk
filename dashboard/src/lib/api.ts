@@ -39,8 +39,44 @@ export const api = axios.create({
   baseURL: `${BASE_URL}/api/agent-admin`,
 })
  
+// =====================================================================
+// Workspace (client) selection: sent as x-mont-workspace on every admin call.
+// 'all' = the "All Clients Overview" (no header: every workspace).
+// =====================================================================
+const WORKSPACE_KEY = 'mont-workspace'
+export const WORKSPACE_CHANGED_EVENT = 'mont:workspace-changed'
+
+function loadWorkspace(): string {
+  try {
+    return window.localStorage.getItem(WORKSPACE_KEY) || 'default'
+  } catch {
+    return 'default'
+  }
+}
+
+let currentWorkspace: string = loadWorkspace()
+
+export function getWorkspace(): string {
+  return currentWorkspace
+}
+
+export function setWorkspace(slug: string): void {
+  if (slug === currentWorkspace) return
+  currentWorkspace = slug
+  try {
+    window.localStorage.setItem(WORKSPACE_KEY, slug)
+  } catch {
+    // ignore storage errors
+  }
+  window.dispatchEvent(new Event(WORKSPACE_CHANGED_EVENT))
+}
+
 api.interceptors.request.use((config) => {
   if (currentToken) config.headers.set('x-admin-token', currentToken)
+  // A request may pin its own scope (e.g. the overview asks for every workspace).
+  if (currentWorkspace !== 'all' && !config.headers.has('x-mont-workspace')) {
+    config.headers.set('x-mont-workspace', currentWorkspace)
+  }
   return config
 })
  

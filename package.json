@@ -8,7 +8,7 @@
     "mont-gateway": "dist/cli.js"
   },
   "scripts": {
-    "test": "node --import tsx --test --test-concurrency=1 --test-timeout=60000 tests/security-chaos.test.ts tests/v12-features.test.ts tests/v13-shop.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 --test-timeout=60000 tests/security-chaos.test.ts tests/v12-features.test.ts tests/v13-shop.test.ts tests/v20-enterprise.test.ts",
     "typecheck": "tsc --noEmit -p . && tsc --noEmit -p tsconfig.tools.json",
     "build": "tsc",
     "build:all": "tsc && npm --prefix dashboard run build",
@@ -16,7 +16,8 @@
     "start": "tsx src/server.ts",
     "proxy": "tsx src/cli.ts start",
     "demo:shopify": "tsx examples/shopify-refund-demo/server.ts",
-    "leads": "tsx scripts/find-leads.ts"
+    "leads": "tsx scripts/find-leads.ts",
+    "keygen": "tsx scripts/keygen.ts"
   },
   "repository": {
     "type": "git",
@@ -34,6 +35,9 @@
   "author": "Montweel <support@montweel.com> (https://montweel.com)",
   "license": "SEE LICENSE IN TERMS.md",
   "type": "commonjs",
+  "engines": {
+    "node": ">=20.17.0"
+  },
   "files": [
     "dist",
     "dashboard/dist",

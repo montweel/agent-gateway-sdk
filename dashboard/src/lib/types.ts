@@ -1,5 +1,13 @@
-export type Mode = 'ALLOW' | 'REQUIRE_APPROVAL' | 'BLOCK'
-export type LogStatus = 'ALLOWED' | 'BLOCKED' | 'QUEUED' | 'APPROVED' | 'REJECTED' | 'RATE_LIMITED'
+export type Mode = 'ALLOW' | 'REQUIRE_APPROVAL' | 'BLOCK' | 'SHADOW_BLOCK' | 'SHADOW_APPROVAL'
+export type LogStatus =
+  | 'ALLOWED'
+  | 'BLOCKED'
+  | 'QUEUED'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'RATE_LIMITED'
+  | 'RESPONSE_BLOCKED'
+  | 'RESPONSE_SCRUBBED'
 export type ApprovalStatus = 'PENDING' | 'EXECUTING' | 'APPROVED' | 'REJECTED' | 'FAILED' | 'EXPIRED'
 export type Decision = 'APPROVE' | 'REJECT' | 'RETRY'
 export type Tab = 'rules' | 'approvals' | 'logs' | 'analytics' | 'team' | 'setup' | 'settings'
@@ -73,6 +81,8 @@ export interface EmergencyState {
 
 export interface BudgetUsage {
   ruleKey: string
+  workspaceId?: number
+  workspaceSlug?: string
   field: string
   max: number
   windowMinutes: number
@@ -90,6 +100,8 @@ export interface ProtectionSummary {
   moneyExecuted: number
   pending: number
   emergency: EmergencyState
+  globalEmergency?: EmergencyState
+  shadow?: { wouldBlock: number; wouldHold: number }
   budgets: BudgetUsage[]
   topBlocked: { method: string; path: string; count: number }[]
   topCallers: { caller: string; blocked: number }[]
@@ -107,6 +119,15 @@ export interface LogRow {
   action_id?: number | null
   caller_ip?: string | null
   detail?: string | null
+  amount?: number | null
+  workspace_id?: number | null
+  workspace_slug?: string | null
+  shadow?: 'BLOCK' | 'APPROVAL' | null
+  original_payload?: string | null
+  modified_payload?: string | null
+  row_hash?: string | null
+  sealed?: boolean
+  has_snapshot?: boolean
 }
 
 export interface HourlyBucket {
@@ -117,6 +138,8 @@ export interface HourlyBucket {
   RATE_LIMITED: number
   APPROVED: number
   REJECTED: number
+  RESPONSE_BLOCKED?: number
+  RESPONSE_SCRUBBED?: number
   total: number
 }
 
@@ -135,19 +158,32 @@ export interface AgentStat {
   intervened: number
 }
 
+export type LicenseTier = 'COMMUNITY' | 'PRO' | 'AGENCY'
+
+export interface LicenseFeatures {
+  multiWorkspace: boolean
+  interactiveApprovals: boolean
+  rollbackWebhooks: boolean
+  payloadPatching: boolean
+  auditVerification: boolean
+}
+
 export interface LicenseStatus {
   valid: boolean
   expired: boolean
   isTrial: boolean
-  tier: 'COMMUNITY' | 'PRO'
+  tier: LicenseTier
   org?: string
   email?: string
   issuedAt?: string
   expiresAt?: string
   daysRemaining?: number
-  source: 'ENV' | 'DB' | 'TRIAL' | 'TRIAL_EXPIRED'
+  source: 'OPTION' | 'ENV' | 'DB' | 'TRIAL' | 'TRIAL_EXPIRED'
   reason?: string
   renewalUrl: string
+  maxWorkspaces?: number
+  features?: LicenseFeatures
+  keyVersion?: 1 | 2
 }
 
 /** Body of a Pro-gated call the current license does not cover (HTTP 200, never 403). */
@@ -194,6 +230,12 @@ export interface Approval {
   rollback_status?: string | null
   /** "mcp" for held MCP tool calls, "http" (or null) for HTTP requests. */
   kind?: string | null
+  workspace_id?: number | null
+  workspace_slug?: string | null
+  workspace_name?: string | null
+  /** Redacted JSON of the approver's edit (Edit & Approve). */
+  modified_body?: string | null
+  modified_query?: string | null
 }
 
 export interface RevokeResponse {
@@ -238,6 +280,14 @@ export interface GatewaySettings {
   timezone: string
   schedule: { enabled: boolean; days: number[]; start: string; end: string }
   alerts: { enabled: boolean; burstThreshold: number; burstWindowMinutes: number; digestHour: number | null }
+  responseGuard: ResponseGuardSettings
+}
+
+export interface ResponseGuardSettings {
+  enabled: boolean
+  maxArrayItems: number
+  onLargeArray: 'block' | 'truncate'
+  onSecret: 'scrub' | 'block'
 }
 
 export type BridgeState = 'disabled' | 'connecting' | 'connected' | 'standby' | 'error'
@@ -309,6 +359,8 @@ export interface DecideResponse {
   replayStatus?: number
   response_preview?: string
   warning?: string
+  edited?: boolean
+  changes?: string[]
 }
 
 export interface AgentKey {
@@ -317,4 +369,99 @@ export interface AgentKey {
   keyPrefix: string
   createdAt: string
   lastUsedAt: string | null
+}
+
+// =====================================================================
+// v2.0: workspaces, audit ledger, policy time-machine
+// =====================================================================
+export interface Workspace {
+  id: number
+  name: string
+  slug: string
+  isDefault: boolean
+  apiKeyPrefix: string | null
+  hasApiKey: boolean
+  requireKey: boolean
+  upstreamUrl: string | null
+  mode: EmergencyMode
+  modeReason: string | null
+  modeChangedBy: string | null
+  modeChangedAt: string | null
+  telegramChatId: string | null
+  slackChannel: string | null
+  timezone: string | null
+  schedule: { enabled: boolean; days: number[]; start: string; end: string } | null
+  createdAt: string
+  entitled: boolean
+  effectiveMode: EmergencyMode
+}
+
+export interface WorkspacesResponse {
+  workspaces: Workspace[]
+  license: { tier: LicenseTier; maxWorkspaces: number; multiWorkspace: boolean }
+}
+
+export interface WorkspaceOverviewRow {
+  workspace: Workspace
+  counts: Record<LogStatus, number>
+  moneyProtected: number
+  moneyExecuted: number
+  pending: number
+  shadow: { wouldBlock: number; wouldHold: number }
+  budgets: BudgetUsage[]
+}
+
+export interface WorkspaceOverview {
+  windowHours: number
+  globalEmergency: EmergencyState
+  totals: { moneyProtected: number; moneyExecuted: number; pending: number; blocked: number; allowed: number }
+  workspaces: WorkspaceOverviewRow[]
+}
+
+export interface LedgerVerifyReport {
+  ok: boolean
+  checked: number
+  unsealed: number
+  firstId: number | null
+  lastId: number | null
+  headHash: string
+  checkpoint: { id: number; hash: string } | null
+  storedHead: { id: number; hash: string } | null
+  brokenAt: number | null
+  reason: string | null
+  verifiedAt: string
+}
+
+export type SimOutcome = 'ALLOW' | 'BLOCK' | 'REQUIRE_APPROVAL' | 'RATE_LIMITED'
+
+export interface SimulationReport {
+  workspaceId: number | null
+  evaluated: number
+  unevaluable: number
+  skippedNoSnapshot: number
+  historical: Record<SimOutcome, number>
+  simulated: Record<SimOutcome, number>
+  changed: number
+  transitions: { from: SimOutcome; to: SimOutcome; count: number }[]
+  wouldBlock: number
+  wouldHold: number
+  wouldRateLimit: number
+  wouldAllow: number
+  shadow: { wouldBlock: number; wouldHold: number }
+  moneyNewlyBlocked: number
+  rows: {
+    logId: number
+    timestamp: string
+    method: string
+    path: string
+    historical: SimOutcome
+    simulated: SimOutcome
+    reason: string
+    shadow: 'BLOCK' | 'APPROVAL' | null
+    amount: number | null
+    caller: string
+  }[]
+  from: string | null
+  to: string | null
+  usedCandidateRules: boolean
 }

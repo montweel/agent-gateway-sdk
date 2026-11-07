@@ -1,8 +1,8 @@
 import type { GatewayContext } from "./context";
 import type { BlockedCallerRow, PendingRow } from "./types";
 import type { NewBlock } from "./callerBlocklist";
-import { NO_BODY_METHODS, REDACTED, REPLAY_HEADER, ROLLBACK_TIMEOUT_MS, UPSTREAM_TIMEOUT_MS } from "./constants";
-import { decryptPayload } from "./crypto";
+import { DEFAULT_WORKSPACE_ID, MAX_PENDING_BODY_BYTES, NO_BODY_METHODS, REDACTED, REPLAY_HEADER, ROLLBACK_TIMEOUT_MS, UPSTREAM_TIMEOUT_MS } from "./constants";
+import { decryptPayload, encryptPayload } from "./crypto";
 import { evaluateRule } from "./policy";
 import { isTimeoutError, readCapped } from "./proxy";
 import { signWebhookBody } from "./notify";
@@ -10,6 +10,9 @@ import { normalizePath, parseJsonObject } from "./utils";
 import { ownerAlive } from "./instance";
 import type { McpWaiter } from "./toolGuard";
 import { extractAmount } from "./guards";
+import { scopedRuleKey } from "./workspaces";
+import { effectiveMode } from "./operatingMode";
+import { PatchError, applyEdits, assertJsonValue, describeChanges, validateQueryEdit, withQuery } from "./payloadPatch";
 
 /**
  * Approval state machine, shared by the dashboard API and the signed phone links.
@@ -21,6 +24,11 @@ import { extractAmount } from "./guards";
  *
  * EXECUTING is claimed with a conditional UPDATE, so two deciders (two admins, or an
  * admin and a phone link) can never replay the same action twice.
+ *
+ * v2.0 "Edit & Approve": an approver may change the body / query (HTTP) or the arguments (MCP)
+ * before releasing a request. The edit is merged into the ORIGINAL request (payloadPatch.ts),
+ * re-checked against the rule, recorded (redacted original + redacted modified) in the audit log,
+ * and forwarded with a freshly computed Content-Length.
  */
 
 export type Decision = "APPROVE" | "REJECT" | "RETRY";
@@ -37,9 +45,15 @@ export interface RevokeOptions {
   reason: string | null;
 }
 
+/** Approver edits (APPROVE only). `body` = JSON body (HTTP) or tool arguments (MCP). */
+export interface ApprovalEdits {
+  body?: unknown;
+  query?: unknown;
+}
+
 export interface ApprovalService {
   expireStale(): Promise<void>;
-  decide(id: number, decision: Decision, actorName: string): Promise<ServiceResult>;
+  decide(id: number, decision: Decision, actorName: string, edits?: ApprovalEdits): Promise<ServiceResult>;
   revoke(id: number, options: RevokeOptions, actorName: string): Promise<ServiceResult>;
 }
 
@@ -61,12 +75,38 @@ function queryFromPath(path: string): Record<string, string | string[]> {
   return out;
 }
 
+function parseOrUndefined(text: string | null): unknown {
+  if (text === null) return undefined;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+interface OriginalRequest {
+  path: string;
+  body: string | null;
+  usedRedactedCopy: boolean;
+}
+
+/** The request that will actually run, plus what to record about the approver's edits. */
+interface Prepared extends OriginalRequest {
+  edited: boolean;
+  /** Redacted JSON for the audit row / pending_actions. */
+  originalPayload: string | null;
+  modifiedPayload: string | null;
+  modifiedBody: string | null;
+  modifiedQuery: string | null;
+  changes: string[];
+}
+
 export function createApprovalService(ctx: GatewayContext): ApprovalService {
   const { db } = ctx;
 
   async function expireStale(): Promise<void> {
     await db.run(
-      `UPDATE pending_actions SET status = 'EXPIRED', encrypted_payload = NULL
+      `UPDATE pending_actions SET status = 'EXPIRED', encrypted_payload = NULL, patch_encrypted = NULL
        WHERE status IN ('PENDING', 'FAILED') AND expires_at IS NOT NULL AND expires_at <= ?`,
       [Date.now()]
     );
@@ -80,10 +120,18 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     }
   }
 
-  async function logDecision(row: PendingRow, status: "APPROVED" | "REJECTED" | "BLOCKED", actorName: string, detail: string | null): Promise<void> {
+  const wsIdOf = (row: PendingRow): number => row.workspace_id ?? DEFAULT_WORKSPACE_ID;
+
+  async function logDecision(
+    row: PendingRow,
+    status: "APPROVED" | "REJECTED" | "BLOCKED",
+    actorName: string,
+    detail: string | null,
+    payloads: { original: string | null; modified: string | null; amountBody?: unknown } = { original: null, modified: null }
+  ): Promise<void> {
     await db.run(
-      `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, original_payload, modified_payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         new Date().toISOString(),
         row.method,
@@ -95,27 +143,32 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
         row.caller_ip ?? null,
         detail,
         // A revocation (BLOCKED) is not money protected a second time.
-        status === "BLOCKED" ? null : extractAmount(bodyOf(row)),
+        status === "BLOCKED" ? null : extractAmount(payloads.amountBody !== undefined ? payloads.amountBody : bodyOf(row)),
+        wsIdOf(row),
+        payloads.original,
+        payloads.modified,
       ]
     );
+    ctx.ledger.kick();
   }
 
   /** Human-approved spend counts toward the rule's budget. Never fails the approval. */
-  async function recordApprovedSpend(row: PendingRow, originalBody: string | null): Promise<void> {
+  async function recordApprovedSpend(row: PendingRow, executedBody: string | null): Promise<void> {
     try {
+      const wsId = wsIdOf(row);
       const rulePath = normalizePath(row.path.split("?")[0]);
-      const entry = ctx.rules.lookupEntry(row.method, rulePath);
+      const entry = ctx.workspaces.lookupEntry(wsId, row.method, rulePath);
       if (!entry?.rule.budget) return;
-      const body = originalBody ? (JSON.parse(originalBody) as unknown) : null;
+      const body = executedBody ? (JSON.parse(executedBody) as unknown) : null;
       const callerId = row.agent_key_id !== null ? `key:${row.agent_key_id}` : `ip:${row.caller_ip ?? "unknown"}`;
-      await ctx.guards.recordApproved(entry.key, entry.rule, body, row.id, callerId);
-    } catch (err) {
-      console.error(`Could not record the approved spend for action ${row.id}:`, err);
+      await ctx.guards.recordApproved(scopedRuleKey(wsId, entry.key), entry.rule, body, row.id, callerId);
+    } catch (e) {
+      console.error(`Could not record the approved spend for action ${row.id}:`, e);
     }
   }
 
   /** Decrypts the stored original request. Rows queued before encryption existed only have the redacted copy. */
-  function original(row: PendingRow): { path: string; body: string | null; usedRedactedCopy: boolean } {
+  function original(row: PendingRow): OriginalRequest {
     if (row.encrypted_payload === null) return { path: row.path, body: row.body, usedRedactedCopy: true };
     const parsed = JSON.parse(decryptPayload(row.encrypted_payload, ctx.config.replayEncryptionKey())) as {
       path?: unknown;
@@ -125,12 +178,85 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     return { path: parsed.path, body: typeof parsed.body === "string" ? parsed.body : null, usedRedactedCopy: false };
   }
 
+  /** Applies the approver's edits (if any) to the original request. Throws PatchError on bad input. */
+  function prepare(row: PendingRow, orig: OriginalRequest, edits: ApprovalEdits | undefined): Prepared {
+    const base: Prepared = { ...orig, edited: false, originalPayload: null, modifiedPayload: null, modifiedBody: null, modifiedQuery: null, changes: [] };
+    if (!edits || (edits.body === undefined && edits.query === undefined)) return base;
+    const isMcp = row.kind === "mcp";
+    if (isMcp && edits.query !== undefined) throw new PatchError("MCP tool calls have no query string; edit the arguments (modifiedBody) instead.");
+
+    const shownBody = row.body === null ? null : parseOrUndefined(row.body);
+    let shownQuery: Record<string, unknown> = {};
+    try {
+      shownQuery = row.query_json ? (JSON.parse(row.query_json) as Record<string, unknown>) : {};
+    } catch {
+      shownQuery = {};
+    }
+
+    let body = orig.body;
+    let path = orig.path;
+    let newBody: unknown = shownBody;
+    let newQuery: Record<string, string | string[]> = shownQuery as Record<string, string | string[]>;
+    const changes: string[] = [];
+
+    if (edits.body !== undefined) {
+      assertJsonValue(edits.body);
+      if (isMcp && (typeof edits.body !== "object" || edits.body === null || Array.isArray(edits.body))) {
+        throw new PatchError("The edited tool arguments must be a JSON object.");
+      }
+      if (row.body !== null && shownBody === undefined) {
+        throw new PatchError("This request's body was too large (or not JSON) to show in full, so it cannot be edited. Approve or reject it as is.");
+      }
+      if (orig.usedRedactedCopy && row.body !== null && row.body.includes(REDACTED)) {
+        throw new PatchError("This request was queued before encrypted replay existed; edit is unavailable because its original values are gone.");
+      }
+      if (!NO_BODY_METHODS.includes(row.method) || isMcp) {
+        const originalParsed = parseOrUndefined(orig.body);
+        const merged = originalParsed === undefined ? edits.body : applyEdits(originalParsed, shownBody ?? null, edits.body);
+        body = JSON.stringify(merged);
+        if (Buffer.byteLength(body) > MAX_PENDING_BODY_BYTES) throw new PatchError(`The edited body must be at most ${MAX_PENDING_BODY_BYTES / 1024} KB.`);
+        newBody = edits.body;
+        describeChanges(shownBody ?? null, edits.body, isMcp ? "arguments" : "body", changes);
+      } else {
+        throw new PatchError(`${row.method} requests have no body to edit.`);
+      }
+    }
+    if (edits.query !== undefined) {
+      const editedQuery = validateQueryEdit(edits.query);
+      const merged = applyEdits(queryFromPath(orig.path), shownQuery, editedQuery) as Record<string, unknown>;
+      const clean: Record<string, string | string[]> = {};
+      for (const [k, v] of Object.entries(merged)) {
+        if (typeof v === "string" || (Array.isArray(v) && v.every((x) => typeof x === "string"))) clean[k] = v as string | string[];
+        else throw new PatchError(`Query parameter "${k}" must be a string or a list of strings.`);
+      }
+      path = withQuery(orig.path, clean);
+      newQuery = editedQuery;
+      describeChanges(shownQuery, editedQuery, "query", changes);
+    }
+    if (changes.length === 0) return base; // submitted unchanged: a plain approval
+
+    const r = ctx.redactor;
+    return {
+      path,
+      body,
+      usedRedactedCopy: orig.usedRedactedCopy,
+      edited: true,
+      originalPayload: JSON.stringify({ body: shownBody ?? null, query: shownQuery }),
+      modifiedPayload: JSON.stringify(r.json({ body: newBody ?? null, query: newQuery })),
+      modifiedBody: edits.body !== undefined ? r.jsonText(JSON.stringify(edits.body)) : null,
+      modifiedQuery: edits.query !== undefined ? JSON.stringify(r.json(newQuery)) : null,
+      changes: changes.map((c) => r.text(c)),
+    };
+  }
+
   /** Replays a claimed (EXECUTING) action and records the outcome. */
-  async function execute(row: PendingRow, req: { path: string; body: string | null; usedRedactedCopy: boolean }, actorName: string): Promise<ServiceResult> {
+  async function execute(row: PendingRow, req: Prepared, actorName: string): Promise<ServiceResult> {
     const id = row.id;
     const config = ctx.config.load();
-    const replayToSelf = config.targetUrl === "";
-    const baseUrl = replayToSelf ? `http://127.0.0.1:${ctx.port}` : config.targetUrl;
+    const ws = ctx.workspaces.get(wsIdOf(row));
+    const upstream = ws?.upstreamUrl ?? config.targetUrl;
+    const replayToSelf = upstream === "";
+    const baseUrl = replayToSelf ? `http://127.0.0.1:${ctx.port}` : upstream;
 
     const saved = parseJsonObject(row.headers);
     const replayHeaders: Record<string, string> = {};
@@ -139,8 +265,9 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     if (saved["user-agent"]) replayHeaders["user-agent"] = saved["user-agent"];
 
     const hasBody = req.body !== null && !NO_BODY_METHODS.includes(row.method);
-    if (hasBody && !replayHeaders["content-type"]) replayHeaders["content-type"] = "application/json";
+    if (hasBody && (!replayHeaders["content-type"] || req.edited)) replayHeaders["content-type"] = "application/json";
     if (replayToSelf) replayHeaders[REPLAY_HEADER] = ctx.replaySecret;
+    // Content-Length is computed by fetch from the (possibly edited) body; it is never copied.
 
     const warning =
       req.usedRedactedCopy && (row.body?.includes(REDACTED) || row.path.includes(encodeURIComponent(REDACTED)))
@@ -148,24 +275,25 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
         : undefined;
 
     try {
-      const upstream = await fetch(baseUrl + req.path, {
+      const upstreamRes = await fetch(baseUrl + req.path, {
         method: row.method,
         headers: replayHeaders,
         body: hasBody ? (req.body as string) : undefined,
         redirect: "manual",
         signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
       });
-      const text = (await readCapped(upstream)).toString("utf-8");
+      const text = (await readCapped(upstreamRes)).toString("utf-8");
       // The upstream reply is stored and shown to approvers: scrub it like everything else.
-      const preview = ctx.redactor.text(`${upstream.status} ${text.slice(0, 500)}`);
+      const preview = ctx.redactor.text(`${upstreamRes.status} ${text.slice(0, 500)}`);
 
       // Done: the secrets are no longer needed, so wipe them for good.
-      await db.run(
-        "UPDATE pending_actions SET status = 'APPROVED', response_preview = ?, encrypted_payload = NULL WHERE id = ?",
-        [preview, id]
-      );
-      await logDecision(row, "APPROVED", actorName, null);
-      if (upstream.status < 400) await recordApprovedSpend(row, req.body);
+      await db.run("UPDATE pending_actions SET status = 'APPROVED', response_preview = ?, encrypted_payload = NULL, patch_encrypted = NULL WHERE id = ?", [preview, id]);
+      await logDecision(row, "APPROVED", actorName, req.edited ? `edited by approver: ${req.changes.join("; ")}` : null, {
+        original: req.originalPayload,
+        modified: req.modifiedPayload,
+        amountBody: req.edited ? parseOrUndefined(req.body) ?? null : undefined,
+      });
+      if (upstreamRes.status < 400) await recordApprovedSpend(row, req.body);
       return {
         status: 200,
         body: {
@@ -173,8 +301,9 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
           id,
           status: "APPROVED",
           decided_by: actorName,
-          replayStatus: upstream.status,
+          replayStatus: upstreamRes.status,
           response_preview: preview,
+          ...(req.edited ? { edited: true, changes: req.changes } : {}),
           ...(warning ? { warning } : {}),
         },
       };
@@ -184,23 +313,27 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
       const timedOut = isTimeoutError(e);
       const reason = timedOut ? "the target did not respond in time" : "the target could not be reached";
       console.error("Replay failed:", e);
-      await db
-        .run("UPDATE pending_actions SET status = 'FAILED', response_preview = ? WHERE id = ?", [`Replay failed: ${reason}.`, id])
-        .catch(() => undefined);
-      return err(
-        timedOut ? 504 : 502,
-        timedOut ? "Gateway Timeout" : "Bad Gateway",
-        `Replay failed (${reason}). The action is marked FAILED; an admin can retry it.`,
-        { id, status: "FAILED" }
-      );
+      await db.run("UPDATE pending_actions SET status = 'FAILED', response_preview = ? WHERE id = ?", [`Replay failed: ${reason}.`, id]).catch(() => undefined);
+      return err(timedOut ? 504 : 502, timedOut ? "Gateway Timeout" : "Bad Gateway", `Replay failed (${reason}). The action is marked FAILED; an admin can retry it.`, {
+        id,
+        status: "FAILED",
+      });
     }
   }
 
-  async function decide(id: number, decision: Decision, actorName: string): Promise<ServiceResult> {
+  async function decide(id: number, decision: Decision, actorName: string, edits?: ApprovalEdits): Promise<ServiceResult> {
     await expireStale();
     const row = await db.get<PendingRow>("SELECT * FROM pending_actions WHERE id = ?", [id]);
     if (!row) return err(404, "Not Found", `No pending action with id ${id}.`);
     if (row.status === "EXPIRED") return err(410, "Gone", `Action ${id} expired before it was decided. The agent must send it again.`);
+    const wantsEdit = edits !== undefined && (edits.body !== undefined || edits.query !== undefined);
+    if (wantsEdit && decision !== "APPROVE") return err(400, "Bad Request", "Edits can only be sent with an APPROVE decision.");
+    if (wantsEdit && !ctx.license.current().features.payloadPatching) {
+      return err(402, "Payment Required", "Edit & Approve is a Mont Pro feature. Approve or reject the request as is, or activate a Pro / Agency key.", {
+        proRequired: true,
+        feature: "payloadPatching",
+      });
+    }
 
     // ---- Reject (a PENDING or FAILED action) ----
     if (decision === "REJECT") {
@@ -208,7 +341,7 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
         return err(409, "Conflict", `Action ${id} is ${row.status} and can no longer be rejected.`);
       }
       const result = await db.run(
-        "UPDATE pending_actions SET status = 'REJECTED', decided_by = ?, encrypted_payload = NULL WHERE id = ? AND status = ?",
+        "UPDATE pending_actions SET status = 'REJECTED', decided_by = ?, encrypted_payload = NULL, patch_encrypted = NULL WHERE id = ? AND status = ?",
         [actorName, id, row.status]
       );
       if (result.changes === 0) return err(409, "Conflict", `Action ${id} was already decided.`);
@@ -223,8 +356,9 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     }
 
     // ---- Approve (PENDING) or Retry (FAILED) ----
-    // Lockdown means nothing runs, including requests a human already looked at.
-    if (ctx.emergency.current().mode === "lockdown") {
+    // Lockdown (global or this client's) means nothing runs, including requests a human already looked at.
+    const ws = ctx.workspaces.get(wsIdOf(row));
+    if (effectiveMode(ctx, ws) === "lockdown") {
       return err(409, "Conflict", "The gateway is in emergency lockdown, so nothing can be executed. Resume normal mode first, or reject the request.");
     }
     const from = decision === "APPROVE" ? "PENDING" : "FAILED";
@@ -232,9 +366,7 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
       return err(
         409,
         "Conflict",
-        decision === "APPROVE"
-          ? `Action ${id} is ${row.status}; only PENDING actions can be approved.`
-          : `Action ${id} is ${row.status}; only FAILED actions can be retried.`
+        decision === "APPROVE" ? `Action ${id} is ${row.status}; only PENDING actions can be approved.` : `Action ${id} is ${row.status}; only FAILED actions can be retried.`
       );
     }
 
@@ -244,9 +376,9 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
       return err(409, "Conflict", `The caller of action ${id} has been blocked (${blocked.kind} ${blocked.label ?? blocked.value}). Reject it instead.`);
     }
 
-    let req: { path: string; body: string | null; usedRedactedCopy: boolean };
+    let orig: OriginalRequest;
     try {
-      req = original(row);
+      orig = original(row);
     } catch (e) {
       console.error(`Could not decrypt the stored request for action ${id}:`, e);
       await db
@@ -261,31 +393,35 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
       });
     }
 
+    let req: Prepared;
+    try {
+      req = prepare(row, orig, edits);
+    } catch (e) {
+      if (e instanceof PatchError) return err(400, "Bad Request", e.message);
+      throw e;
+    }
+
     // The rule (or its payload policies) may have changed while the request waited. Re-check it now
-    // against the ORIGINAL payload, so tightening a threshold also stops already-queued requests.
+    // against the payload that will actually run (the edited one, if edited), so tightening a
+    // threshold also stops already-queued requests, and an edit can never exceed a hard BLOCK tier.
     const rulePath = normalizePath(row.path.split("?")[0]);
-    const rule = ctx.rules.lookup(row.method, rulePath);
-    if (!rule) {
+    const entry = ctx.workspaces.lookupEntry(wsIdOf(row), row.method, rulePath);
+    if (!entry) {
       return err(409, "Conflict", `${row.method} ${rulePath} no longer has a rule (default deny), so this action cannot run. Reject it instead.`);
     }
-    let parsedBody: unknown = undefined;
-    if (req.body !== null) {
-      try {
-        parsedBody = JSON.parse(req.body);
-      } catch {
-        parsedBody = undefined;
-      }
-    }
-    const verdict = evaluateRule(rule, {
+    const parsedBody = req.body !== null ? parseOrUndefined(req.body) : undefined;
+    const verdict = evaluateRule(entry.rule, {
       body: parsedBody,
-      query: queryFromPath(req.path),
-      headers: parseJsonObject(row.headers),
+      query: row.kind === "mcp" ? {} : queryFromPath(req.path),
+      headers: row.kind === "mcp" ? {} : parseJsonObject(row.headers),
     });
     if (verdict.mode === "BLOCK") {
       return err(
         409,
         "Conflict",
-        `The rule for ${row.method} ${rulePath} now BLOCKs this request (${verdict.matched}), so it cannot run. Reject it instead.`
+        req.edited
+          ? `The edited request is BLOCKED by the rule for ${row.method} ${rulePath} (${verdict.matched}). Change the edit, or reject it.`
+          : `The rule for ${row.method} ${rulePath} now BLOCKs this request (${verdict.matched}), so it cannot run. Reject it instead.`
       );
     }
 
@@ -294,10 +430,13 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     const localWaiter = row.kind === "mcp" ? ctx.mcpWaiters.get(id) : undefined;
     const reserved = localWaiter ? localWaiter.reserve() : false;
 
+    // MCP calls held by another process need the edit too: it travels encrypted with the claim.
+    const patchEncrypted =
+      row.kind === "mcp" && req.edited ? encryptPayload(JSON.stringify({ arguments: parsedBody }), ctx.config.replayEncryptionKey()) : null;
     const claim = await db.run(
-      `UPDATE pending_actions SET status = 'EXECUTING', decided_by = ?
+      `UPDATE pending_actions SET status = 'EXECUTING', decided_by = ?, modified_body = ?, modified_query = ?, patch_encrypted = ?
        WHERE id = ? AND status = ? AND (expires_at IS NULL OR expires_at > ?)`,
-      [actorName, id, from, Date.now()]
+      [actorName, req.modifiedBody, req.modifiedQuery, patchEncrypted, id, from, Date.now()]
     );
     if (claim.changes === 0) {
       if (reserved) localWaiter?.unreserve();
@@ -305,7 +444,7 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     }
 
     if (row.kind === "mcp") {
-      const result = await releaseMcp(row, actorName, reserved ? localWaiter : undefined);
+      const result = await releaseMcp(row, actorName, reserved ? localWaiter : undefined, req, parsedBody);
       // In-process success, or released to the owning process (which will execute it).
       if (result.status === 200 || result.status === 202) await recordApprovedSpend(row, req.body);
       return result;
@@ -313,13 +452,15 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     return execute(row, req, actorName);
   }
 
-  /** APPROVE for a held MCP tool call: the waiting transport runs the original call now. */
-  async function releaseMcp(row: PendingRow, actorName: string, waiter: McpWaiter | undefined): Promise<ServiceResult> {
+  /** APPROVE for a held MCP tool call: the waiting transport runs the call (with the approver's edits) now. */
+  async function releaseMcp(row: PendingRow, actorName: string, waiter: McpWaiter | undefined, req: Prepared, args: unknown): Promise<ServiceResult> {
     const id = row.id;
+    const payloads = { original: req.originalPayload, modified: req.modifiedPayload, amountBody: req.edited ? (args ?? null) : undefined };
+    const editNote = req.edited ? `; edited by approver: ${req.changes.join("; ")}` : "";
     if (!waiter && row.owner && row.owner !== ctx.instanceId && ownerAlive(row.owner)) {
       // Another gateway process (e.g. a stdio MCP proxy) holds this call. The row is now
       // EXECUTING; that process sees it on its next poll, runs the call and records the result.
-      await logDecision(row, "APPROVED", actorName, "mcp tool call released to its owning process");
+      await logDecision(row, "APPROVED", actorName, `mcp tool call released to its owning process${editNote}`, payloads);
       return {
         status: 202,
         body: {
@@ -328,50 +469,60 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
           status: "EXECUTING",
           decided_by: actorName,
           message: "Approved. The gateway process holding this tool call is executing it now.",
+          ...(req.edited ? { edited: true, changes: req.changes } : {}),
         },
       };
     }
     if (!waiter) {
-      await db.run(
-        "UPDATE pending_actions SET status = 'EXPIRED', encrypted_payload = NULL, response_preview = ? WHERE id = ?",
-        ["Expired: the agent stopped waiting before the approval, so the tool call was not executed.", id]
-      );
+      await db.run("UPDATE pending_actions SET status = 'EXPIRED', encrypted_payload = NULL, patch_encrypted = NULL, response_preview = ? WHERE id = ?", [
+        "Expired: the agent stopped waiting before the approval, so the tool call was not executed.",
+        id,
+      ]);
       return err(410, "Gone", `The agent is no longer waiting for action ${id}, so it was not executed. It must call the tool again.`);
     }
-    const out = await waiter.onDecision("APPROVE");
+    const out = await waiter.onDecision("APPROVE", req.edited ? { arguments: args } : undefined);
     const preview = ctx.redactor.text(out.preview).slice(0, 500);
-    await db.run(
-      "UPDATE pending_actions SET status = ?, response_preview = ?, encrypted_payload = NULL WHERE id = ?",
-      [out.ok ? "APPROVED" : "FAILED", preview, id]
-    );
-    await logDecision(row, "APPROVED", actorName, out.ok ? "mcp tool call executed" : "mcp tool call failed");
+    await db.run("UPDATE pending_actions SET status = ?, response_preview = ?, encrypted_payload = NULL, patch_encrypted = NULL WHERE id = ?", [
+      out.ok ? "APPROVED" : "FAILED",
+      preview,
+      id,
+    ]);
+    await logDecision(row, "APPROVED", actorName, `${out.ok ? "mcp tool call executed" : "mcp tool call failed"}${editNote}`, payloads);
     if (!out.ok) return err(502, "Bad Gateway", `The tool call was approved but failed: ${preview}`, { id, status: "FAILED" });
-    return { status: 200, body: { success: true, id, status: "APPROVED", decided_by: actorName, response_preview: preview } };
+    return {
+      status: 200,
+      body: { success: true, id, status: "APPROVED", decided_by: actorName, response_preview: preview, ...(req.edited ? { edited: true, changes: req.changes } : {}) },
+    };
   }
 
   async function fireRollback(row: PendingRow, actorName: string, reason: string | null, revokedAt: string): Promise<string> {
     const { url, secret } = ctx.settings.get().rollback;
     if (!url) return "NOT_CONFIGURED";
+    if (!ctx.license.current().features.rollbackWebhooks) return "SKIPPED (compensating rollback webhooks need Mont Pro)";
     let body: unknown = null;
     try {
-      body = row.body ? JSON.parse(row.body) : null;
+      body = row.modified_body ? JSON.parse(row.modified_body) : row.body ? JSON.parse(row.body) : null;
     } catch {
       body = row.body;
     }
     let query: unknown = {};
     try {
-      query = row.query_json ? JSON.parse(row.query_json) : {};
+      query = row.modified_query ? JSON.parse(row.modified_query) : row.query_json ? JSON.parse(row.query_json) : {};
     } catch {
       query = {};
     }
+    const ws = ctx.workspaces.get(wsIdOf(row));
     const payload = JSON.stringify({
       event: "approval.revoked",
       originalRequestId: row.id,
+      workspace: ws ? { id: ws.id, slug: ws.slug, name: ws.name } : null,
       method: row.method,
       path: row.path,
-      // The redacted copy: the unredacted original was wiped when the action was decided.
+      // The redacted copy of what actually ran (the approver's edit, if any): the unredacted
+      // original was wiped when the action was decided.
       body,
       query,
+      editedByApprover: row.modified_body !== null || row.modified_query !== null,
       caller: { ip: row.caller_ip, userAgent: row.caller_ua, agentKey: row.agent_key, agentKeyPrefix: row.agent_key_prefix },
       agentReason: row.agent_reason,
       approvedBy: row.decided_by,
@@ -429,10 +580,7 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     });
 
     const revokedAt = new Date().toISOString();
-    const claim = await db.run(
-      "UPDATE pending_actions SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at IS NULL",
-      [revokedAt, actorName, id]
-    );
+    const claim = await db.run("UPDATE pending_actions SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at IS NULL", [revokedAt, actorName, id]);
     if (claim.changes === 0) return err(409, "Conflict", `Action ${id} was revoked concurrently.`);
 
     // (b) Auto-reject everything this caller still has waiting.
@@ -447,7 +595,7 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     const autoRejected: number[] = [];
     for (const w of waiting) {
       const r = await db.run(
-        "UPDATE pending_actions SET status = 'REJECTED', decided_by = ?, encrypted_payload = NULL WHERE id = ? AND status = ?",
+        "UPDATE pending_actions SET status = 'REJECTED', decided_by = ?, encrypted_payload = NULL, patch_encrypted = NULL WHERE id = ? AND status = ?",
         [`auto:caller-blocked-by:${actorName}`, w.id, w.status]
       );
       if (r.changes > 0) {
@@ -457,7 +605,7 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
       }
     }
 
-    // (c) Compensating rollback webhook.
+    // (c) Compensating rollback webhook (Pro).
     const rollbackStatus = options.fireRollback ? await fireRollback(row, actorName, options.reason, revokedAt) : "SKIPPED";
     await db.run("UPDATE pending_actions SET rollback_status = ? WHERE id = ?", [rollbackStatus, id]);
     await logDecision(

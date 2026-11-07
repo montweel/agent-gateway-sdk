@@ -6,6 +6,8 @@ import { parseTargetUrl, sendError, sendInternalError } from "../utils";
 import { POLICY_PRESETS, applyPreset, findPreset } from "../presets";
 import { HHMM, isValidTimeZone } from "../settingsStore";
 import { isWithinBusinessHours } from "../operatingMode";
+import { validateResponseGuard } from "../responseGuard";
+import { requireWorkspace } from "./scope";
 
 /**
  * No-Code Setup wizard API.
@@ -104,7 +106,7 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
   });
 
   /** Body: { mode: "merge" | "replace" }. merge keeps your other rules; pack rules win on the same key. */
-  router.post("/setup/presets/:id/apply", (req: AuthenticatedRequest, res: Response) => {
+  router.post("/setup/presets/:id/apply", async (req: AuthenticatedRequest, res: Response) => {
     if (req.user?.role !== "admin") {
       sendError(res, 403, "Forbidden", "Only administrators can install policy packs.");
       return;
@@ -119,12 +121,15 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
       sendError(res, 400, "Bad Request", 'mode must be "merge" or "replace".');
       return;
     }
+    // Installed into the workspace selected in the dashboard (default = rules.json).
+    const ws = requireWorkspace(ctx, req, res);
+    if (!ws) return;
     try {
-      const result = applyPreset(ctx.rules.load(), preset, mode);
-      ctx.rules.save(result.rules);
-      res.json({ success: true, preset: preset.id, mode, added: result.added, replaced: result.replaced, rules: result.rules });
+      const result = applyPreset(ctx.workspaces.rules(ws.id), preset, mode);
+      await ctx.workspaces.saveRules(ws.id, result.rules);
+      res.json({ success: true, preset: preset.id, mode, workspace: ws.slug, added: result.added, replaced: result.replaced, rules: result.rules });
     } catch (err) {
-      sendInternalError(res, "Failed to apply policy pack", err, "Could not write rules.json.");
+      sendInternalError(res, "Failed to apply policy pack", err, "Could not save the rules.");
     }
   });
 
@@ -169,6 +174,7 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
       timezone?: unknown;
       schedule?: { enabled?: unknown; days?: unknown; start?: unknown; end?: unknown };
       alerts?: { enabled?: unknown; burstThreshold?: unknown; burstWindowMinutes?: unknown; digestHour?: unknown };
+      responseGuard?: unknown;
     };
 
     const cfg = configStore.load();
@@ -367,6 +373,12 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
       }
     }
 
+    if (input.responseGuard !== undefined) {
+      const rg = validateResponseGuard(input.responseGuard, next.responseGuard);
+      if (!rg.ok) return fail(rg.message);
+      next.responseGuard = rg.value;
+    }
+
     // Receivers should always be able to verify what the gateway sends them.
     if (next.notifications.webhook.enabled && next.notifications.webhook.url && !next.notifications.webhook.secret) {
       next.notifications.webhook.secret = randomHex(24);
@@ -393,6 +405,18 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
     }
     if ((tgs.enabled && !tgs.approverIds) || (sl.enabled && sl.mode === "socket" && !sl.approverIds)) {
       warnings.push("No approver ids are set, so anyone in the chat / channel can approve. Add your user id to restrict it.");
+    }
+    const features = ctx.license.current().features;
+    if (!features.interactiveApprovals && ((tgs.enabled && tgs.mode === "polling") || (sl.enabled && sl.mode === "socket"))) {
+      warnings.push(
+        "Zero-tunnel Telegram polling / Slack Socket Mode buttons need a Mont Pro or Agency license. Notifications are still sent; approve in the dashboard (or via signed links when a Public URL is set)."
+      );
+    }
+    if (next.rollback.url && !features.rollbackWebhooks) {
+      warnings.push("Compensating rollback webhooks are a Mont Pro feature: the URL is saved but will not be called until a license is active.");
+    }
+    if (next.responseGuard.enabled && next.responseGuard.onLargeArray === "block") {
+      warnings.push(`Responses with any JSON array longer than ${next.responseGuard.maxArrayItems} items will now be withheld (502). Raise the limit if a legitimate endpoint returns long lists.`);
     }
     if (next.publicBaseUrl.startsWith("http://") && !/^http:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(next.publicBaseUrl)) {
       warnings.push("The Public URL uses plain http://. Approval links should travel over https://.");

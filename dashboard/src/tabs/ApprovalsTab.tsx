@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react'
 import axios from 'axios'
-import { AlertCircle, Bot, Check, MessageSquareQuote, PencilLine, ShieldOff, X } from 'lucide-react'
+import { AlertCircle, Bot, Check, MessageSquareQuote, PencilLine, Search, ShieldOff, X } from 'lucide-react'
 import { api, errorMessage } from '../lib/api'
+import { APPROVALS_PAGE } from '../hooks/useApprovals'
 import type { ApprovalsApi } from '../hooks/useApprovals'
 import type { Approval, Decision, DecideResponse, RevokeResponse } from '../lib/types'
 import { formatTime, INPUT_CLASS, prettyJson, READ_ONLY_HINT } from '../lib/utils'
@@ -85,8 +86,18 @@ function parseDraft(text: string, label: string, mustBeObject: boolean): { ok: t
 }
 
 export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: ApprovalsApi; readOnly: boolean }) {
-  const { approvals, loading, error, reload } = approvalsApi
-  const [filter, setFilter] = useState<'ALL' | 'PENDING'>('ALL')
+  const { approvals, counts, query, setQuery, loading, error, reload } = approvalsApi
+  const filter = query.status
+  // The ID box keeps what was typed (e.g. "#73"); the query holds the parsed number.
+  const [idText, setIdText] = useState(query.id !== null ? String(query.id) : '')
+  const idInvalid = idText.trim() !== '' && !/^#?\d+$/.test(idText.trim())
+
+  function onIdChange(text: string) {
+    setIdText(text)
+    const digits = text.trim().replace(/^#/, '')
+    if (digits === '') setQuery({ id: null })
+    else if (/^\d+$/.test(digits) && Number(digits) > 0) setQuery({ id: Number(digits) })
+  }
   const [deciding, setDeciding] = useState<Record<number, Decision | undefined>>({})
   const [cardErrors, setCardErrors] = useState<Record<number, string | undefined>>({})
   const [notice, setNotice] = useState<string | null>(null)
@@ -113,8 +124,10 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
     if (ok) setEdits((prev) => ({ ...prev, [a.id]: undefined }))
   }
 
-  const pendingCount = useMemo(() => approvals.filter((a) => a.status === 'PENDING').length, [approvals])
-  const visible = filter === 'PENDING' ? approvals.filter((a) => a.status === 'PENDING') : approvals
+  // The server already applied the status / id filter; this only guards a poll that raced a chip change.
+  const visible = useMemo(() => (filter === 'PENDING' ? approvals.filter((a) => a.status === 'PENDING') : approvals), [approvals, filter])
+  const matching = query.id !== null ? visible.length : filter === 'PENDING' ? counts.pending : counts.total
+  const truncated = query.id === null && visible.length < matching && visible.length >= query.limit
 
   async function decide(id: number, decision: Decision, edit?: { modifiedBody?: unknown; modifiedQuery?: unknown }): Promise<boolean> {
     if (readOnly) return false
@@ -169,25 +182,52 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
       {error && <ErrorBanner message={error} />}
       {notice && <SuccessBanner message={notice} onDismiss={() => setNotice(null)} />}
 
-      <div className="mb-4 flex gap-2">
-        {(
-          [
-            { id: 'ALL', label: `All (${approvals.length})` },
-            { id: 'PENDING', label: `Pending (${pendingCount})` },
-          ] as const
-        ).map((chip) => (
-          <button
-            key={chip.id}
-            onClick={() => setFilter(chip.id)}
-            aria-pressed={filter === chip.id}
-            className={`rounded-full px-3.5 py-1.5 text-sm font-medium transition ${
-              filter === chip.id ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 ring-1 ring-inset ring-slate-200 hover:bg-slate-50'
-            }`}
-          >
-            {chip.label}
-          </button>
-        ))}
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex gap-2">
+          {(
+            [
+              { id: 'ALL', label: `All (${counts.total.toLocaleString()})` },
+              { id: 'PENDING', label: `Pending (${counts.pending.toLocaleString()})` },
+            ] as const
+          ).map((chip) => (
+            <button
+              key={chip.id}
+              onClick={() => setQuery({ status: chip.id })}
+              aria-pressed={filter === chip.id}
+              className={`rounded-full px-3.5 py-1.5 text-sm font-medium transition ${
+                filter === chip.id ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 ring-1 ring-inset ring-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              {chip.label}
+            </button>
+          ))}
+        </div>
+        <label className="relative block w-full sm:w-56">
+          <span className="sr-only">Find a request by ID</span>
+          <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" aria-hidden="true" />
+          <input
+            type="text"
+            inputMode="numeric"
+            value={idText}
+            onChange={(e) => onIdChange(e.target.value)}
+            placeholder="Request ID, e.g. 736"
+            aria-invalid={idInvalid}
+            title="The #number shown in Telegram / Slack alerts"
+            className={`${INPUT_CLASS} pl-9 pr-8 font-mono ${idInvalid ? 'border-red-400' : ''}`}
+          />
+          {idText && (
+            <button
+              type="button"
+              onClick={() => onIdChange('')}
+              aria-label="Clear ID search"
+              className="absolute right-2 top-2 rounded p-0.5 text-slate-400 hover:text-slate-700"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          )}
+        </label>
       </div>
+      {idInvalid && <p className="-mt-2 mb-3 text-xs text-red-600">Enter a number, e.g. 736 or #736.</p>}
 
       {loading ? (
         <div className="space-y-4">
@@ -200,7 +240,11 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
         </div>
       ) : visible.length === 0 ? (
         <div className="rounded-xl border border-slate-200 bg-white px-6 py-16 text-center text-sm text-slate-500 shadow-sm">
-          {filter === 'PENDING' ? 'Nothing is waiting for approval.' : 'No requests have been queued yet.'}
+          {query.id !== null
+            ? `No request #${query.id}${filter === 'PENDING' ? ' is pending' : ''} in this workspace.`
+            : filter === 'PENDING'
+              ? 'Nothing is waiting for approval.'
+              : 'No requests have been queued yet.'}
         </div>
       ) : (
         <div className="space-y-4">
@@ -251,7 +295,7 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
                   <div className="mt-4 flex gap-2 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2.5 text-sm text-indigo-900">
                     <MessageSquareQuote className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
                     <div>
-                      <p className="text-xs font-semibold uppercase tracking-wider text-indigo-700">Agent's stated reason (x-agent-reason)</p>
+                      <p className="text-xs font-semibold uppercase tracking-wider text-indigo-700">Agent's Justification</p>
                       <p className="mt-0.5 whitespace-pre-wrap break-words">{a.agent_reason}</p>
                     </div>
                   </div>
@@ -442,6 +486,22 @@ export function ApprovalsTab({ approvalsApi, readOnly }: { approvalsApi: Approva
               </div>
             )
           })}
+          {truncated && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-dashed border-slate-300 bg-white px-5 py-3 text-sm text-slate-600">
+              <span>
+                Showing the newest {visible.length.toLocaleString()} of {matching.toLocaleString()}. Search by ID above to jump to a specific request.
+              </span>
+              {query.limit < 500 && (
+                <button
+                  type="button"
+                  onClick={() => setQuery({ limit: Math.min(query.limit + APPROVALS_PAGE, 500) })}
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+                >
+                  Show {Math.min(APPROVALS_PAGE, 500 - query.limit, matching - visible.length)} more
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
 

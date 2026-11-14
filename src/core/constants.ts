@@ -49,11 +49,15 @@ export const MAX_LOG_UA_LENGTH = 256;
 // v1.1: fail-closed, approvals, notifications
 export const DB_OPERATION_TIMEOUT_MS = 4_000; // a hung/locked SQLite op fails the request closed after this
 export const AGENT_REASON_HEADER = "x-agent-reason";
+/** Preferred header for the agent's justification of a held action (shown above Approve / Reject). */
+export const JUSTIFICATION_HEADER = "x-mont-justification";
 export const MAX_AGENT_REASON_LENGTH = 1_000;
 export const APPROVAL_CALLBACK_PREFIX = "/_mont/approvals";
 export const NOTIFY_TIMEOUT_MS = 5_000;
 export const ROLLBACK_TIMEOUT_MS = 10_000;
 export const MAX_NOTIFY_PAYLOAD_CHARS = 2_500;
+/** Agent's justification in a chat notification (Telegram caps a message at 4096 chars). */
+export const MAX_NOTIFY_JUSTIFICATION_CHARS = 600;
 export const CALLBACK_MAX_FAILURES = 20; // bad signatures per IP per 15 minutes before lockout
 
 export const DEFAULT_CONFIG: GatewayConfig = {
@@ -64,7 +68,22 @@ export const DEFAULT_CONFIG: GatewayConfig = {
   ssoSharedSecret: "",
   ssoUserHeader: "x-forwarded-user",
   ssoRoleHeader: "x-forwarded-role",
+  audit: {
+    capturePayloads: true,
+    redactKeys: ["password", "token", "authorization", "credit_card", "ssn", "secret", "key"],
+  },
 };
+
+// ---- Compliance audit trail (payload capture + attribution) ----
+// The end user is read from the configured SSO user header (ssoUserHeader, default x-forwarded-user).
+export const MAX_END_USER_LENGTH = 256;
+/** Largest response body kept per audit row; bigger bodies are cut and marked truncated. */
+export const MAX_RESPONSE_CAPTURE_BYTES = 64 * 1024;
+/**
+ * How long the ledger waits for an in-flight request's response before sealing its row without
+ * one. Longer than the upstream timeout, so a proxied response always lands in time.
+ */
+export const RESPONSE_CAPTURE_GRACE_MS = UPSTREAM_TIMEOUT_MS + 15_000;
 
 export const NO_BODY_METHODS = ["GET", "HEAD"];
 export const USERNAME_REGEX = /^[a-zA-Z0-9._@-]{2,64}$/;
@@ -117,6 +136,7 @@ export const NEVER_FORWARD = new Set([
   SETUP_TOKEN_HEADER,
   AGENT_KEY_HEADER,
   WORKSPACE_HEADER,
+  JUSTIFICATION_HEADER, // gateway-internal: shown to the approver, not the upstream
   // Identity headers set by an SSO proxy. They must never reach the upstream
   // where they could be mistaken for a verified identity.
   "x-forwarded-user",

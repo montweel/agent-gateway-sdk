@@ -17,19 +17,57 @@ function parseId(raw: unknown): number | null {
 export function registerApprovalRoutes(router: Router, ctx: GatewayContext): void {
   const { db, approvals, blocklist } = ctx;
 
+  // True totals for the sidebar badge and the filter chips: the list below is capped, the counts are not.
+  router.get("/approvals/counts", async (req: AuthenticatedRequest, res: Response) => {
+    const scoped = readScope(ctx, req, res);
+    if (scoped === undefined) return;
+    try {
+      await approvals.expireStale();
+      const wf = workspaceFilter(scoped?.id ?? null);
+      const row = await db.get<{ total: number; pending: number }>(
+        `SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0) AS pending
+         FROM pending_actions WHERE 1=1${wf.sql}`,
+        wf.params
+      );
+      res.json({ total: row?.total ?? 0, pending: row?.pending ?? 0 });
+    } catch (err) {
+      sendInternalError(res, "Approvals count error", err, "Could not count approvals.");
+    }
+  });
+
+  /**
+   * Newest first. Optional filters:
+   *   ?status=PENDING   one status
+   *   ?id=736           one action (the #id shown in Telegram / Slack / the dashboard)
+   *   ?limit=100        1..500 (default 100)
+   */
   router.get("/approvals", async (req: AuthenticatedRequest, res: Response) => {
     const scoped = readScope(ctx, req, res);
     if (scoped === undefined) return;
     try {
       await approvals.expireStale();
       const wf = workspaceFilter(scoped?.id ?? null);
+      let where = `1=1${wf.sql}`;
+      const params: unknown[] = [...wf.params];
+      const status = typeof req.query.status === "string" ? req.query.status.trim().toUpperCase() : "";
+      if (status) {
+        where += " AND status = ?";
+        params.push(status);
+      }
+      const rawId = typeof req.query.id === "string" ? req.query.id.trim().replace(/^#/, "") : "";
+      if (rawId) {
+        where += " AND id = ?";
+        params.push(parseId(rawId) ?? -1); // a malformed id matches nothing
+      }
+      const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 100, 1), 500);
+      params.push(limit);
       // Explicit columns: encrypted_payload / patch_encrypted must never leave the server.
       const rows = await db.all<PendingRow>(
         `SELECT id, timestamp, method, path, headers, body, status, response_preview, decided_by, expires_at, agent_key,
                 query_json, caller_ip, caller_ua, agent_key_id, agent_key_prefix, agent_reason, matched_policy,
                 revoked_at, revoked_by, rollback_status, kind, workspace_id, modified_body, modified_query
-         FROM pending_actions WHERE 1=1${wf.sql} ORDER BY id DESC LIMIT 100`,
-        wf.params
+         FROM pending_actions WHERE ${where} ORDER BY id DESC LIMIT ?`,
+        params
       );
       const withWorkspace = rows.map((r) => {
         const ws = ctx.workspaces.get(r.workspace_id ?? 1);

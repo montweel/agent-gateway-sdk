@@ -80,7 +80,7 @@ export function LedgerVerifyBadge() {
         className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-slate-900 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-700 disabled:opacity-60"
       >
         {busy ? <Spinner /> : <Fingerprint className="h-4 w-4" aria-hidden="true" />}
-        Verify Ledger Integrity
+        Verify Audit Ledger
       </button>
     </div>
   )

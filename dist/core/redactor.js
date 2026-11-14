@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.REDACTED_SECRET = exports.REDACTED_CARD = exports.REDACTED = void 0;
+exports.normalizeRedactKey = exports.REDACTED_SECRET = exports.REDACTED_CARD = exports.REDACTED = void 0;
 exports.luhnValid = luhnValid;
 exports.looksLikeCard = looksLikeCard;
 exports.scrubSecrets = scrubSecrets;
@@ -120,6 +120,9 @@ function isSecretKey(key) {
     const k = normKey(key);
     return SECRET_KEY_EXACT.has(k) || SECRET_KEY_SUBSTRINGS.some((s) => k.includes(s));
 }
+/** The form a configured redact key is compared in (config.json audit.redactKeys). */
+exports.normalizeRedactKey = normKey;
+const NO_EXTRA_KEYS = new Set();
 function isEmailKey(key) {
     return EMAIL_KEY.test(normKey(key));
 }
@@ -131,7 +134,12 @@ function maskPhone(value) {
     const digits = value.replace(/\D/g, "");
     return digits.length >= 4 ? `[REDACTED:phone ••${digits.slice(-2)}]` : "[REDACTED:phone]";
 }
-function createRedactor(options) {
+/**
+ * `extraKeys` returns the configured redact keys, already normalised (normalizeRedactKey). They are
+ * matched against whole keys, in addition to the built-in list. Read once per json() / jsonText() call.
+ */
+function createRedactor(options, extraKeys = () => NO_EXTRA_KEYS) {
+    const secretKey = (key, extra) => isSecretKey(key) || (extra.size > 0 && extra.has(normKey(key)));
     function text(value) {
         const opts = options();
         let out = value;
@@ -146,10 +154,10 @@ function createRedactor(options) {
             out = out.replace(PHONE_VALUE, (m) => maskPhone(m));
         return out;
     }
-    function scalar(value, key) {
+    function scalar(value, key, extra) {
         const opts = options();
         if (key !== null) {
-            if (isSecretKey(key))
+            if (secretKey(key, extra))
                 return value === null || value === "" ? value : exports.REDACTED;
             if (opts.redactPhones && isPhoneKey(key) && (typeof value === "string" || typeof value === "number")) {
                 return maskPhone(String(value));
@@ -165,25 +173,26 @@ function createRedactor(options) {
             return exports.REDACTED_CARD;
         return value;
     }
-    function walk(value, key, depth) {
+    function walk(value, key, depth, extra) {
         if (depth > MAX_DEPTH)
             return exports.REDACTED;
         if (Array.isArray(value)) {
-            if (key !== null && isSecretKey(key))
+            if (key !== null && secretKey(key, extra))
                 return exports.REDACTED;
-            return value.map((v) => walk(v, key, depth + 1));
+            return value.map((v) => walk(v, key, depth + 1, extra));
         }
         if (typeof value === "object" && value !== null) {
-            if (key !== null && isSecretKey(key))
+            if (key !== null && secretKey(key, extra))
                 return exports.REDACTED;
             const out = {};
             for (const [k, v] of Object.entries(value))
-                out[k] = walk(v, k, depth + 1);
+                out[k] = walk(v, k, depth + 1, extra);
             return out;
         }
-        return scalar(value, key);
+        return scalar(value, key, extra);
     }
     function headers(h) {
+        const extra = extraKeys();
         const out = {};
         for (const [rawKey, v] of Object.entries(h)) {
             if (v === undefined)
@@ -192,19 +201,21 @@ function createRedactor(options) {
             if (DROPPED_HEADERS.has(k))
                 continue;
             const value = Array.isArray(v) ? v.join(", ") : v;
-            out[k] = SECRET_HEADERS.has(k) || isSecretKey(k) ? exports.REDACTED : text(value);
+            out[k] = SECRET_HEADERS.has(k) || secretKey(k, extra) ? exports.REDACTED : text(value);
         }
         return out;
     }
     function jsonText(t) {
         if (t === null)
             return null;
+        let parsed;
         try {
-            return JSON.stringify(walk(JSON.parse(t), null, 0));
+            parsed = JSON.parse(t);
         }
         catch {
             return text(t);
         }
+        return JSON.stringify(walk(parsed, null, 0, extraKeys()));
     }
-    return { json: (v) => walk(v, null, 0), text, headers, jsonText };
+    return { json: (v) => walk(v, null, 0, extraKeys()), text, headers, jsonText };
 }

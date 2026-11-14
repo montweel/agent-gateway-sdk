@@ -11,6 +11,7 @@
  *     X-Agent-Key, X-Admin-Token, CSRF / AWS session tokens, gateway-internal headers
  *   - JSON keys containing password, secret, token, api key, authorization, cookie, cvv/cvc,
  *     card number, private/access key, session id; keys equal to pin, ssn, pan
+ *   - keys equal to any entry of config.json audit.redactKeys (case / "_" / "-" / "." insensitive)
  *   - card numbers anywhere in strings or numbers (13-19 digits, Luhn-valid)
  *   - well-known credential formats in any string: Bearer tokens, JWTs, Stripe sk_/rk_ keys,
  *     GitHub ghp_/gho_/... tokens, Slack xox?-/xapp- tokens, AWS AKIA keys, Telegram bot tokens,
@@ -145,6 +146,11 @@ export function isSecretKey(key: string): boolean {
   return SECRET_KEY_EXACT.has(k) || SECRET_KEY_SUBSTRINGS.some((s) => k.includes(s));
 }
 
+/** The form a configured redact key is compared in (config.json audit.redactKeys). */
+export const normalizeRedactKey = normKey;
+
+const NO_EXTRA_KEYS: ReadonlySet<string> = new Set();
+
 function isEmailKey(key: string): boolean {
   return EMAIL_KEY.test(normKey(key));
 }
@@ -170,7 +176,13 @@ export interface Redactor {
   jsonText(text: string | null): string | null;
 }
 
-export function createRedactor(options: () => PrivacySettings): Redactor {
+/**
+ * `extraKeys` returns the configured redact keys, already normalised (normalizeRedactKey). They are
+ * matched against whole keys, in addition to the built-in list. Read once per json() / jsonText() call.
+ */
+export function createRedactor(options: () => PrivacySettings, extraKeys: () => ReadonlySet<string> = () => NO_EXTRA_KEYS): Redactor {
+  const secretKey = (key: string, extra: ReadonlySet<string>): boolean => isSecretKey(key) || (extra.size > 0 && extra.has(normKey(key)));
+
   function text(value: string): string {
     const opts = options();
     let out = value;
@@ -184,10 +196,10 @@ export function createRedactor(options: () => PrivacySettings): Redactor {
     return out;
   }
 
-  function scalar(value: unknown, key: string | null): unknown {
+  function scalar(value: unknown, key: string | null, extra: ReadonlySet<string>): unknown {
     const opts = options();
     if (key !== null) {
-      if (isSecretKey(key)) return value === null || value === "" ? value : REDACTED;
+      if (secretKey(key, extra)) return value === null || value === "" ? value : REDACTED;
       if (opts.redactPhones && isPhoneKey(key) && (typeof value === "string" || typeof value === "number")) {
         return maskPhone(String(value));
       }
@@ -201,41 +213,44 @@ export function createRedactor(options: () => PrivacySettings): Redactor {
     return value;
   }
 
-  function walk(value: unknown, key: string | null, depth: number): unknown {
+  function walk(value: unknown, key: string | null, depth: number, extra: ReadonlySet<string>): unknown {
     if (depth > MAX_DEPTH) return REDACTED;
     if (Array.isArray(value)) {
-      if (key !== null && isSecretKey(key)) return REDACTED;
-      return value.map((v) => walk(v, key, depth + 1));
+      if (key !== null && secretKey(key, extra)) return REDACTED;
+      return value.map((v) => walk(v, key, depth + 1, extra));
     }
     if (typeof value === "object" && value !== null) {
-      if (key !== null && isSecretKey(key)) return REDACTED;
+      if (key !== null && secretKey(key, extra)) return REDACTED;
       const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = walk(v, k, depth + 1);
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = walk(v, k, depth + 1, extra);
       return out;
     }
-    return scalar(value, key);
+    return scalar(value, key, extra);
   }
 
   function headers(h: Record<string, string | string[] | undefined>): Record<string, string> {
+    const extra = extraKeys();
     const out: Record<string, string> = {};
     for (const [rawKey, v] of Object.entries(h)) {
       if (v === undefined) continue;
       const k = rawKey.toLowerCase();
       if (DROPPED_HEADERS.has(k)) continue;
       const value = Array.isArray(v) ? v.join(", ") : v;
-      out[k] = SECRET_HEADERS.has(k) || isSecretKey(k) ? REDACTED : text(value);
+      out[k] = SECRET_HEADERS.has(k) || secretKey(k, extra) ? REDACTED : text(value);
     }
     return out;
   }
 
   function jsonText(t: string | null): string | null {
     if (t === null) return null;
+    let parsed: unknown;
     try {
-      return JSON.stringify(walk(JSON.parse(t), null, 0));
+      parsed = JSON.parse(t);
     } catch {
       return text(t);
     }
+    return JSON.stringify(walk(parsed, null, 0, extraKeys()));
   }
 
-  return { json: (v) => walk(v, null, 0), text, headers, jsonText };
+  return { json: (v) => walk(v, null, 0, extraKeys()), text, headers, jsonText };
 }

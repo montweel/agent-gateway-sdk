@@ -1,7 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.SENSITIVE_KEYS = exports.BASE62 = exports.HEADER_NAME_REGEX = exports.SSO_USERNAME_REGEX = exports.USERNAME_REGEX = exports.NO_BODY_METHODS = exports.DEFAULT_CONFIG = exports.CALLBACK_MAX_FAILURES = exports.MAX_NOTIFY_PAYLOAD_CHARS = exports.ROLLBACK_TIMEOUT_MS = exports.NOTIFY_TIMEOUT_MS = exports.APPROVAL_CALLBACK_PREFIX = exports.MAX_AGENT_REASON_LENGTH = exports.AGENT_REASON_HEADER = exports.DB_OPERATION_TIMEOUT_MS = exports.MAX_LOG_UA_LENGTH = exports.MAX_LOG_PATH_LENGTH = exports.MAX_DECIDED_PENDING_ROWS = exports.MAX_PENDING_DISPLAY_CHARS = exports.MAX_PENDING_BODY_BYTES = exports.MAX_PENDING_ACTIONS = exports.MAX_TRACKED_IPS = exports.JSON_BODY_LIMIT = exports.LOGIN_MAX_FAILURES_PER_USER = exports.MAX_RULE_PATH_LENGTH = exports.MAX_CONCURRENT_SCRYPT = exports.MAX_LOG_ROWS = exports.SESSION_TOUCH_INTERVAL_MS = exports.OTP_TTL_MS = exports.PENDING_TTL_MS = exports.MAX_HOPS = exports.MAX_UPSTREAM_BYTES = exports.UPSTREAM_TIMEOUT_MS = exports.SESSION_TTL_MS = exports.LOGIN_MAX_FAILURES = exports.LOGIN_WINDOW_MS = exports.RATE_WINDOW_MS = exports.SETUP_TOKEN_HEADER = exports.AGENT_KEY_PREFIX = exports.AGENT_KEY_HEADER = exports.HOPS_HEADER = exports.SSO_SECRET_HEADER = exports.REPLAY_HEADER = exports.MAX_SNAPSHOT_CHARS = exports.DEFAULT_WORKSPACE_SLUG = exports.DEFAULT_WORKSPACE_ID = exports.WORKSPACE_PATH_PREFIX = exports.WORKSPACE_KEY_PREFIX = exports.WORKSPACE_HEADER = exports.RULE_MODES = void 0;
-exports.UNSAVED_HEADERS = exports.NEVER_FORWARD = exports.HOP_BY_HOP = exports.OTP_ALPHABET = exports.MCP_TOOL_PATH_PREFIX = exports.MCP_RULE_METHOD = exports.RULE_METHODS = exports.SENSITIVE_QUERY_KEYS = exports.REDACTED = void 0;
+exports.NO_BODY_METHODS = exports.RESPONSE_CAPTURE_GRACE_MS = exports.MAX_RESPONSE_CAPTURE_BYTES = exports.MAX_END_USER_LENGTH = exports.DEFAULT_CONFIG = exports.CALLBACK_MAX_FAILURES = exports.MAX_NOTIFY_JUSTIFICATION_CHARS = exports.MAX_NOTIFY_PAYLOAD_CHARS = exports.ROLLBACK_TIMEOUT_MS = exports.NOTIFY_TIMEOUT_MS = exports.APPROVAL_CALLBACK_PREFIX = exports.MAX_AGENT_REASON_LENGTH = exports.JUSTIFICATION_HEADER = exports.AGENT_REASON_HEADER = exports.DB_OPERATION_TIMEOUT_MS = exports.MAX_LOG_UA_LENGTH = exports.MAX_LOG_PATH_LENGTH = exports.MAX_DECIDED_PENDING_ROWS = exports.MAX_PENDING_DISPLAY_CHARS = exports.MAX_PENDING_BODY_BYTES = exports.MAX_PENDING_ACTIONS = exports.MAX_TRACKED_IPS = exports.JSON_BODY_LIMIT = exports.LOGIN_MAX_FAILURES_PER_USER = exports.MAX_RULE_PATH_LENGTH = exports.MAX_CONCURRENT_SCRYPT = exports.MAX_LOG_ROWS = exports.SESSION_TOUCH_INTERVAL_MS = exports.OTP_TTL_MS = exports.PENDING_TTL_MS = exports.MAX_HOPS = exports.MAX_UPSTREAM_BYTES = exports.UPSTREAM_TIMEOUT_MS = exports.SESSION_TTL_MS = exports.LOGIN_MAX_FAILURES = exports.LOGIN_WINDOW_MS = exports.RATE_WINDOW_MS = exports.SETUP_TOKEN_HEADER = exports.AGENT_KEY_PREFIX = exports.AGENT_KEY_HEADER = exports.HOPS_HEADER = exports.SSO_SECRET_HEADER = exports.REPLAY_HEADER = exports.MAX_SNAPSHOT_CHARS = exports.DEFAULT_WORKSPACE_SLUG = exports.DEFAULT_WORKSPACE_ID = exports.WORKSPACE_PATH_PREFIX = exports.WORKSPACE_KEY_PREFIX = exports.WORKSPACE_HEADER = exports.RULE_MODES = void 0;
+exports.UNSAVED_HEADERS = exports.NEVER_FORWARD = exports.HOP_BY_HOP = exports.OTP_ALPHABET = exports.MCP_TOOL_PATH_PREFIX = exports.MCP_RULE_METHOD = exports.RULE_METHODS = exports.SENSITIVE_QUERY_KEYS = exports.REDACTED = exports.SENSITIVE_KEYS = exports.BASE62 = exports.HEADER_NAME_REGEX = exports.SSO_USERNAME_REGEX = exports.USERNAME_REGEX = void 0;
 exports.RULE_MODES = ["ALLOW", "BLOCK", "REQUIRE_APPROVAL", "SHADOW_BLOCK", "SHADOW_APPROVAL"];
 // v2.0 multi-tenant workspaces
 exports.WORKSPACE_HEADER = "x-mont-workspace";
@@ -46,11 +46,15 @@ exports.MAX_LOG_UA_LENGTH = 256;
 // v1.1: fail-closed, approvals, notifications
 exports.DB_OPERATION_TIMEOUT_MS = 4000; // a hung/locked SQLite op fails the request closed after this
 exports.AGENT_REASON_HEADER = "x-agent-reason";
+/** Preferred header for the agent's justification of a held action (shown above Approve / Reject). */
+exports.JUSTIFICATION_HEADER = "x-mont-justification";
 exports.MAX_AGENT_REASON_LENGTH = 1000;
 exports.APPROVAL_CALLBACK_PREFIX = "/_mont/approvals";
 exports.NOTIFY_TIMEOUT_MS = 5000;
 exports.ROLLBACK_TIMEOUT_MS = 10000;
 exports.MAX_NOTIFY_PAYLOAD_CHARS = 2500;
+/** Agent's justification in a chat notification (Telegram caps a message at 4096 chars). */
+exports.MAX_NOTIFY_JUSTIFICATION_CHARS = 600;
 exports.CALLBACK_MAX_FAILURES = 20; // bad signatures per IP per 15 minutes before lockout
 exports.DEFAULT_CONFIG = {
     targetUrl: "",
@@ -60,7 +64,21 @@ exports.DEFAULT_CONFIG = {
     ssoSharedSecret: "",
     ssoUserHeader: "x-forwarded-user",
     ssoRoleHeader: "x-forwarded-role",
+    audit: {
+        capturePayloads: true,
+        redactKeys: ["password", "token", "authorization", "credit_card", "ssn", "secret", "key"],
+    },
 };
+// ---- Compliance audit trail (payload capture + attribution) ----
+// The end user is read from the configured SSO user header (ssoUserHeader, default x-forwarded-user).
+exports.MAX_END_USER_LENGTH = 256;
+/** Largest response body kept per audit row; bigger bodies are cut and marked truncated. */
+exports.MAX_RESPONSE_CAPTURE_BYTES = 64 * 1024;
+/**
+ * How long the ledger waits for an in-flight request's response before sealing its row without
+ * one. Longer than the upstream timeout, so a proxied response always lands in time.
+ */
+exports.RESPONSE_CAPTURE_GRACE_MS = exports.UPSTREAM_TIMEOUT_MS + 15000;
 exports.NO_BODY_METHODS = ["GET", "HEAD"];
 exports.USERNAME_REGEX = /^[a-zA-Z0-9._@-]{2,64}$/;
 exports.SSO_USERNAME_REGEX = /^[a-zA-Z0-9._@+-]{1,128}$/;
@@ -105,6 +123,7 @@ exports.NEVER_FORWARD = new Set([
     exports.SETUP_TOKEN_HEADER,
     exports.AGENT_KEY_HEADER,
     exports.WORKSPACE_HEADER,
+    exports.JUSTIFICATION_HEADER, // gateway-internal: shown to the approver, not the upstream
     // Identity headers set by an SSO proxy. They must never reach the upstream
     // where they could be mistaken for a verified identity.
     "x-forwarded-user",

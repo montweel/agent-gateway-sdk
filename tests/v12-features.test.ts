@@ -121,11 +121,13 @@ describe("1. deterministic PII & secret scrubber", () => {
   test("HTTP: nothing sensitive reaches SQLite, logs or notifications, yet policies and replay see real data", async () => {
     // A fake webhook receiver captures exactly what the gateway sends to third parties.
     const captured: string[] = [];
+    const capturedHeaders: http.IncomingHttpHeaders[] = [];
     const receiver = http.createServer((req, res) => {
       let data = "";
       req.on("data", (c) => (data += c));
       req.on("end", () => {
         captured.push(data);
+        capturedHeaders.push(req.headers);
         res.end("ok");
       });
     });
@@ -175,6 +177,13 @@ describe("1. deterministic PII & secret scrubber", () => {
     assert.match(String(visible.path), /j\*\*\*%40example\.com/, "URL-encoded emails in the query string are masked too");
     assertNoSecrets(JSON.stringify(await sqliteAll(h.dbPath, "SELECT * FROM agent_logs")), "agent_logs");
     assertNoSecrets(captured.join("\n"), "webhook notification");
+    // The webhook names the request id admins search for (parity with the #id in Telegram / Slack).
+    const notice = JSON.parse(captured[0]) as { event: string; requestId: number; action: { id: number } };
+    assert.equal(notice.event, "approval.pending");
+    assert.equal(notice.requestId, approvalId);
+    assert.equal(notice.action.id, approvalId);
+    assert.equal(capturedHeaders[0]["x-mont-request-id"], String(approvalId));
+    assert.equal(capturedHeaders[0]["idempotency-key"], `mont-pending-${approvalId}`);
 
     // Approved replay uses the encrypted original: the app receives the real values.
     const decided = await h.admin("POST", `/approvals/${approvalId}/decide`, { decision: "APPROVE" });
@@ -325,8 +334,13 @@ describe("3. zero-tunnel phone approvals", () => {
     // Replaying the same button does nothing more.
     tap(approveBtn.callback_data, -100555, 777);
     tap(rejectBtn.callback_data, -100555, 777);
-    await sleep(800);
+    await waitFor(
+      () => tg.sent.filter((m) => /Already handled: #\d+ was not changed, it is already approved by telegram:@u777/.test(String(m.text))).length >= 2,
+      4000,
+      "both repeat taps answered with Already handled"
+    );
     assert.equal(h.hits.length, 1);
+    assert.equal(await pendingStatus(h.dbPath, approvalId), "APPROVED", "the late Reject changed nothing");
   });
 
   test("Slack Socket Mode: outbound WebSocket, acks envelopes, approver + channel checks, decides with no public URL", async () => {
@@ -377,7 +391,12 @@ describe("3. zero-tunnel phone approvals", () => {
     const buttons = msg.blocks.find((b: { type: string }) => b.type === "actions").elements;
     const reject = buttons.find((b: { action_id: string }) => b.action_id === "mont_reject");
 
-    const envelope = (id: string, userId: string, channelId: string) =>
+    // The header names the request id, like Telegram's "Approval needed: #id".
+    assert.equal(msg.blocks[0].type, "header");
+    assert.match(msg.blocks[0].text.text, new RegExp(`Approval needed: #${approvalId}$`));
+
+    // Like real Slack, a click sends back the clicked message's blocks.
+    const click = (id: string, userId: string, channelId: string, m: Record<string, any>, actionId: string, value: string) =>
       conn!.send(
         JSON.stringify({
           envelope_id: id,
@@ -386,11 +405,17 @@ describe("3. zero-tunnel phone approvals", () => {
             type: "block_actions",
             user: { id: userId, username: "owner" },
             channel: { id: channelId },
-            message: { ts: msg.ts ?? "1700000000.001" },
-            actions: [{ action_id: "mont_reject", value: reject.value }],
+            message: { ts: m.ts ?? "1700000000.001", blocks: m.blocks },
+            actions: [{ action_id: actionId, value }],
           },
         })
       );
+    const envelope = (id: string, userId: string, channelId: string) => click(id, userId, channelId, msg, "mont_reject", reject.value);
+    const settledCorrectly = (u: Record<string, any>, id: number) =>
+      Array.isArray(u.blocks) &&
+      !u.blocks.some((b: { type: string }) => b.type === "actions") &&
+      u.blocks[0]?.type === "header" &&
+      new RegExp(`#${id}$`).test(u.blocks[0].text.text);
 
     envelope("env-1", "U0999STRANGER", "C0123ABCD");
     envelope("env-2", "U0777OWNER", "C0999OTHER");
@@ -401,8 +426,23 @@ describe("3. zero-tunnel phone approvals", () => {
     envelope("env-3", "U0777OWNER", "C0123ABCD");
     await waitFor(async () => (await pendingStatus(h.dbPath, approvalId)) === "REJECTED", 5000, "rejected via Slack");
     assert.deepEqual(conn!.received.map((r) => JSON.parse(r).envelope_id), ["env-1", "env-2", "env-3"], "every envelope acked");
-    await waitFor(() => updated.some((u) => /Rejected #\d+ by slack:owner/.test(String(u.text))), 3000, "chat.update with outcome");
+    const done = await waitFor(() => updated.find((u) => /Rejected #\d+ by slack:owner/.test(String(u.text))), 3000, "chat.update with outcome");
+    assert.ok(settledCorrectly(done, approvalId), "request details kept, buttons removed");
+    assert.match(JSON.stringify(done.blocks.at(-1)), /Rejected #\d+ by slack:owner/);
     assert.equal(h.hits.length, 0);
+
+    // Double tap across channels: the dashboard approves first, then the owner taps Approve in Slack.
+    const second = await postJson(`${h.base}/api/payout`, { amount: 50, destination: "acct_ok" });
+    const { approvalId: id2 } = (await second.json()) as { approvalId: number };
+    const msg2 = await waitFor(() => posted.find((m) => String(m.text).includes(`#${id2}`)), 5000, "second chat.postMessage");
+    const approve2 = msg2.blocks.find((b: { type: string }) => b.type === "actions").elements.find((b: { action_id: string }) => b.action_id === "mont_approve");
+    assert.equal((await h.admin("POST", `/approvals/${id2}/decide`, { decision: "APPROVE" })).status, 200);
+    assert.equal(h.hits.length, 1);
+    click("env-4", "U0777OWNER", "C0123ABCD", msg2, "mont_approve", approve2.value);
+    const late = await waitFor(() => updated.find((u) => String(u.text).includes(`Already handled: #${id2}`)), 3000, "Already handled update");
+    assert.match(String(late.text), /it is already approved by api-token-admin\.$/, "names who decided it in the dashboard");
+    assert.ok(settledCorrectly(late, id2), "the late tap also removes the buttons and keeps the details");
+    assert.equal(h.hits.length, 1, "not executed twice");
   });
 });
 

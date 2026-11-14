@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Hand, OctagonX, ShieldCheck } from 'lucide-react'
+import { FileText, Hand, OctagonX, ShieldCheck, X } from 'lucide-react'
 import { api, errorMessage } from '../lib/api'
-import type { EmergencyMode, ProtectionSummary } from '../lib/types'
+import type { AuditDigest, EmergencyMode, ProtectionSummary } from '../lib/types'
 import { formatTime, READ_ONLY_HINT } from '../lib/utils'
 import { Spinner } from './ui'
 
@@ -51,6 +51,27 @@ export function EmergencyBar({
   const [summary, setSummary] = useState<ProtectionSummary | null>(null)
   const [busy, setBusy] = useState<EmergencyMode | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [digest, setDigest] = useState<AuditDigest | null>(null)
+  /** Workspace the open digest panel belongs to (null = closed). Switching workspace hides it. */
+  const [digestFor, setDigestFor] = useState<string | null>(null)
+  const [digestBusy, setDigestBusy] = useState(false)
+  const [digestError, setDigestError] = useState<string | null>(null)
+  const digestOpen = digestFor === workspace
+
+  async function openDigest() {
+    setDigestFor(workspace)
+    if (digestFor !== workspace) setDigest(null)
+    setDigestBusy(true)
+    setDigestError(null)
+    try {
+      const res = await api.get<AuditDigest>('/audit/digest')
+      setDigest(res.data)
+    } catch (err) {
+      setDigestError(errorMessage(err))
+    } finally {
+      setDigestBusy(false)
+    }
+  }
 
   const load = useCallback(async () => {
     try {
@@ -157,9 +178,50 @@ export function EmergencyBar({
                 </strong>
               </span>
             ))}
+            <button
+              type="button"
+              onClick={() => void openDigest()}
+              disabled={digestBusy}
+              className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-wait"
+              title="Last 24 hours in one sentence, computed on this machine"
+            >
+              {digestBusy ? <Spinner className="h-3.5 w-3.5" /> : <FileText className="h-3.5 w-3.5" aria-hidden="true" />}
+              View Daily Digest
+            </button>
           </div>
         )}
       </div>
+      {digestOpen && (
+        <div className="mx-auto max-w-5xl px-10 pb-3">
+          <div role="status" aria-live="polite" className="relative rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 pr-10 text-sm text-emerald-950">
+            <button
+              type="button"
+              onClick={() => setDigestFor(null)}
+              aria-label="Close the daily digest"
+              className="absolute right-2 top-2 rounded p-1 text-emerald-700 hover:bg-emerald-100"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700">
+              Daily digest{workspace === 'all' && multiWorkspace ? ' · all clients' : multiWorkspace ? ` · ${workspace}` : ''}
+            </p>
+            {digestError ? (
+              <p className="mt-1 text-red-700">{digestError}</p>
+            ) : digest ? (
+              <>
+                <p className="mt-1 leading-relaxed">{digest.summary}</p>
+                <p className="mt-1 text-[11px] text-emerald-800/70">
+                  Generated {formatTime(digest.generatedAt)} from your local audit log.
+                  {digest.riskyCalls > 0 &&
+                    ` The dollar estimate adds up the amount / price of the ${digest.riskyCallsWithAmount} of ${digest.riskyCalls} risky calls that carried one.`}
+                </p>
+              </>
+            ) : (
+              <p className="mt-1 text-emerald-800/70">Adding up the last 24 hours…</p>
+            )}
+          </div>
+        </div>
+      )}
       {summary && current !== 'normal' && (
         <div className="mx-auto max-w-5xl px-10 pb-2 text-xs font-medium text-slate-700">
           {scope === 'client' ? `[${workspace}] ` : ''}

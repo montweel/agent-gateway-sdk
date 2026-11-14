@@ -1,4 +1,4 @@
-import type { AgentGatewayOptions, GatewayConfig } from "./types";
+import type { AgentGatewayOptions, AuditConfig, GatewayConfig } from "./types";
 import { DEFAULT_CONFIG, HEADER_NAME_REGEX } from "./constants";
 import { randomHex } from "./crypto";
 import { createFileCache } from "./fileCache";
@@ -39,6 +39,30 @@ function cleanHeaderName(value: unknown, fallback: string): string {
   if (typeof value !== "string") return fallback;
   const v = value.trim().toLowerCase();
   return HEADER_NAME_REGEX.test(v) ? v : fallback;
+}
+
+const MAX_REDACT_KEYS = 200;
+
+/** A redact key as typed (trimmed). Keys that are empty, too long or not a string are dropped. */
+export function cleanRedactKeys(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: string[] = [];
+  for (const k of value) {
+    if (typeof k !== "string") continue;
+    const t = k.trim();
+    if (t && t.length <= 128 && !out.includes(t)) out.push(t);
+    if (out.length >= MAX_REDACT_KEYS) break;
+  }
+  return out;
+}
+
+function parseAuditConfig(value: unknown): AuditConfig {
+  const d = DEFAULT_CONFIG.audit;
+  const raw = typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  return {
+    capturePayloads: typeof raw.capturePayloads === "boolean" ? raw.capturePayloads : d.capturePayloads,
+    redactKeys: cleanRedactKeys(raw.redactKeys) ?? [...d.redactKeys],
+  };
 }
 
 const newSecret = (): string => randomHex(32);
@@ -102,6 +126,7 @@ export function createConfigStore(configPath: string, options: AgentGatewayOptio
       ssoSharedSecret: secret,
       ssoUserHeader: cleanHeaderName(raw.ssoUserHeader, DEFAULT_CONFIG.ssoUserHeader),
       ssoRoleHeader: cleanHeaderName(raw.ssoRoleHeader, DEFAULT_CONFIG.ssoRoleHeader),
+      audit: parseAuditConfig(raw.audit),
     };
   }
 
@@ -116,6 +141,7 @@ export function createConfigStore(configPath: string, options: AgentGatewayOptio
       ssoTrustProxyHeader: config.ssoTrustProxyHeader,
       ssoUserHeader: config.ssoUserHeader,
       ssoRoleHeader: config.ssoRoleHeader,
+      audit: { capturePayloads: config.audit.capturePayloads, redactKeys: [...config.audit.redactKeys] },
     };
     if (secret) merged.ssoSharedSecret = secret;
     persist(merged);

@@ -7,6 +7,7 @@ import { isProRequired } from '../lib/types'
 import type { GatewayConfig, ProRequiredResponse } from '../lib/types'
 import { INPUT_CLASS, READ_ONLY_HINT } from '../lib/utils'
 import { AgentKeysPanel } from '../components/AgentKeysPanel'
+import { AuditSettingsCard } from '../components/AuditSettingsCard'
 import { LicenseCard, ProLockLink } from '../components/LicenseCard'
 import type { LicenseApi } from '../hooks/useLicense'
 import { Badge, ErrorBanner, PageHeader, ProCallout, RefreshButton, Spinner, SuccessBanner, WarningBanner } from '../components/ui'
@@ -382,6 +383,15 @@ export function SettingsTab({ readOnly, licenseApi }: { readOnly: boolean; licen
           </button>
         </div>
       </form>
+
+      {config?.audit && (
+        <AuditSettingsCard
+          key={JSON.stringify(config.audit)}
+          audit={config.audit}
+          readOnly={readOnly}
+          onSaved={(c) => setConfig((prev) => (prev ? { ...prev, audit: c.audit } : prev))}
+        />
+      )}
 
       {!readOnly && <AgentKeysPanel required={requireAgentApiKey} isPro={isPro} onOpenLicense={scrollToLicense} />}
 

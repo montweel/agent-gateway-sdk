@@ -1,15 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useApprovals } from '../hooks/useApprovals'
 import { useLicense } from '../hooks/useLicense'
 import { useRules } from '../hooks/useRules'
 import type { AuthUser, LicenseStatus, Tab } from '../lib/types'
 import { getWorkspace, WORKSPACE_CHANGED_EVENT } from '../lib/api'
+import { ruleKey } from '../lib/utils'
 import { Sidebar } from '../components/Sidebar'
 import { TopBar } from '../components/TopBar'
 import { ChangePasswordModal } from '../components/ChangePasswordModal'
 import { RulesTab } from '../tabs/RulesTab'
 import { ApprovalsTab } from '../tabs/ApprovalsTab'
 import { LogsTab } from '../tabs/LogsTab'
+import type { LogsFilter } from '../tabs/LogsTab'
 import { AnalyticsTab } from '../tabs/AnalyticsTab'
 import { TeamTab } from '../tabs/TeamTab'
 import { SettingsTab } from '../tabs/SettingsTab'
@@ -60,9 +62,29 @@ const SCOPED_TABS: Tab[] = ['rules', 'approvals', 'logs', 'analytics']
 
 export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const readOnly = user.role !== 'admin'
-  const [tab, setTab] = useState<Tab>('rules')
+  const [tab, setTabState] = useState<Tab>('rules')
+  // Rule key to open in the payload rules editor when jumping there from the rules list or
+  // the audit log. A key with no rule yet starts a new rule pre-filled with its method + path.
+  const [policyFocus, setPolicyFocus] = useState<string | null>(null)
+  // Filters to open the Audit Logs with (from Analytics). Cleared by ordinary tab navigation.
+  const [logsFilter, setLogsFilter] = useState<LogsFilter | null>(null)
+  const setTab = useCallback((next: Tab) => {
+    setPolicyFocus(null)
+    setLogsFilter(null)
+    setTabState(next)
+  }, [])
+  const openLogs = useCallback((filter: LogsFilter, withinMs?: number) => {
+    setPolicyFocus(null)
+    // A relative window ("the last 24h") becomes a fixed start time at the moment of the click.
+    setLogsFilter(withinMs ? { ...filter, from: new Date(Date.now() - withinMs).toISOString() } : filter)
+    setTabState('logs')
+  }, [])
+  const openPayloadEditor = useCallback((key: string) => {
+    setPolicyFocus(key)
+    setTabState('setup')
+  }, [])
   const licenseApi = useLicense()
-  const openLicense = useCallback(() => setTab('settings'), [])
+  const openLicense = useCallback(() => setTab('settings'), [setTab])
   const [showPasswordModal, setShowPasswordModal] = useState(false)
   const rulesApi = useRules()
   const approvalsApi = useApprovals()
@@ -84,9 +106,30 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
 
   const closePasswordModal = useCallback(() => setShowPasswordModal(false), [])
 
-  const pendingCount = useMemo(
-    () => approvalsApi.approvals.filter((a) => a.status === 'PENDING').length,
-    [approvalsApi.approvals]
+  // The real COUNT(*) from the server; the approvals list itself is capped.
+  const pendingCount = approvalsApi.counts.pending
+
+  // "Edit Rule" from Analytics: open the rule that actually governs this method + path when one is
+  // keyed on it (method-specific first, then the any-method rule); otherwise start a new rule
+  // pre-filled with it. Wildcard rules are not opened, so editing never widens or narrows a pattern
+  // that covers other endpoints by surprise.
+  const { rules } = rulesApi
+  const openRuleFor = useCallback(
+    (method: string, path: string) => {
+      const exact = ruleKey(method, path)
+      const own = (k: string) => Object.prototype.hasOwnProperty.call(rules, k)
+      openPayloadEditor(own(exact) ? exact : method !== 'MCP' && own(path) ? path : exact)
+    },
+    [rules, openPayloadEditor]
+  )
+
+  const { setQuery: setApprovalsQuery } = approvalsApi
+  const openApproval = useCallback(
+    (id: number) => {
+      setApprovalsQuery({ status: 'ALL', id })
+      setTab('approvals')
+    },
+    [setApprovalsQuery, setTab]
   )
 
   const multiWorkspace = (workspacesApi.data?.workspaces.length ?? 0) > 1
@@ -118,13 +161,30 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
             <AllClientsOverview />
           ) : (
             <>
-              {tab === 'rules' && <RulesTab rulesApi={rulesApi} readOnly={readOnly} />}
+              {tab === 'rules' && <RulesTab rulesApi={rulesApi} readOnly={readOnly} onEditPayload={openPayloadEditor} />}
               {tab === 'approvals' && <ApprovalsTab approvalsApi={approvalsApi} readOnly={readOnly} />}
-              {tab === 'logs' && <LogsTab rulesApi={rulesApi} readOnly={readOnly} />}
-              {tab === 'analytics' && <AnalyticsTab isPro={licenseApi.isPro} onOpenLicense={openLicense} />}
+              {tab === 'logs' && (
+                <LogsTab
+                  key={JSON.stringify(logsFilter)}
+                  rulesApi={rulesApi}
+                  readOnly={readOnly}
+                  initialFilter={logsFilter}
+                  onCreateRule={(method, path) => openPayloadEditor(ruleKey(method, path))}
+                  onOpenApproval={openApproval}
+                />
+              )}
+              {tab === 'analytics' && (
+                <AnalyticsTab isPro={licenseApi.isPro} onOpenLicense={openLicense} onViewLogs={openLogs} onEditRule={openRuleFor} readOnly={readOnly} />
+              )}
               {tab === 'team' && !readOnly && <TeamTab currentUser={user} />}
               {tab === 'setup' && (
-                <SetupTab rulesApi={rulesApi} readOnly={readOnly} licenseApi={licenseApi} workspacesApi={workspacesApi} />
+                <SetupTab
+                  rulesApi={rulesApi}
+                  readOnly={readOnly}
+                  licenseApi={licenseApi}
+                  workspacesApi={workspacesApi}
+                  focusRuleKey={policyFocus}
+                />
               )}
               {tab === 'settings' && <SettingsTab readOnly={readOnly} licenseApi={licenseApi} />}
             </>

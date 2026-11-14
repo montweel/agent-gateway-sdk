@@ -8,6 +8,7 @@ exports.workspaceNotice = workspaceNotice;
 exports.signWebhookBody = signWebhookBody;
 exports.createNotifier = createNotifier;
 exports.noticeFromRow = noticeFromRow;
+exports.settledSlackBlocks = settledSlackBlocks;
 exports.createApprovalBridges = createApprovalBridges;
 const crypto_1 = __importDefault(require("crypto"));
 const constants_1 = require("./constants");
@@ -106,15 +107,34 @@ function slackText(n) {
     const risks = riskLines(n.body);
     return (`*${escSlack(n.method)}* \`${escSlack(n.path)}\`\n` +
         `*Caller:* ${escSlack(callerLine(n))}\n` +
-        (n.agentReason ? `*Agent's reason:* ${escSlack(n.agentReason.slice(0, 300))}\n` : "") +
         (n.matchedPolicy ? `*Matched:* ${escSlack(n.matchedPolicy)}\n` : "") +
         (risks.length ? `:warning: *High-risk fields:* ${escSlack(risks.join(", "))}` : ""));
+}
+/** The agent's justification, capped for chat. Shown last, right above Approve / Reject. */
+function justificationText(n) {
+    if (!n.agentReason)
+        return null;
+    return n.agentReason.length > constants_1.MAX_NOTIFY_JUSTIFICATION_CHARS ? `${n.agentReason.slice(0, constants_1.MAX_NOTIFY_JUSTIFICATION_CHARS)}…` : n.agentReason;
+}
+/** Slack block quote: every line prefixed with "> " so a multi-line reason stays inside the quote. */
+const slackQuote = (s) => s.split("\n").map((l) => `>${escSlack(l)}`).join("\n");
+function slackJustificationBlock(n) {
+    const j = justificationText(n);
+    return {
+        type: "section",
+        text: {
+            type: "mrkdwn",
+            text: j ? `:speech_balloon: *Agent's Justification*\n${slackQuote(j)}` : ":grey_question: *Agent's Justification:* _none given. The agent did not say why it wants to do this._",
+        },
+    };
 }
 function slackBlocks(n, actions, footer) {
     const blocks = [
         { type: "header", text: { type: "plain_text", text: n.id === 0 ? "Test notification" : `${wsLabel(n)}Approval needed: #${n.id}`.slice(0, 150), emoji: false } },
         { type: "section", text: { type: "mrkdwn", text: slackText(n) } },
         { type: "section", text: { type: "mrkdwn", text: "```" + escSlack(prettyBody(n.body)).replace(/```/g, "'''") + "```" } },
+        // Directly above the buttons: the human reads WHY before deciding.
+        slackJustificationBlock(n),
     ];
     if (actions)
         blocks.push(actions);
@@ -124,14 +144,18 @@ function slackBlocks(n, actions, footer) {
 }
 function telegramText(n, footer) {
     const risks = riskLines(n.body);
+    const j = justificationText(n);
     return (`<b>${n.id === 0 ? "Test notification" : `${escHtml(wsLabel(n))}Approval needed: #${n.id}`}</b>\n` +
         `<b>${escHtml(n.method)}</b> <code>${escHtml(n.path)}</code>\n` +
         `<b>Caller:</b> ${escHtml(callerLine(n))}\n` +
-        (n.agentReason ? `<b>Agent's reason:</b> ${escHtml(n.agentReason.slice(0, 300))}\n` : "") +
         (n.matchedPolicy ? `<b>Matched:</b> ${escHtml(n.matchedPolicy)}\n` : "") +
         (risks.length ? `⚠️ <b>High-risk fields:</b> ${escHtml(risks.join(", "))}\n` : "") +
-        `<pre>${escHtml(prettyBody(n.body))}</pre>` +
-        (footer ? `\n${escHtml(footer)}` : ""));
+        `<pre>${escHtml(prettyBody(n.body))}</pre>\n` +
+        // Last line of the message = directly above the inline Approve / Reject buttons.
+        (j
+            ? `\n💬 <b>Agent's Justification</b>\n<blockquote>${escHtml(j)}</blockquote>`
+            : `\n❔ <b>Agent's Justification:</b> <i>none given. The agent did not say why it wants to do this.</i>`) +
+        (footer ? `\n\n${escHtml(footer)}` : ""));
 }
 // ---------------------------------------------------------------------------
 // Senders
@@ -206,6 +230,8 @@ async function sendWebhook(url, secret, n, l) {
     }
     const body = JSON.stringify({
         event: "approval.pending",
+        // The #id shown in Telegram / Slack and searched in the dashboard (also action.id).
+        requestId: n.id,
         action: {
             id: n.id,
             queuedAt: n.queuedAt,
@@ -216,6 +242,7 @@ async function sendWebhook(url, secret, n, l) {
             query: n.query,
             caller: { ip: n.callerIp, userAgent: n.callerUa, agentKey: n.agentKey, agentKeyPrefix: n.agentKeyPrefix },
             agentReason: n.agentReason,
+            justification: n.agentReason,
             matchedPolicy: n.matchedPolicy,
             highRiskFields: riskLines(n.body),
         },
@@ -223,7 +250,13 @@ async function sendWebhook(url, secret, n, l) {
         rejectUrl: l?.reject ?? null,
     });
     const ts = String(Math.floor(Date.now() / 1000));
-    const headers = { "x-mont-event": "approval.pending", "x-mont-timestamp": ts };
+    const headers = {
+        "x-mont-event": "approval.pending",
+        "x-mont-timestamp": ts,
+        "x-mont-request-id": String(n.id),
+        // Lets a receiver drop a redelivery of the same notification (same scheme as the rollback webhook).
+        "idempotency-key": `mont-pending-${n.id}`,
+    };
     if (secret)
         headers["x-mont-signature"] = `sha256=${signWebhookBody(secret, ts, body)}`;
     const r = await postJson(url, body, headers);
@@ -335,7 +368,7 @@ features) {
             callerUa: "mont-setup-test",
             agentKey: null,
             agentKeyPrefix: null,
-            agentReason: "Testing the mobile approval bridge.",
+            agentReason: "Customer reported a double charge on order #1001; refunding the duplicate payment. (Sample: this is a test from Mont setup.)",
             matchedPolicy: "test",
         }),
     };
@@ -388,20 +421,38 @@ function noticeFromRow(row, workspace) {
         workspace: workspaceNotice(workspace),
     };
 }
+/**
+ * The message after a decision: the original request details stay (like Telegram, which only
+ * drops the keyboard), the buttons go, and the outcome is appended. Falls back to the outcome
+ * alone when Slack did not send the original blocks.
+ */
+function settledSlackBlocks(original, outcome) {
+    const outcomeBlock = { type: "context", elements: [{ type: "mrkdwn", text: escSlack(outcome) }] };
+    const kept = (original ?? []).filter((b) => {
+        const type = b?.type;
+        return typeof type === "string" && type !== "actions";
+    });
+    // Slack allows 50 blocks per message; ours has 4-6, but never fail an update on a long one.
+    return kept.length > 0 ? [...kept.slice(0, 49), outcomeBlock] : [{ type: "section", text: { type: "mrkdwn", text: escSlack(outcome) } }];
+}
 function telegramChatMatcher(chat) {
     return (configured) => {
         const c = configured.trim();
         return c !== "" && (String(chat.id) === c || (c.startsWith("@") && chat.username?.toLowerCase() === c.slice(1).toLowerCase()));
     };
 }
-/** Verifies a button token against its queued row and applies the decision. */
+/**
+ * Verifies a button token against its queued row and applies the decision.
+ * `settled` is true when the message's buttons can no longer do anything (decided now, or
+ * already decided / expired before this tap), so the bridge removes them.
+ */
 async function decideFromButton(ctx, token, actor, origin) {
     const parsed = (0, approvalSigning_1.parseButtonToken)(token);
     if (!parsed)
-        return { ok: false, text: "This button is not valid." };
+        return { ok: false, settled: false, text: "This button is not valid." };
     const row = await ctx.db.get("SELECT id, timestamp, workspace_id FROM pending_actions WHERE id = ?", [parsed.id]);
     if (!row || !(0, approvalSigning_1.verifyButtonToken)(ctx.settings.approvalSigningSecret(), parsed, row.timestamp)) {
-        return { ok: false, text: "This button is not valid for that request." };
+        return { ok: false, settled: false, text: "This button is not valid for that request." };
     }
     // The request's workspace decides which chat / channel may approve it.
     const ws = ctx.workspaces.get(row.workspace_id ?? constants_1.DEFAULT_WORKSPACE_ID);
@@ -411,15 +462,20 @@ async function decideFromButton(ctx, token, actor, origin) {
         : origin.channelId === (ws?.slackChannel || n.slack.channelId);
     if (!allowed) {
         console.error(`[agent-gateway] Refused a ${origin.channel} button for action #${parsed.id} from a chat that does not belong to its workspace.`);
-        return { ok: false, text: `#${parsed.id} belongs to another client workspace; it can only be decided from that workspace's chat or the dashboard.` };
+        return { ok: false, settled: false, text: `#${parsed.id} belongs to another client workspace; it can only be decided from that workspace's chat or the dashboard.` };
     }
     const result = await ctx.approvals.decide(parsed.id, parsed.decision, actor);
     const body = result.body;
     if (result.status >= 200 && result.status < 300) {
         const verb = body.status === "REJECTED" ? "⛔ Rejected" : body.status === "EXECUTING" ? "✅ Approved (executing)" : "✅ Approved and executed";
-        return { ok: true, text: `${verb} #${parsed.id} by ${actor}${body.replayStatus !== undefined ? ` · target replied HTTP ${body.replayStatus}` : ""}` };
+        return { ok: true, settled: true, text: `${verb} #${parsed.id} by ${actor}${body.replayStatus !== undefined ? ` · target replied HTTP ${body.replayStatus}` : ""}` };
     }
-    return { ok: false, text: `#${parsed.id} not changed: ${body.message ?? "it could not be decided."}` };
+    if (body.alreadyTaken) {
+        // Second tap, or decided elsewhere (dashboard / another approver / phone link) first.
+        const state = body.status === "EXPIRED" ? "it expired before anyone decided it" : `it is already ${String(body.status ?? "decided").toLowerCase()}${body.decided_by ? ` by ${body.decided_by}` : ""}`;
+        return { ok: false, settled: true, text: `ℹ️ Already handled: #${parsed.id} was not changed, ${state}.` };
+    }
+    return { ok: false, settled: false, text: `#${parsed.id} not changed: ${body.message ?? "it could not be decided."}` };
 }
 function createApprovalBridges(ctx, endpoints) {
     let stopped = true;
@@ -481,7 +537,7 @@ function createApprovalBridges(ctx, endpoints) {
         const actor = `telegram:${cq.from.username ? `@${cq.from.username}` : cq.from.id}`;
         const outcome = await decideFromButton(ctx, cq.data ?? "", actor, { channel: "telegram", chatMatches: matcher });
         if (cq.message) {
-            if (outcome.ok) {
+            if (outcome.settled) {
                 await tg("editMessageReplyMarkup", token, { chat_id: cq.message.chat.id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => undefined);
             }
             await tg("sendMessage", token, { chat_id: cq.message.chat.id, text: outcome.text, reply_to_message_id: cq.message.message_id }).catch(() => undefined);
@@ -673,12 +729,14 @@ function createApprovalBridges(ctx, endpoints) {
         }
         const actor = `slack:${p.user?.username ?? p.user?.name ?? userId}`;
         const outcome = await decideFromButton(ctx, action.value ?? "", actor, { channel: "slack", channelId });
-        if (outcome.ok && p.message) {
+        if (outcome.settled && p.message) {
+            // Decided now, or already handled elsewhere (dashboard, Telegram, phone link, another
+            // approver): keep the request details, remove the buttons, show the outcome.
             await slackApi("chat.update", s.botToken, {
                 channel: channelId,
                 ts: p.message.ts,
                 text: outcome.text,
-                blocks: [{ type: "section", text: { type: "mrkdwn", text: escSlack(outcome.text) } }],
+                blocks: settledSlackBlocks(p.message.blocks, outcome.text),
             }).catch(() => undefined);
         }
         else {

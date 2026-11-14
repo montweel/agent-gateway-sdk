@@ -95,8 +95,9 @@ export function Sidebar({
                   <span
                     className="inline-flex min-w-[1.5rem] items-center justify-center rounded-full bg-amber-500 px-2 py-0.5 text-xs font-bold text-slate-900"
                     aria-label={`${pendingCount} pending approvals`}
+                    title={`${pendingCount.toLocaleString()} pending approvals`}
                   >
-                    {pendingCount}
+                    {pendingCount > 999 ? '999+' : pendingCount}
                   </span>
                 )}
               </button>

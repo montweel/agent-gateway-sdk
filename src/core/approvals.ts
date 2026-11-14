@@ -13,6 +13,7 @@ import { extractAmount } from "./guards";
 import { scopedRuleKey } from "./workspaces";
 import { effectiveMode } from "./operatingMode";
 import { PatchError, applyEdits, assertJsonValue, describeChanges, validateQueryEdit, withQuery } from "./payloadPatch";
+import { formatResponse } from "./payloadCapture";
 
 /**
  * Approval state machine, shared by the dashboard API and the signed phone links.
@@ -61,6 +62,25 @@ const err = (status: number, error: string, message: string, extra: Record<strin
   status,
   body: { error, message, ...extra },
 });
+
+/**
+ * The single answer for a decision that arrives after the action was already decided or expired:
+ * a second tap in Telegram / Slack, the dashboard and a phone deciding at the same moment, or a
+ * decision after the 24 h window. `alreadyTaken: true` lets the chat bridges say "Already handled".
+ * 410 for EXPIRED (it can never be decided), 409 otherwise.
+ */
+const alreadyTaken = (row: Pick<PendingRow, "id" | "status" | "decided_by">): ServiceResult => {
+  const expired = row.status === "EXPIRED";
+  const what = expired
+    ? "expired before it was decided; the agent must send it again"
+    : `is already ${row.status}${row.decided_by ? ` (by ${row.decided_by})` : ""}`;
+  return err(expired ? 410 : 409, expired ? "Gone" : "Conflict", `Action already taken: #${row.id} ${what}.`, {
+    id: row.id,
+    status: row.status,
+    decided_by: row.decided_by,
+    alreadyTaken: true,
+  });
+};
 
 /** Query object rebuilt from the original (unredacted) path, shaped like Express's simple parser output. */
 function queryFromPath(path: string): Record<string, string | string[]> {
@@ -127,11 +147,12 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     status: "APPROVED" | "REJECTED" | "BLOCKED",
     actorName: string,
     detail: string | null,
-    payloads: { original: string | null; modified: string | null; amountBody?: unknown } = { original: null, modified: null }
+    payloads: { original: string | null; modified: string | null; amountBody?: unknown; response?: string | null } = { original: null, modified: null }
   ): Promise<void> {
     await db.run(
-      `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, original_payload, modified_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, original_payload, modified_payload,
+                               end_user, end_user_verified, approved_by, response_payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         new Date().toISOString(),
         row.method,
@@ -147,6 +168,11 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
         wsIdOf(row),
         payloads.original,
         payloads.modified,
+        row.end_user ?? null,
+        row.end_user ? (row.end_user_verified === 1 ? 1 : 0) : null,
+        // actorName is the verified dashboard identity (SSO only after the shared-secret check), never a raw header.
+        status === "APPROVED" ? actorName : null,
+        payloads.response ?? null,
       ]
     );
     ctx.ledger.kick();
@@ -282,9 +308,14 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
         redirect: "manual",
         signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
       });
-      const text = (await readCapped(upstreamRes)).toString("utf-8");
+      const raw = await readCapped(upstreamRes);
+      const text = raw.toString("utf-8");
       // The upstream reply is stored and shown to approvers: scrub it like everything else.
       const preview = ctx.redactor.text(`${upstreamRes.status} ${text.slice(0, 500)}`);
+      // fetch() has already decompressed the body.
+      const response = config.audit.capturePayloads
+        ? formatResponse(ctx, { status: upstreamRes.status, contentType: upstreamRes.headers.get("content-type"), body: raw, overflow: false, bytes: raw.length })
+        : null;
 
       // Done: the secrets are no longer needed, so wipe them for good.
       await db.run("UPDATE pending_actions SET status = 'APPROVED', response_preview = ?, encrypted_payload = NULL, patch_encrypted = NULL WHERE id = ?", [preview, id]);
@@ -292,6 +323,7 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
         original: req.originalPayload,
         modified: req.modifiedPayload,
         amountBody: req.edited ? parseOrUndefined(req.body) ?? null : undefined,
+        response,
       });
       if (upstreamRes.status < 400) await recordApprovedSpend(row, req.body);
       return {
@@ -321,11 +353,28 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     }
   }
 
+  /**
+   * The atomic claim matched no row: someone else decided it between our read and our UPDATE
+   * (e.g. the dashboard and Telegram at the same moment), or the 24 h window ran out. Re-read
+   * so the answer names what actually happened.
+   */
+  async function lostRace(row: PendingRow): Promise<ServiceResult> {
+    await expireStale();
+    const fresh = await db.get<Pick<PendingRow, "id" | "status" | "decided_by">>("SELECT id, status, decided_by FROM pending_actions WHERE id = ?", [row.id]);
+    return alreadyTaken(fresh ?? { ...row, status: "EXPIRED" });
+  }
+
   async function decide(id: number, decision: Decision, actorName: string, edits?: ApprovalEdits): Promise<ServiceResult> {
     await expireStale();
     const row = await db.get<PendingRow>("SELECT * FROM pending_actions WHERE id = ?", [id]);
     if (!row) return err(404, "Not Found", `No pending action with id ${id}.`);
-    if (row.status === "EXPIRED") return err(410, "Gone", `Action ${id} expired before it was decided. The agent must send it again.`);
+    // Idempotency, checked first so a repeat tap is answered the same way whatever else changed
+    // (lockdown, rule edits, a blocked caller). Only PENDING can be approved or rejected; FAILED
+    // (a replay that may have reached the target) can still be retried or rejected by a human.
+    // This early read is for the message only: the decision itself is claimed below with an
+    // atomic UPDATE ... WHERE status = <expected>, so two simultaneous deciders cannot both win.
+    const settled = row.status !== "PENDING" && row.status !== "FAILED"; // EXECUTING, APPROVED, REJECTED, EXPIRED
+    if (settled || (decision === "APPROVE" && row.status === "FAILED")) return alreadyTaken(row);
     const wantsEdit = edits !== undefined && (edits.body !== undefined || edits.query !== undefined);
     if (wantsEdit && decision !== "APPROVE") return err(400, "Bad Request", "Edits can only be sent with an APPROVE decision.");
     if (wantsEdit && !ctx.license.current().features.payloadPatching) {
@@ -337,14 +386,11 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
 
     // ---- Reject (a PENDING or FAILED action) ----
     if (decision === "REJECT") {
-      if (row.status !== "PENDING" && row.status !== "FAILED") {
-        return err(409, "Conflict", `Action ${id} is ${row.status} and can no longer be rejected.`);
-      }
       const result = await db.run(
         "UPDATE pending_actions SET status = 'REJECTED', decided_by = ?, encrypted_payload = NULL, patch_encrypted = NULL WHERE id = ? AND status = ?",
         [actorName, id, row.status]
       );
-      if (result.changes === 0) return err(409, "Conflict", `Action ${id} was already decided.`);
+      if (result.changes === 0) return lostRace(row);
       await logDecision(row, "REJECTED", actorName, null);
       // A held MCP call gets its answer right away.
       void ctx.mcpWaiters.get(id)?.onDecision("REJECT");
@@ -363,11 +409,8 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     }
     const from = decision === "APPROVE" ? "PENDING" : "FAILED";
     if (row.status !== from) {
-      return err(
-        409,
-        "Conflict",
-        decision === "APPROVE" ? `Action ${id} is ${row.status}; only PENDING actions can be approved.` : `Action ${id} is ${row.status}; only FAILED actions can be retried.`
-      );
+      // Only RETRY of a PENDING action gets here (everything else was answered above).
+      return err(409, "Conflict", `Action ${id} is ${row.status}; only FAILED actions can be retried.`);
     }
 
     // A caller blocked after this request was queued can never have it executed.
@@ -440,7 +483,7 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
     );
     if (claim.changes === 0) {
       if (reserved) localWaiter?.unreserve();
-      return err(409, "Conflict", `Action ${id} was already decided or has expired.`);
+      return lostRace(row);
     }
 
     if (row.kind === "mcp") {

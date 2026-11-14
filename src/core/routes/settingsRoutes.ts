@@ -16,6 +16,7 @@ import {
 import type { BudgetSpec, DedupeSpec, PolicyTier, Rule } from "../types";
 import { validateBudget, validateDedupe, validatePolicies } from "../policy";
 import { requireWorkspace } from "./scope";
+import { cleanRedactKeys } from "../config";
 
 /** Adds rateLimit to a rule only when it is a real limit, so rules.json stays clean. */
 function withRateLimit(rule: Rule, rateLimit: number | null | undefined): Rule {
@@ -93,6 +94,7 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
       ssoTrustProxyHeader?: unknown;
       ssoUserHeader?: unknown;
       ssoRoleHeader?: unknown;
+      audit?: unknown;
     };
     const current: GatewayConfig = configStore.load();
     const updated: GatewayConfig = { ...current };
@@ -145,6 +147,30 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
       const clean = parseHeaderName(res, input.ssoRoleHeader, "ssoRoleHeader", "x-forwarded-role");
       if (clean === null) return;
       updated.ssoRoleHeader = clean;
+    }
+
+    if (input.audit !== undefined) {
+      const a = input.audit as { capturePayloads?: unknown; redactKeys?: unknown } | null;
+      if (typeof a !== "object" || a === null || Array.isArray(a)) {
+        sendError(res, 400, "Bad Request", "audit must be an object like { capturePayloads, redactKeys }.");
+        return;
+      }
+      const audit = { ...current.audit };
+      if (a.capturePayloads !== undefined) {
+        if (typeof a.capturePayloads !== "boolean") {
+          sendError(res, 400, "Bad Request", "audit.capturePayloads must be a boolean.");
+          return;
+        }
+        audit.capturePayloads = a.capturePayloads;
+      }
+      if (a.redactKeys !== undefined) {
+        if (!Array.isArray(a.redactKeys) || !a.redactKeys.every((k) => typeof k === "string")) {
+          sendError(res, 400, "Bad Request", "audit.redactKeys must be a list of strings.");
+          return;
+        }
+        audit.redactKeys = cleanRedactKeys(a.redactKeys) ?? [];
+      }
+      updated.audit = audit;
     }
 
     // Trusted Identity Proxy (SSO) is a Pro feature. Re-saving an unchanged SSO setup

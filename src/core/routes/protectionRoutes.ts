@@ -5,6 +5,7 @@ import { EMERGENCY_MODES } from "../operatingMode";
 import { buildSummary, modeLabel, workspaceFilter } from "../protection";
 import { sendError, sendInternalError } from "../utils";
 import { actorOf, readScope } from "./scope";
+import { logFilterSql } from "./logRoutes";
 
 /**
  * Shop-owner endpoints (all honour the x-mont-workspace scope):
@@ -34,6 +35,10 @@ const CSV_COLUMNS = [
   "workspace",
   "shadow",
   "row_hash",
+  // Appended (not inserted) so spreadsheets that read columns by position keep working.
+  "end_user",
+  "end_user_verified",
+  "approved_by",
 ] as const;
 
 export function csvCell(v: unknown): string {
@@ -110,31 +115,14 @@ export function registerProtectionRoutes(router: Router, ctx: GatewayContext): v
     const scoped = readScope(ctx, req, res);
     if (scoped === undefined) return;
     try {
-      const { status, method, from, to } = req.query;
       const wf = workspaceFilter(scoped?.id ?? null);
-      let sql = `SELECT id, timestamp, workspace_id, method, path, status, shadow, amount, agent_key, caller_ip, user_agent, action_id, detail, row_hash
-                 FROM agent_logs WHERE 1=1${wf.sql}`;
-      const params: unknown[] = [...wf.params];
-      if (typeof status === "string" && status.trim()) {
-        sql += " AND status = ?";
-        params.push(status.trim().toUpperCase());
-      }
-      if (typeof method === "string" && method.trim()) {
-        sql += " AND method = ?";
-        params.push(method.trim().toUpperCase());
-      }
-      for (const [v, op] of [
-        [from, ">="],
-        [to, "<="],
-      ] as const) {
-        if (typeof v === "string" && v.trim()) {
-          const d = new Date(v.trim());
-          if (!Number.isNaN(d.getTime())) {
-            sql += ` AND timestamp ${op} ?`;
-            params.push(d.toISOString());
-          }
-        }
-      }
+      // Same filters as GET /logs, so the file matches what the dashboard shows.
+      const filter = logFilterSql(req.query);
+      let sql = `SELECT id, timestamp, workspace_id, method, path, status, shadow, amount, agent_key, caller_ip, user_agent, action_id, detail, row_hash, end_user,
+                        CASE WHEN end_user IS NULL THEN NULL WHEN end_user_verified = 1 THEN 'verified' ELSE 'agent-claimed' END AS end_user_verified,
+                        approved_by
+                 FROM agent_logs WHERE 1=1${wf.sql}${filter.sql}`;
+      const params: unknown[] = [...wf.params, ...filter.params];
       sql += " ORDER BY id DESC LIMIT 50000";
       const rows = await ctx.db.all<Record<string, unknown>>(sql, params);
       const lines = [

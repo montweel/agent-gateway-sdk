@@ -3,12 +3,15 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.registerAuditRoutes = registerAuditRoutes;
 const constants_1 = require("../constants");
 const simulator_1 = require("../simulator");
+const digest_1 = require("../digest");
 const utils_1 = require("../utils");
 const scope_1 = require("./scope");
 /**
  *   GET  /audit/verify          walks the hash-chained audit ledger and proves it was not modified
  *                               (Pro / Agency). Seals any rows written in the last moment first.
  *   GET  /audit/head            the current chain head (any user; write it down / it is in the digest)
+ *   GET  /audit/digest          last 24h in one plain-English sentence: requests, risky calls blocked,
+ *                               estimated money prevented, approvals pending (local SQL only, no LLM)
  *   POST /simulate/history      { limit?: 1-5000, rules?: <candidate rules> } -> what the last N recorded
  *                               requests would have done under these rules (current rules when omitted)
  */
@@ -33,6 +36,18 @@ function registerAuditRoutes(router, ctx) {
         }
         catch (err) {
             (0, utils_1.sendInternalError)(res, "Audit head error", err, "Could not read the audit ledger head.");
+        }
+    });
+    // Zero-LLM daily digest: one local SQLite aggregation + a fixed sentence template. Any signed-in user.
+    router.get("/audit/digest", async (req, res) => {
+        const scoped = (0, scope_1.readScope)(ctx, req, res);
+        if (scoped === undefined)
+            return;
+        try {
+            res.json(await (0, digest_1.buildDigest)(ctx, scoped?.id ?? null));
+        }
+        catch (err) {
+            (0, utils_1.sendInternalError)(res, "Audit digest error", err, "Could not build the daily digest.");
         }
     });
     router.post("/simulate/history", async (req, res) => {

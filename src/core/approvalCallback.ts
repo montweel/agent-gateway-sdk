@@ -131,7 +131,7 @@ export function createApprovalCallbackRouter(ctx: GatewayContext): Router {
       <div class="card">
         <div class="row"><span class="m">#${row.id}</span><span class="m">${esc(row.method)}</span><code>${esc(row.path)}</code></div>
         <p class="muted">Queued ${esc(row.timestamp)}${caller ? ` · ${esc(caller)}` : ""}${row.matched_policy ? ` · matched ${esc(row.matched_policy)}` : ""}</p>
-        ${row.agent_reason ? `<p><b>Agent's reason:</b> ${esc(row.agent_reason)}</p>` : ""}
+        ${row.agent_reason ? `<p><b>Agent's Justification:</b> ${esc(row.agent_reason)}</p>` : ""}
         ${risks.length ? `<div class="risk"><b>High-risk fields</b><br>${risks.map((r) => `<code>${esc(r.path)}</code> = <code>${esc(JSON.stringify(r.value))}</code>`).join("<br>")}</div>` : ""}
         <pre>${esc(pretty)}</pre>
       </div>`;
@@ -181,8 +181,11 @@ export function createApprovalCallbackRouter(ctx: GatewayContext): Router {
         return;
       }
       const result = await ctx.approvals.decide(row.id, f.decision as CallbackDecision, "mobile-link");
-      const body = result.body as { status?: string; message?: string; replayStatus?: number };
-      if (result.status >= 200 && result.status < 300) {
+      const body = result.body as { status?: string; message?: string; replayStatus?: number; alreadyTaken?: boolean };
+      if (body.alreadyTaken) {
+        // Decided elsewhere (Telegram, Slack, dashboard) between opening this page and tapping.
+        page(res, result.status, "Already handled", `<h1>Already handled</h1><p>${esc(body.message ?? "This request was already decided.")}</p>`);
+      } else if (result.status >= 200 && result.status < 300) {
         page(
           res,
           200,

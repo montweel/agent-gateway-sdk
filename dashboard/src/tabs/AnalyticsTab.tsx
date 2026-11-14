@@ -1,12 +1,120 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, BarChart3, Bot, EyeOff, Filter, ShieldAlert } from 'lucide-react'
+import { Activity, BarChart3, Bot, ChevronDown, EyeOff, Filter, ListFilter, ShieldAlert, SlidersHorizontal } from 'lucide-react'
 import { api, errorMessage } from '../lib/api'
 import type { HourlyBucket, AnalyticsResponse, LogStatus } from '../lib/types'
 import { formatBucketLabel } from '../lib/utils'
 import { ProBadge } from '../components/LicenseCard'
 import { ErrorBanner, MethodBadge, PageHeader, RefreshButton } from '../components/ui'
+import type { LogsFilter } from './LogsTab'
 
 type WindowId = '1h' | '2h' | '24h' | '1w'
+const WINDOW_MS: Record<WindowId, number> = { '1h': 3_600_000, '2h': 7_200_000, '24h': 86_400_000, '1w': 604_800_000 }
+
+/**
+ * "View Logs" / "Edit Rule" for one endpoint row. Closes on outside click, Escape or scroll.
+ * The menu is position: fixed at the button, because the table sits in an overflow-x-auto
+ * wrapper that would clip an absolutely positioned dropdown.
+ */
+function EndpointActions({
+  method,
+  path,
+  readOnly,
+  onViewLogs,
+  onEditRule,
+}: {
+  method: string
+  path: string
+  readOnly: boolean
+  onViewLogs: () => void
+  onEditRule: () => void
+}) {
+  const [menuAt, setMenuAt] = useState<{ top: number; left: number } | null>(null)
+  const open = menuAt !== null
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const close = () => setMenuAt(null)
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) close()
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close()
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    // Capture: the page scrolls inside <main>, not the window.
+    window.addEventListener('scroll', close, true)
+    window.addEventListener('resize', close)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+      window.removeEventListener('scroll', close, true)
+      window.removeEventListener('resize', close)
+    }
+  }, [open])
+
+  function toggle(e: React.MouseEvent<HTMLButtonElement>) {
+    if (open) {
+      setMenuAt(null)
+      return
+    }
+    const r = e.currentTarget.getBoundingClientRect()
+    const MENU_W = 192
+    setMenuAt({ top: r.bottom + 4, left: Math.max(8, Math.min(r.left, window.innerWidth - MENU_W - 8)) })
+  }
+  const setOpen = (v: boolean) => {
+    if (!v) setMenuAt(null)
+  }
+
+  const item = 'flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50'
+  return (
+    <div ref={ref} className="relative min-w-0">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={`Actions for ${method} ${path}`}
+        className="group flex min-w-0 items-center gap-2 rounded-md px-1 py-0.5 text-left hover:bg-indigo-50"
+      >
+        <MethodBadge method={method} />
+        <span className="truncate font-mono font-medium text-slate-800 group-hover:text-indigo-700 group-hover:underline">{path}</span>
+        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden="true" />
+      </button>
+      {menuAt && (
+        <div
+          role="menu"
+          style={{ top: menuAt.top, left: menuAt.left }}
+          className="fixed z-40 w-48 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            className={item}
+            onClick={() => {
+              setOpen(false)
+              onViewLogs()
+            }}
+          >
+            <ListFilter className="h-3.5 w-3.5 text-indigo-600" aria-hidden="true" /> View Logs
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className={item}
+            onClick={() => {
+              setOpen(false)
+              onEditRule()
+            }}
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5 text-indigo-600" aria-hidden="true" /> {readOnly ? 'View Rule' : 'Edit Rule'}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
 const WINDOWS: { id: WindowId; label: string }[] = [
   { id: '1h', label: '1h' },
   { id: '2h', label: '2h' },
@@ -28,7 +136,21 @@ const CHART_SERIES: {
   { status: 'REJECTED', label: 'Rejected', swatch: 'bg-rose-500', textColor: 'text-rose-300' },
 ]
 
-export function AnalyticsTab({ isPro, onOpenLicense }: { isPro: boolean; onOpenLicense: () => void }) {
+export function AnalyticsTab({
+  isPro,
+  onOpenLicense,
+  onViewLogs,
+  onEditRule,
+  readOnly = false,
+}: {
+  isPro: boolean
+  onOpenLicense: () => void
+  /** Open Audit Logs with these filters, limited to the last `withinMs` (the window the table counted). */
+  onViewLogs?: (filter: LogsFilter, withinMs?: number) => void
+  /** Open the rule editor for this method + path (existing rule, or a new pre-filled one). */
+  onEditRule?: (method: string, path: string) => void
+  readOnly?: boolean
+}) {
   const [windowParam, setWindowParam] = useState<WindowId>('24h')
   const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null)
   const [loading, setLoading] = useState(true)
@@ -109,6 +231,11 @@ export function AnalyticsTab({ isPro, onOpenLicense }: { isPro: boolean; onOpenL
   const hourly = analytics?.hourly ?? []
   const topEndpoints = analytics?.topEndpoints ?? []
   const topAgents = analytics?.topAgents ?? []
+
+  // Logs opened from a table row cover the same time window the table counted.
+  // (Without Pro a 1w request is served as 24h.)
+  const shownWindow: WindowId = analytics?.proRequired ? '24h' : windowParam
+  const viewLogs = (filter: LogsFilter) => onViewLogs?.(filter, WINDOW_MS[shownWindow])
 
   // Helper to compute visible total for a bucket based on active legend toggles
   const getVisibleBucketTotal = useCallback(
@@ -341,6 +468,7 @@ export function AnalyticsTab({ isPro, onOpenLicense }: { isPro: boolean; onOpenL
             </h2>
             <p className="mt-0.5 text-xs text-slate-500">
               API routes ranked by request volume and security intervention rate (Blocked, Queued, Rejected, Rate Limited).
+              {onViewLogs && ' Click an endpoint to view its logs or edit its rule.'}
             </p>
           </div>
 
@@ -366,10 +494,20 @@ export function AnalyticsTab({ isPro, onOpenLicense }: { isPro: boolean; onOpenL
                     return (
                       <tr key={`${ep.method}:${ep.path}`} className="hover:bg-slate-50/80">
                         <td className="py-2.5 pr-3">
-                          <div className="flex items-center gap-2">
-                            <MethodBadge method={ep.method} />
-                            <span className="font-mono font-medium text-slate-800">{ep.path}</span>
-                          </div>
+                          {onViewLogs && onEditRule ? (
+                            <EndpointActions
+                              method={ep.method}
+                              path={ep.path}
+                              readOnly={readOnly}
+                              onViewLogs={() => viewLogs({ method: ep.method, path: ep.path })}
+                              onEditRule={() => onEditRule(ep.method, ep.path)}
+                            />
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <MethodBadge method={ep.method} />
+                              <span className="font-mono font-medium text-slate-800">{ep.path}</span>
+                            </div>
+                          )}
                         </td>
                         <td className="py-2.5 text-right font-semibold text-slate-900">{ep.total}</td>
                         <td className="py-2.5 text-right text-emerald-600 font-medium">{ep.allowed}</td>
@@ -405,6 +543,7 @@ export function AnalyticsTab({ isPro, onOpenLicense }: { isPro: boolean; onOpenL
             </h2>
             <p className="mt-0.5 text-xs text-slate-500">
               User-Agents ranked by total traffic volume and blocked/rejected actions.
+              {onViewLogs && ' Click one to see its requests in the Audit Logs.'}
             </p>
           </div>
 
@@ -427,9 +566,20 @@ export function AnalyticsTab({ isPro, onOpenLicense }: { isPro: boolean; onOpenL
                   {topAgents.map((ag) => (
                     <tr key={ag.agent} className="hover:bg-slate-50/80">
                       <td className="py-2.5 pr-3">
-                        <span className="block max-w-[240px] truncate font-mono text-slate-800" title={ag.agent}>
-                          {ag.agent}
-                        </span>
+                        {onViewLogs ? (
+                          <button
+                            type="button"
+                            onClick={() => viewLogs({ userAgent: ag.agent })}
+                            title={`View Audit Logs from ${ag.agent}`}
+                            className="block max-w-[240px] truncate rounded-md px-1 py-0.5 text-left font-mono text-slate-800 hover:bg-indigo-50 hover:text-indigo-700 hover:underline"
+                          >
+                            {ag.agent}
+                          </button>
+                        ) : (
+                          <span className="block max-w-[240px] truncate font-mono text-slate-800" title={ag.agent}>
+                            {ag.agent}
+                          </span>
+                        )}
                       </td>
                       <td className="py-2.5 text-right font-semibold text-slate-900">{ag.total}</td>
                       <td className="py-2.5 text-right text-emerald-600 font-medium">{ag.allowed}</td>

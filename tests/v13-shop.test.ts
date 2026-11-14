@@ -402,7 +402,7 @@ describe("6. alerts, digest, money-protected summary, CSV export", () => {
     const text = (await csv.text()).replace(/^\uFEFF/, "");
     const lines = text.trim().split("\n");
     // v1.3 columns keep their positions; v2 appends workspace, shadow and the ledger hash.
-    assert.equal(lines[0], "id,timestamp,method,path,status,amount,agent_key,caller_ip,user_agent,action_id,detail,workspace,shadow,row_hash");
+    assert.equal(lines[0], "id,timestamp,method,path,status,amount,agent_key,caller_ip,user_agent,action_id,detail,workspace,shadow,row_hash,end_user,end_user_verified,approved_by");
     assert.equal(lines.length, 7);
     assert.ok(lines[1].includes(`"'=HYPERLINK(""http://evil.test"",""click"")"`), "formula injection neutralised");
     assert.ok(lines.slice(1).every((l) => l.includes(",BLOCKED,5000,")));

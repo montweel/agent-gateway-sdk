@@ -3,6 +3,7 @@ import type { GatewayContext } from "../context";
 import type { AuthenticatedRequest, RuleMode, Rules } from "../types";
 import { RULE_MODES } from "../constants";
 import { simulateHistory } from "../simulator";
+import { buildDigest } from "../digest";
 import { normalizeRule, parseRuleKey, ruleKey, sendError, sendInternalError, validateRulePath } from "../utils";
 import { readScope, requireWorkspace, sendLicenseRequired } from "./scope";
 
@@ -10,6 +11,8 @@ import { readScope, requireWorkspace, sendLicenseRequired } from "./scope";
  *   GET  /audit/verify          walks the hash-chained audit ledger and proves it was not modified
  *                               (Pro / Agency). Seals any rows written in the last moment first.
  *   GET  /audit/head            the current chain head (any user; write it down / it is in the digest)
+ *   GET  /audit/digest          last 24h in one plain-English sentence: requests, risky calls blocked,
+ *                               estimated money prevented, approvals pending (local SQL only, no LLM)
  *   POST /simulate/history      { limit?: 1-5000, rules?: <candidate rules> } -> what the last N recorded
  *                               requests would have done under these rules (current rules when omitted)
  */
@@ -33,6 +36,17 @@ export function registerAuditRoutes(router: Router, ctx: GatewayContext): void {
       res.json({ head: await ctx.ledger.head() });
     } catch (err) {
       sendInternalError(res, "Audit head error", err, "Could not read the audit ledger head.");
+    }
+  });
+
+  // Zero-LLM daily digest: one local SQLite aggregation + a fixed sentence template. Any signed-in user.
+  router.get("/audit/digest", async (req: AuthenticatedRequest, res: Response) => {
+    const scoped = readScope(ctx, req, res);
+    if (scoped === undefined) return;
+    try {
+      res.json(await buildDigest(ctx, scoped?.id ?? null));
+    } catch (err) {
+      sendInternalError(res, "Audit digest error", err, "Could not build the daily digest.");
     }
   });
 

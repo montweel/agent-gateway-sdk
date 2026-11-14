@@ -1,5 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.cleanRedactKeys = cleanRedactKeys;
 exports.createConfigStore = createConfigStore;
 const constants_1 = require("./constants");
 const crypto_1 = require("./crypto");
@@ -10,6 +11,31 @@ function cleanHeaderName(value, fallback) {
         return fallback;
     const v = value.trim().toLowerCase();
     return constants_1.HEADER_NAME_REGEX.test(v) ? v : fallback;
+}
+const MAX_REDACT_KEYS = 200;
+/** A redact key as typed (trimmed). Keys that are empty, too long or not a string are dropped. */
+function cleanRedactKeys(value) {
+    if (!Array.isArray(value))
+        return null;
+    const out = [];
+    for (const k of value) {
+        if (typeof k !== "string")
+            continue;
+        const t = k.trim();
+        if (t && t.length <= 128 && !out.includes(t))
+            out.push(t);
+        if (out.length >= MAX_REDACT_KEYS)
+            break;
+    }
+    return out;
+}
+function parseAuditConfig(value) {
+    const d = constants_1.DEFAULT_CONFIG.audit;
+    const raw = typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+    return {
+        capturePayloads: typeof raw.capturePayloads === "boolean" ? raw.capturePayloads : d.capturePayloads,
+        redactKeys: cleanRedactKeys(raw.redactKeys) ?? [...d.redactKeys],
+    };
 }
 const newSecret = () => (0, crypto_1.randomHex)(32);
 const validSecret = (v) => typeof v === "string" && v.length >= 32;
@@ -69,6 +95,7 @@ function createConfigStore(configPath, options) {
             ssoSharedSecret: secret,
             ssoUserHeader: cleanHeaderName(raw.ssoUserHeader, constants_1.DEFAULT_CONFIG.ssoUserHeader),
             ssoRoleHeader: cleanHeaderName(raw.ssoRoleHeader, constants_1.DEFAULT_CONFIG.ssoRoleHeader),
+            audit: parseAuditConfig(raw.audit),
         };
     }
     function save(config) {
@@ -82,6 +109,7 @@ function createConfigStore(configPath, options) {
             ssoTrustProxyHeader: config.ssoTrustProxyHeader,
             ssoUserHeader: config.ssoUserHeader,
             ssoRoleHeader: config.ssoRoleHeader,
+            audit: { capturePayloads: config.audit.capturePayloads, redactKeys: [...config.audit.redactKeys] },
         };
         if (secret)
             merged.ssoSharedSecret = secret;

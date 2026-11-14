@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Award, BellRing, Building2, Clock, EyeOff, Package, Plus, ScanSearch, Send, Server, ShieldOff, SlidersHorizontal, Trash2, Undo2, Wand2 } from 'lucide-react'
+import { AlertCircle, Award, BellRing, Building2, CheckCircle2, Clock, EyeOff, Package, Plus, RotateCcw, ScanSearch, Send, Server, ShieldOff, SlidersHorizontal, Trash2, Undo2, Wand2 } from 'lucide-react'
 import type { LicenseApi } from '../hooks/useLicense'
 import { LicenseCard } from '../components/LicenseCard'
 import { WorkspacesPanel } from '../components/WorkspacesPanel'
@@ -222,11 +222,14 @@ export function SetupTab({
   readOnly,
   licenseApi,
   workspacesApi,
+  focusRuleKey = null,
 }: {
   rulesApi: RulesApi
   readOnly: boolean
   licenseApi: LicenseApi
   workspacesApi: WorkspacesApi
+  /** Rule to open in the payload rules editor, e.g. when coming from "Edit payload rules" in the rules list. */
+  focusRuleKey?: string | null
 }) {
   const { rules, setRules, reload: reloadRules } = rulesApi
   const [loading, setLoading] = useState(true)
@@ -482,7 +485,15 @@ export function SetupTab({
         subtitle="Decide by what the agent is actually asking for, e.g. allow small refunds, hold medium ones for you, block huge ones."
       >
         <PresetPicker readOnly={readOnly} setRules={setRules} onError={setError} onNotice={setNotice} />
-        <PolicyBuilder rules={rules} setRules={setRules} readOnly={readOnly} onError={setError} onNotice={setNotice} onWarnings={setWarnings} />
+        <PolicyBuilder
+          rules={rules}
+          setRules={setRules}
+          readOnly={readOnly}
+          onError={setError}
+          onNotice={setNotice}
+          onWarnings={setWarnings}
+          focusRuleKey={focusRuleKey}
+        />
       </Section>
 
       {/* ---------------- Step 3 ---------------- */}
@@ -1158,9 +1169,10 @@ function PolicyBuilder({
   rules,
   setRules,
   readOnly,
-  onError,
-  onNotice,
-  onWarnings,
+  onError: onErrorTop,
+  onNotice: onNoticeTop,
+  onWarnings: onWarningsTop,
+  focusRuleKey,
 }: {
   rules: Rules
   setRules: (r: Rules) => void
@@ -1168,11 +1180,43 @@ function PolicyBuilder({
   onError: (e: string | null) => void
   onNotice: (n: string | null) => void
   onWarnings: (w: string[]) => void
+  focusRuleKey: string | null
 }) {
   const keys = useMemo(() => Object.keys(rules).sort(), [rules])
-  const [selected, setSelected] = useState<string>('__new__')
-  const [newMethod, setNewMethod] = useState<string>('POST')
-  const [newPath, setNewPath] = useState('/api/refund')
+
+  // Save feedback is shown next to the Save button. The page-level banners sit at the top of
+  // Gateway Setup, out of view while editing (and "Create Rule" scrolls straight here), so a
+  // rejected save used to look like a button that did nothing. Clearing also clears the top
+  // banners, so an old message there cannot contradict the one shown here.
+  const [localError, setLocalError] = useState<string | null>(null)
+  const [localNotice, setLocalNotice] = useState<string | null>(null)
+  const [localWarnings, setLocalWarnings] = useState<string[]>([])
+  const onError = (e: string | null) => {
+    setLocalError(e)
+    if (e === null) onErrorTop(null)
+  }
+  const onNotice = (n: string | null) => {
+    setLocalNotice(n)
+    if (n === null) onNoticeTop(null)
+  }
+  const onWarnings = (w: string[]) => {
+    setLocalWarnings(w)
+    if (w.length === 0) onWarningsTop([])
+  }
+
+  // A focus key with an existing rule opens that rule; one without (e.g. "Create Rule" on an
+  // unknown endpoint in the audit log) starts a new rule with its method and path filled in.
+  const focusIsNew = focusRuleKey !== null && rules[focusRuleKey] === undefined
+  const [selected, setSelected] = useState<string>(focusRuleKey !== null && !focusIsNew ? focusRuleKey : '__new__')
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  // Opened from the rules list: bring the editor into view.
+  useEffect(() => {
+    if (focusRuleKey) rootRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [focusRuleKey])
+  const prefill = focusIsNew ? splitRuleKey(focusRuleKey ?? '') : null
+  const [newMethod, setNewMethod] = useState<string>(prefill?.method ?? 'POST')
+  const [newPath, setNewPath] = useState(prefill?.path ?? '/api/refund')
   const [fallback, setFallback] = useState<Mode>('REQUIRE_APPROVAL')
   const [ruleLimit, setRuleLimit] = useState('')
   const [tiers, setTiers] = useState<DraftTier[]>([])
@@ -1214,14 +1258,40 @@ function PolicyBuilder({
     }
   }, [selected, rules])
 
+  // On the first load of rules only, open the first rule that has payload tiers.
+  // The ref stops this from running again when a save changes keys.length, which
+  // would undo a form reset.
+  const autoSelectedRef = useRef(focusRuleKey !== null)
   useEffect(() => {
-    if (selected === '__new__' && keys.length > 0 && tiers.length === 0) {
+    if (autoSelectedRef.current || keys.length === 0) return
+    autoSelectedRef.current = true
+    if (selected === '__new__' && tiers.length === 0) {
       const firstWithPolicies = keys.find((k) => (rules[k]?.policies?.length ?? 0) > 0)
       if (firstWithPolicies) setSelected(firstWithPolicies)
     }
-    // Only on first load of rules.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keys.length])
+
+  // Put the editor back into "new endpoint" mode with empty inputs, so the next
+  // save creates a new rule instead of overwriting the one that was loaded.
+  function resetForm() {
+    setSelected('__new__')
+    setNewMethod('POST')
+    setNewPath('')
+    setFallback('REQUIRE_APPROVAL')
+    setRuleLimit('')
+    setTiers([])
+    setBudgetOn(false)
+    setBudgetField('body.amount')
+    setBudgetMax('300')
+    setBudgetWindow('60')
+    setBudgetPer('global')
+    setBudgetOnExceed('REQUIRE_APPROVAL')
+    setDedupeOn(false)
+    setDedupeFields('body.orderId')
+    setDedupeWindow('1440')
+    setDedupeOnDuplicate('BLOCK')
+  }
 
   const editKey = selected === '__new__' ? ruleKey(newMethod, newPath.trim()) : selected
 
@@ -1282,7 +1352,7 @@ function PolicyBuilder({
       setRules(res.data.rules)
       onWarnings(res.data.warnings ?? [])
       onNotice(`Payload rules for ${editKey} saved (${policies.length} tier${policies.length === 1 ? '' : 's'}).`)
-      setSelected(editKey)
+      resetForm()
     } catch (err) {
       onError(errorMessage(err))
     } finally {
@@ -1293,7 +1363,7 @@ function PolicyBuilder({
   const { method: selMethod, path: selPath } = splitRuleKey(editKey)
 
   return (
-    <div className="space-y-4">
+    <div ref={rootRef} className="scroll-mt-6 space-y-4">
       <div className="grid gap-3 md:grid-cols-[1fr_auto]">
         <Field label="Endpoint">
           <select value={selected} onChange={(e) => setSelected(e.target.value)} className={`${INPUT_CLASS} font-mono`}>
@@ -1515,13 +1585,47 @@ function PolicyBuilder({
         <Field label="Rate limit for this endpoint (per minute)" hint="Empty = global limit.">
           <input value={ruleLimit} onChange={(e) => setRuleLimit(e.target.value)} inputMode="numeric" className={INPUT_CLASS} placeholder="e.g. 5" disabled={readOnly} />
         </Field>
-        <div className="flex items-end">
+        <div className="flex items-end gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              resetForm()
+              onError(null)
+              onNotice(null)
+              onWarnings([])
+            }}
+            disabled={saving}
+            title="Clear the form and start a new rule"
+            className={SECONDARY_BTN}
+          >
+            <RotateCcw className="h-4 w-4" aria-hidden="true" />
+            Add new rule
+          </button>
           <button type="button" onClick={() => void save()} disabled={readOnly || saving} className={PRIMARY_BTN}>
             {saving && <Spinner />}
             Save payload rules
           </button>
         </div>
       </div>
+      {localError && (
+        <div role="alert" className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          <span>
+            <strong className="font-semibold">Not saved.</strong> {localError}
+          </span>
+        </div>
+      )}
+      {localNotice && (
+        <div role="status" className="flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          <span>{localNotice}</span>
+        </div>
+      )}
+      {localWarnings.map((w) => (
+        <div key={w} className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          {w}
+        </div>
+      ))}
       <p className="text-xs text-slate-500">
         Tiers are checked top to bottom; the first match wins. Body numbers must be real JSON numbers (<span className="font-mono">"250"</span> as text never
         counts as 250). Quote a value to compare it as text, e.g. <span className="font-mono">"123"</span>.

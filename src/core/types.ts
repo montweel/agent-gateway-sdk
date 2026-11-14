@@ -189,6 +189,22 @@ export interface GatewayConfig {
   ssoSharedSecret: string;
   ssoUserHeader: string;
   ssoRoleHeader: string;
+  /** Compliance audit trail options (config.json "audit"). */
+  audit: AuditConfig;
+}
+
+export interface AuditConfig {
+  /**
+   * Store the (redacted) upstream response body with each ALLOWED / APPROVED audit row, sealed
+   * into the hash chain. Request bodies are always kept in the redacted request snapshot.
+   */
+  capturePayloads: boolean;
+  /**
+   * Extra JSON keys whose values are replaced with "[REDACTED]" in every stored payload, on top
+   * of the built-in secret / PII list. Matched case-insensitively, ignoring "_", "-" and ".",
+   * against the whole key ("credit_card" matches "creditCard", "key" does not match "monkey").
+   */
+  redactKeys: string[];
 }
 
 export interface AuthUser {
@@ -324,7 +340,7 @@ export interface PendingRow {
   caller_ua: string | null;
   agent_key_id: number | null;
   agent_key_prefix: string | null;
-  /** Free-text justification the agent sent in x-agent-reason. */
+  /** The agent's justification: x-mont-justification / x-agent-reason header, MCP _meta, or a justification / reason / summary payload field. */
   agent_reason: string | null;
   /** Which policy tier (or the base rule) put this request in the queue. */
   matched_policy: string | null;
@@ -343,6 +359,10 @@ export interface PendingRow {
   modified_query: string | null;
   /** AES-256-GCM copy of the approver's edited payload, for the process that executes it. Wiped once decided. */
   patch_encrypted: string | null;
+  /** The human the agent acted for (x-forwarded-user on the agent's request; asserted, not verified). */
+  end_user: string | null;
+  /** 1 = vouched for by the identity proxy (SSO shared secret), 0 = agent-claimed, NULL = no end user. */
+  end_user_verified: number | null;
 }
 
 export interface BlockedCallerRow {

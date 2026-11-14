@@ -43,7 +43,7 @@ import { createNotifier } from "./notify";
 import { createApprovalService } from "./approvals";
 import { createApprovalCallbackRouter } from "./approvalCallback";
 import { createApprovalBridges } from "./notify";
-import { createRedactor } from "./redactor";
+import { createRedactor, normalizeRedactKey } from "./redactor";
 import { newInstanceId, reapOrphanedMcp } from "./instance";
 import { createMcpGuard } from "./toolGuard";
 import { createGuards } from "./guards";
@@ -120,7 +120,26 @@ export function createAgentGateway(options: AgentGatewayOptions = {}): AgentGate
   const agentKeys = createAgentKeyStore(db);
   const settings = createSettingsStore(db);
   const blocklist = createCallerBlocklist(db);
-  const redactor = createRedactor(() => settings.privacy());
+  // config.json audit.redactKeys, normalised once per change. Redaction runs several times per
+  // request, so config.json (a stat() per load) is consulted at most once a second.
+  let redactKeysSource = "";
+  let redactKeySet: ReadonlySet<string> = new Set();
+  let redactKeysCheckedAt = 0;
+  const redactor = createRedactor(
+    () => settings.privacy(),
+    () => {
+      const now = Date.now();
+      if (now - redactKeysCheckedAt < 1_000) return redactKeySet;
+      redactKeysCheckedAt = now;
+      const keys = config.load().audit.redactKeys;
+      const source = keys.join("\n");
+      if (source !== redactKeysSource) {
+        redactKeysSource = source;
+        redactKeySet = new Set(keys.map(normalizeRedactKey).filter(Boolean));
+      }
+      return redactKeySet;
+    }
+  );
   const endpoints = {
     telegramApiBase: (options.telegramApiBase ?? "https://api.telegram.org").replace(/\/+$/, ""),
     slackApiBase: (options.slackApiBase ?? "https://slack.com/api").replace(/\/+$/, ""),

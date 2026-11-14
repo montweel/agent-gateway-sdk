@@ -32,7 +32,7 @@ Agents are now calling production APIs, and they fail in ways firewalls were nev
 | **Runaway loops.** An agent retries the same refund or email 400 times. | Duplicate payouts, spam, burned API budget | Rate limits per route, **duplicate-action protection**, cumulative **spending budgets** |
 | **Prompt-injected refunds.** A support ticket says "refund every order", and the agent obeys. | Real money leaves the store | **Payload policies** (`amount > 100` → needs a human), **phone approvals**, **Edit & Approve**, **Lockdown** switch |
 | **Blind MCP tool calls.** The model calls `delete_customer` or `export_database` because a webpage told it to. | Data loss, data exfiltration | **Default-deny MCP tool rules**, per-argument policies, **outbound response guard** |
-| **"What did the agent actually do?"** | No evidence for chargebacks or audits | **Hash-chained, tamper-evident audit log**, CSV export, money-protected reports |
+| **"What did the agent actually do?"** | No evidence for chargebacks or audits | **Hash-chained, tamper-evident audit log** with redacted request *and* response payloads, end-user & approver attribution, CSV export, money-protected reports |
 
 Every decision is **fail-closed**. A request reaches your API only after every check passed *and* its audit row is durably written. A database error, timeout, malformed body or policy error ends in a 4xx/503, never in a forwarded request.
 
@@ -107,6 +107,7 @@ Licenses are offline Ed25519 keys and nothing phones home. Every new install get
 | PII & secret scrubber, outbound response guard, CSV export | ✅ | ✅ | ✅ |
 | Shadow (dry-run) rules & Policy Time-Machine replay | ✅ | ✅ | ✅ |
 | **Hash-Chained Audit Ledger**: every row chained | ✅ | ✅ | ✅ |
+| **Compliance audit trail**: response capture, custom redaction keys, end-user & approver attribution | ✅ | ✅ | ✅ |
 | Hash-Chained Audit Ledger: one-click integrity **verification** | — | ✅ | ✅ |
 | **Zero-Tunnel Telegram / Slack buttons** & Telegram bot commands | — (alerts arrive; approve in the dashboard) | ✅ | ✅ |
 | **Edit & Approve** (change a payload before it runs) | — | ✅ | ✅ |
@@ -154,7 +155,8 @@ Rule keys are `"/api/x"` (any method), `"POST /api/x"` (one method), or wildcard
 
 ### 2. Humans in the loop, from anywhere
 
-- **Approval queue with a payload inspector.** You see the redacted body and query, high-risk fields flagged (`amount`, `email`, `destination`…), the caller's key, IP and User-Agent, and the agent's own `x-agent-reason`.
+- **Approval queue with a payload inspector.** You see the redacted body and query, high-risk fields flagged (`amount`, `email`, `destination`…), the caller's key, IP and User-Agent, and the **Agent's Justification**: taken from the `x-mont-justification` header (or the older `x-agent-reason`), the MCP `params._meta["mont/justification"]`, or a `justification` / `reason` / `summary` field in the payload. Telegram and Slack show it directly above the Approve / Reject buttons.
+- **Zero-LLM daily digest.** `GET /api/agent-admin/audit/digest` (or **View Daily Digest** in the dashboard) gives one plain-English sentence for the last 24 hours: actions processed, risky calls blocked, the estimated dollars prevented (from `amount` / `price`), and how many approvals are waiting. It is computed by a local SQLite query; nothing is sent anywhere.
 - **Phone approvals:**
   - *Zero-tunnel (Pro):* Telegram inline buttons via outbound long-polling, or Slack buttons via Socket Mode. No public URL, ngrok or open port.
   - *Signed links:* Slack, Telegram or a custom webhook with HMAC-signed Approve / Reject links. Links open a confirmation page, so chat link previews can't approve anything.
@@ -193,9 +195,10 @@ Every JSON-RPC `tools/call` gets the same rules, payload policies (on `params.ar
 
 ### 4. Data protection in both directions
 
-- **PII & secret scrubber.** Nothing is stored in SQLite or sent to Slack, Telegram or webhooks without passing through it.
+- **Deep PII & secret scrubber.** Nothing is stored in SQLite or sent to Slack, Telegram or webhooks without passing through it. It walks every level of nested JSON.
   - *Always removed:* auth headers, cookies, passwords, tokens, API keys (Stripe, GitHub, Slack, AWS, OpenAI/Anthropic, JWT…) and Luhn-valid card numbers.
   - *Masked by default:* emails and phone numbers.
+  - *Your own keys:* add field names to `audit.redactKeys` (or **Settings → Audit & PII Redaction**). They match the whole key, ignoring case, `_`, `-` and `.`, so `credit_card` also catches `creditCard`, but `key` does not catch `monkey`.
   - Rules still evaluate the real values, and approved requests replay from an AES-256-GCM encrypted original.
 - **Outbound response guard** (opt-in). Mont inspects what your API or MCP tool sends *back* before the agent sees it.
   - **Bulk dumps:** a JSON array longer than your limit (e.g. 1,000 customer rows) is withheld with `502 Response Policy Violation`, or truncated.
@@ -204,12 +207,24 @@ Every JSON-RPC `tools/call` gets the same rules, payload policies (on `params.ar
 
 ### 5. Proof: a tamper-evident audit ledger
 
-- **Hash chain.** Every audit row is chained:
-  `row_hash = SHA-256(prev_hash + id, timestamp, caller, route, decision, redacted payload, …)`.
-  - **Verify Ledger Integrity** (Pro) re-hashes the chain and pinpoints any edited, deleted, inserted or truncated row.
+- **Cryptographic hash chain.** Every audit row is chained with SHA-256:
+  `row_hash = SHA-256(prev_hash + id, timestamp, caller, route, decision, redacted request, …, end user, approver, redacted response)`.
+  - **Verify Audit Ledger** (Pro; Audit Logs page, or `GET /audit/verify`) re-hashes the chain and pinpoints any edited, deleted, inserted or truncated row.
   - Retention pruning keeps the chain verifiable.
   - Several gateway processes can share one database safely.
   - The daily digest carries the chain head, giving you an off-box copy.
+  - Ledgers sealed by older versions still verify after upgrading.
+- **Request and response capture.** Each audit row keeps the redacted request (body, query, headers). With `audit.capturePayloads` on (the default), it also keeps the redacted **upstream response**: status, content type and body, up to 64 KB. That includes the response to an approved, replayed request.
+  - The response is sealed into the same hash chain. A row waits (up to 45 s) for its response before it is sealed.
+  - Bodies are redacted *before* they are truncated, so a large payload cannot leak a secret by being cut mid-object.
+  - Redaction runs after the response has gone out, so it adds no latency.
+  - Event streams, and binary or compressed bodies, are noted but not stored. So are responses over 1 MB.
+- **End-user attribution** (`end_user`). Agents name the human they act for in the SSO user header (`x-forwarded-user` by default).
+  - **Verified** when the request also carries the SSO shared secret (`x-gateway-sso-secret`, with *Trust identity proxy headers* on). This means your identity proxy vouched for the user.
+  - **Unverified (agent-claimed)** otherwise. The dashboard badges the two differently, the CSV marks them `verified` or `agent-claimed`, and the flag is part of the hash.
+  - It is recorded only; it never grants access.
+- **Approver attribution** (`approved_by`). The admin who released a held action is recorded on its `APPROVED` row: the signed-in account, or the SSO identity once the shared secret has checked out. The end user follows the action from its queued row to that decision row.
+- **Row details.** Expand any row in **Audit Logs** to see the redacted request and response, the end user and approver, and the row's ledger hash (`GET /logs/:id`).
 - **Money protected** shows how much agents tried to move and were stopped, next to what was executed.
 - **CSV export** for accounting and chargeback disputes (formula-injection safe).
 - **Shadow rules & Policy Time-Machine.** Try a policy as `SHADOW_*` on live traffic, or click **Test Rules Against History**. The last N real requests are replayed through your rules, including rate limits, budgets and duplicate protection, and you see exactly which ones would now be blocked, held or rate-limited.
@@ -278,6 +293,15 @@ The image is multi-stage on Node 20 Alpine. Slack Socket Mode's WebSocket client
 | `MONT_LICENSE_KEY` | `MONT-V2.…` Pro / Agency key (or a v1 `MONT-…` Pro key) | unset |
 | `MONT_AGENT_KEY` | (`mcp-stdio`) the local client's `agk_…` agent key or `mws_…` workspace key | unset |
 
+**Audit settings** (`config.json`, or **Settings → Audit & PII Redaction**):
+
+```json
+"audit": {
+  "capturePayloads": true,
+  "redactKeys": ["password", "token", "authorization", "credit_card", "ssn", "secret", "key"]
+}
+```
+
 **SDK options** (`createAgentGateway({...})`):
 - `port`
 - `rulesPath`, `configPath`, `dbPath`
@@ -292,7 +316,7 @@ The image is multi-stage on Node 20 Alpine. Slack Socket Mode's WebSocket client
 | Area | Endpoints |
 |---|---|
 | Rules & approvals | `rules`, `approvals/:id/decide`, `approvals/:id/revoke` |
-| Logs & ledger | `logs`, `logs/export.csv`, `audit/verify`, `simulate/history` |
+| Logs & ledger | `logs`, `logs/:id`, `logs/export.csv`, `audit/verify`, `simulate/history` |
 | Protection | `protection/summary`, `emergency`, `guards/usage` |
 | Workspaces & setup | `workspaces`, `setup`, `setup/presets/:id/apply`, `license` |
 

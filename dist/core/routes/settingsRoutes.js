@@ -5,6 +5,7 @@ const constants_1 = require("../constants");
 const utils_1 = require("../utils");
 const policy_1 = require("../policy");
 const scope_1 = require("./scope");
+const config_1 = require("../config");
 /** Adds rateLimit to a rule only when it is a real limit, so rules.json stays clean. */
 function withRateLimit(rule, rateLimit) {
     return typeof rateLimit === "number" ? { ...rule, rateLimit } : rule;
@@ -107,6 +108,29 @@ function registerSettingsRoutes(router, ctx) {
             if (clean === null)
                 return;
             updated.ssoRoleHeader = clean;
+        }
+        if (input.audit !== undefined) {
+            const a = input.audit;
+            if (typeof a !== "object" || a === null || Array.isArray(a)) {
+                (0, utils_1.sendError)(res, 400, "Bad Request", "audit must be an object like { capturePayloads, redactKeys }.");
+                return;
+            }
+            const audit = { ...current.audit };
+            if (a.capturePayloads !== undefined) {
+                if (typeof a.capturePayloads !== "boolean") {
+                    (0, utils_1.sendError)(res, 400, "Bad Request", "audit.capturePayloads must be a boolean.");
+                    return;
+                }
+                audit.capturePayloads = a.capturePayloads;
+            }
+            if (a.redactKeys !== undefined) {
+                if (!Array.isArray(a.redactKeys) || !a.redactKeys.every((k) => typeof k === "string")) {
+                    (0, utils_1.sendError)(res, 400, "Bad Request", "audit.redactKeys must be a list of strings.");
+                    return;
+                }
+                audit.redactKeys = (0, config_1.cleanRedactKeys)(a.redactKeys) ?? [];
+            }
+            updated.audit = audit;
         }
         // Trusted Identity Proxy (SSO) is a Pro feature. Re-saving an unchanged SSO setup
         // (the dashboard form always sends every field) stays allowed so a lapsed license

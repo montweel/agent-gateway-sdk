@@ -5,10 +5,8 @@ import type { Rule } from "./types";
 import {
   AGENT_KEY_HEADER,
   AGENT_KEY_PREFIX,
-  AGENT_REASON_HEADER,
   HOPS_HEADER,
   JSON_BODY_LIMIT,
-  MAX_AGENT_REASON_LENGTH,
   MAX_HOPS,
   MAX_UPSTREAM_BYTES,
   REPLAY_HEADER,
@@ -25,18 +23,14 @@ import { buildSnapshot, createAudit, discardPending, queuePending } from "./pend
 import type { Audit, Caller } from "./pendingQueue";
 import { applyOperatingMode } from "./operatingMode";
 import { callerIdOf, extractAmount } from "./guards";
-import { extractBody, failClosed, normalizePath, sendCaughtError, sendError, truncate, withTimeout } from "./utils";
+import { extractBody, failClosed, normalizePath, sendCaughtError, sendError, withTimeout } from "./utils";
 import { resolveWorkspace, scopedRuleKey, splitWorkspacePath } from "./workspaces";
 import type { Workspace } from "./workspaces";
 import { describeFindings, inspectResponseBody } from "./responseGuard";
+import { justificationFromHeaders } from "./justification";
+import { captureResponse, endUserOf } from "./payloadCapture";
 
-/** Cleans the free-text justification an agent may send in x-agent-reason. */
-export function cleanAgentReason(raw: string | undefined | null): string | null {
-  if (!raw) return null;
-  // eslint-disable-next-line no-control-regex
-  const clean = raw.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
-  return clean ? truncate(clean, MAX_AGENT_REASON_LENGTH) : null;
-}
+export { cleanAgentReason } from "./justification";
 
 /** What an agent is told when it is refused. Thresholds stay private; the kind of refusal does not. */
 export function blockMessage(matched: string, path: string, reason: string | null): string {
@@ -293,7 +287,8 @@ export function createInterceptor(ctx: GatewayContext): RequestHandler {
             query: req.query,
             headers: req.headers,
             caller,
-            agentReason: cleanAgentReason(req.get(AGENT_REASON_HEADER)),
+            // Header first; queuePending falls back to a justification / reason / summary body field.
+            agentReason: justificationFromHeaders((name) => req.get(name)),
             matched: why,
             amount,
             workspace,
@@ -328,7 +323,8 @@ export function createInterceptor(ctx: GatewayContext): RequestHandler {
         await guard.commit(null);
         guard.release(); // recorded: the next request on this rule may be checked now
         const shadowNote = shadow ? `shadow: would have ${shadow === "BLOCK" ? "blocked" : "held for approval"} (${ruleDecision.matched})` : null;
-        await audit.logStrict({
+        const captureOn = ctx.config.load().audit.capturePayloads;
+        const logId = await audit.logStrict({
           method: req.method,
           path: cleanPath,
           status: "ALLOWED",
@@ -339,7 +335,10 @@ export function createInterceptor(ctx: GatewayContext): RequestHandler {
           workspaceId: wsId,
           shadow,
           snapshot: snapshot(),
+          responsePending: captureOn,
         });
+        // Installed before forward(), so it sees the final bytes (after the response guard, if any).
+        if (captureOn) captureResponse(ctx, res, logId);
         await forward(req, res, next, scope, caller);
       } finally {
         guard.release();
@@ -383,7 +382,16 @@ export function createInterceptor(ctx: GatewayContext): RequestHandler {
           const resolved = resolveWorkspace(ctx.workspaces, { pathSlug: pathWs?.slug ?? null, headerSlug: req.get(WORKSPACE_HEADER) ?? null, key: creds.workspaceKey });
           const forwardUrl = pathWs ? pathWs.rest : req.originalUrl;
           const cleanPath = normalizePath(forwardUrl.split("?")[0]);
-          const anonymous: Caller = { ip: bucketIp(rawIp), userAgent, agentKeyName: null, agentKeyId: null, agentKeyPrefix: null };
+          const endUser = endUserOf((name) => req.get(name), config);
+          const anonymous: Caller = {
+            ip: bucketIp(rawIp),
+            userAgent,
+            agentKeyName: null,
+            agentKeyId: null,
+            agentKeyPrefix: null,
+            endUser: endUser.endUser,
+            endUserVerified: endUser.verified,
+          };
           if (!resolved.ok) {
             await audit.logRefusal({ method: req.method, path: cleanPath, status: "BLOCKED", caller: anonymous, userAgent, detail: resolved.reason, workspaceId: ctx.workspaces.bySlug(pathWs?.slug ?? req.get(WORKSPACE_HEADER) ?? "")?.id ?? null });
             if (resolved.status === 401) res.setHeader("WWW-Authenticate", 'Bearer realm="agent-gateway"');

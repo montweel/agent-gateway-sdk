@@ -47,7 +47,7 @@ const readline_1 = __importDefault(require("readline"));
 const stream_1 = require("stream");
 const constants_1 = require("./core/constants");
 const proxy_1 = require("./core/proxy");
-const interceptor_1 = require("./core/interceptor");
+const justification_1 = require("./core/justification");
 exports.DEFAULT_APPROVAL_WAIT_MS = 5 * 60000;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 120000;
 const SSE_KEEPALIVE_MS = 15000;
@@ -90,7 +90,9 @@ async function gateToolCall(guard, msg, caller, opts, executeLater) {
         return { kind: "respond", message: rpcError(id, -32602, "tools/call needs params.name (string).") };
     }
     const meta = isObject(params._meta) ? params._meta : {};
-    const reason = caller.reason ?? (typeof meta["mont/reason"] === "string" ? (0, interceptor_1.cleanAgentReason)(meta["mont/reason"]) : null);
+    // Header (x-mont-justification / x-agent-reason), then _meta; the queue falls back to a
+    // justification / reason / summary field in the tool arguments.
+    const reason = caller.reason ?? (0, justification_1.justificationFromMcpMeta)(meta);
     const verdict = await guard.check({
         toolName: params.name,
         arguments: params.arguments,
@@ -208,7 +210,7 @@ function upstreamHeaders(req) {
     const headers = new Headers();
     for (const [key, value] of Object.entries(req.headers)) {
         const k = key.toLowerCase();
-        if (value === undefined || constants_1.HOP_BY_HOP.has(k) || constants_1.NEVER_FORWARD.has(k) || k === constants_1.AGENT_REASON_HEADER)
+        if (value === undefined || constants_1.HOP_BY_HOP.has(k) || constants_1.NEVER_FORWARD.has(k) || k === constants_1.AGENT_REASON_HEADER || k === constants_1.JUSTIFICATION_HEADER)
             continue;
         const v = Array.isArray(value) ? value.join(", ") : value;
         const lower = v.toLowerCase();
@@ -394,7 +396,7 @@ function createMcpHttpProxy(gateway, opts) {
                     ip: req.ip ?? req.socket.remoteAddress ?? "unknown",
                     userAgent: req.get("user-agent") ?? "mcp-client",
                     agentKey: agentKeyOf(req),
-                    reason: (0, interceptor_1.cleanAgentReason)(req.get(constants_1.AGENT_REASON_HEADER)),
+                    reason: (0, justification_1.justificationFromHeaders)((name) => req.get(name)),
                     workspace: workspaceOf(req, opts.workspace),
                 };
                 try {
@@ -530,7 +532,7 @@ function createMcpHttpProxy(gateway, opts) {
                 ip: s.ip,
                 userAgent: req.get("user-agent") ?? s.userAgent,
                 agentKey: agentKeyOf(req) ?? s.agentKey,
-                reason: (0, interceptor_1.cleanAgentReason)(req.get(constants_1.AGENT_REASON_HEADER)),
+                reason: (0, justification_1.justificationFromHeaders)((name) => req.get(name)),
                 workspace: postWorkspace ?? s.workspace,
             };
             const makeHeaders = () => {

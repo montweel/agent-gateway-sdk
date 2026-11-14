@@ -33,9 +33,9 @@ import { Readable } from "stream";
 import type { Writable } from "stream";
 import type { AgentGateway } from "./gateway";
 import type { ExecuteOutcome, ExecuteOverride, McpGuard } from "./core/toolGuard";
-import { AGENT_KEY_HEADER, AGENT_KEY_PREFIX, AGENT_REASON_HEADER, HOP_BY_HOP, NEVER_FORWARD, WORKSPACE_HEADER, WORKSPACE_KEY_PREFIX } from "./core/constants";
+import { AGENT_KEY_HEADER, AGENT_KEY_PREFIX, AGENT_REASON_HEADER, HOP_BY_HOP, JUSTIFICATION_HEADER, NEVER_FORWARD, WORKSPACE_HEADER, WORKSPACE_KEY_PREFIX } from "./core/constants";
 import { readCapped, isTimeoutError } from "./core/proxy";
-import { cleanAgentReason } from "./core/interceptor";
+import { justificationFromHeaders, justificationFromMcpMeta } from "./core/justification";
 
 export const DEFAULT_APPROVAL_WAIT_MS = 5 * 60_000;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 120_000;
@@ -116,7 +116,9 @@ export async function gateToolCall<T>(
     return { kind: "respond", message: rpcError(id, -32602, "tools/call needs params.name (string).") };
   }
   const meta = isObject(params._meta) ? params._meta : {};
-  const reason = caller.reason ?? (typeof meta["mont/reason"] === "string" ? cleanAgentReason(meta["mont/reason"]) : null);
+  // Header (x-mont-justification / x-agent-reason), then _meta; the queue falls back to a
+  // justification / reason / summary field in the tool arguments.
+  const reason = caller.reason ?? justificationFromMcpMeta(meta);
 
   const verdict = await guard.check({
     toolName: params.name,
@@ -263,7 +265,7 @@ function upstreamHeaders(req: Request): Headers {
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
     const k = key.toLowerCase();
-    if (value === undefined || HOP_BY_HOP.has(k) || NEVER_FORWARD.has(k) || k === AGENT_REASON_HEADER) continue;
+    if (value === undefined || HOP_BY_HOP.has(k) || NEVER_FORWARD.has(k) || k === AGENT_REASON_HEADER || k === JUSTIFICATION_HEADER) continue;
     const v = Array.isArray(value) ? value.join(", ") : value;
     const lower = v.toLowerCase();
     if (k === "authorization" && (lower.startsWith(`bearer ${AGENT_KEY_PREFIX}`) || lower.startsWith(`bearer ${WORKSPACE_KEY_PREFIX}`))) continue;
@@ -471,7 +473,7 @@ export function createMcpHttpProxy(gateway: AgentGateway, opts: McpHttpProxyOpti
           ip: req.ip ?? req.socket.remoteAddress ?? "unknown",
           userAgent: req.get("user-agent") ?? "mcp-client",
           agentKey: agentKeyOf(req),
-          reason: cleanAgentReason(req.get(AGENT_REASON_HEADER)),
+          reason: justificationFromHeaders((name) => req.get(name)),
           workspace: workspaceOf(req, opts.workspace),
         };
 
@@ -605,7 +607,7 @@ export function createMcpHttpProxy(gateway: AgentGateway, opts: McpHttpProxyOpti
         ip: s.ip,
         userAgent: req.get("user-agent") ?? s.userAgent,
         agentKey: agentKeyOf(req) ?? s.agentKey,
-        reason: cleanAgentReason(req.get(AGENT_REASON_HEADER)),
+        reason: justificationFromHeaders((name) => req.get(name)),
         workspace: postWorkspace ?? s.workspace,
       };
       const makeHeaders = (): Headers => {

@@ -1,7 +1,7 @@
-import type { Request, Response, Router } from "express";
+import type { NextFunction, Request, Response, Router } from "express";
 import type { GatewayContext } from "../context";
 import type { LogStatus } from "../types";
-import { escapeLike, sendInternalError } from "../utils";
+import { escapeLike, sendError, sendInternalError } from "../utils";
 import { workspaceFilter } from "../protection";
 import { readScope } from "./scope";
 
@@ -28,6 +28,73 @@ interface AnalyticsBucket {
   total: number;
 }
 
+/** How the analytics "top agents" table labels a row with no user agent; the user_agent filter accepts it too. */
+export const UNKNOWN_AGENT_LABEL = "Unknown Agent";
+const AGENT_LABEL_SQL = `COALESCE(NULLIF(TRIM(user_agent), ''), '${UNKNOWN_AGENT_LABEL}')`;
+
+/**
+ * Audit log filters shared by GET /logs and GET /logs/export.csv, so the CSV always holds
+ * exactly the rows the dashboard shows. Returns SQL starting with " AND ..." (or empty).
+ *   status, method          exact (case-insensitive)
+ *   search                  path contains
+ *   path                    path equals (e.g. from an analytics row)
+ *   action_id               the approval / request id (#736 in Telegram and Pending Approvals)
+ *   user_agent              exact, as labelled in analytics (UNKNOWN_AGENT_LABEL = none recorded)
+ *   from, to                ISO timestamps
+ *   shadow=1                only shadow-mode hits
+ *   unknown=1               only calls that matched no rule (default deny)
+ */
+export function logFilterSql(query: Request["query"]): { sql: string; params: unknown[] } {
+  const { status, method, search, path, action_id, user_agent, from, to, shadow, unknown } = query;
+  let sql = "";
+  const params: unknown[] = [];
+  const text = (v: unknown): string | null => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
+
+  if (shadow === "1" || shadow === "true") sql += " AND shadow IS NOT NULL";
+  // Unknown endpoints: calls that matched no rule and were refused by default deny
+  // (see interceptor.ts and toolGuard.ts, which write exactly these details).
+  if (unknown === "1" || unknown === "true") sql += " AND status = 'BLOCKED' AND detail IN ('default-deny', 'mcp default-deny')";
+  if (text(status)) {
+    sql += " AND status = ?";
+    params.push(text(status)!.toUpperCase());
+  }
+  if (text(method)) {
+    sql += " AND method = ?";
+    params.push(text(method)!.toUpperCase());
+  }
+  if (text(search)) {
+    sql += " AND path LIKE ? ESCAPE '\\'";
+    params.push(`%${escapeLike(text(search)!.slice(0, 200))}%`);
+  }
+  if (text(path)) {
+    sql += " AND path = ?";
+    params.push(text(path)!.slice(0, 2048));
+  }
+  if (text(action_id)) {
+    // A non-numeric id can match nothing, rather than being ignored and showing everything.
+    const id = Number(text(action_id)!.replace(/^#/, ""));
+    sql += " AND action_id = ?";
+    params.push(Number.isInteger(id) && id > 0 ? id : -1);
+  }
+  if (text(user_agent)) {
+    sql += ` AND ${AGENT_LABEL_SQL} = ?`;
+    params.push(text(user_agent)!.slice(0, 1024));
+  }
+  for (const [v, op] of [
+    [from, ">="],
+    [to, "<="],
+  ] as const) {
+    if (text(v)) {
+      const d = new Date(text(v)!);
+      if (!Number.isNaN(d.getTime())) {
+        sql += ` AND timestamp ${op} ?`;
+        params.push(d.toISOString());
+      }
+    }
+  }
+  return { sql, params };
+}
+
 /** Audit log listing and traffic analytics. */
 export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
   const { db, license } = ctx;
@@ -36,58 +103,85 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
     const scoped = readScope(ctx, req, res);
     if (scoped === undefined) return;
     try {
-      const { status, method, search, from, to, limit, shadow } = req.query;
+      const { limit } = req.query;
       const wf = workspaceFilter(scoped?.id ?? null);
-      let sql = `SELECT * FROM agent_logs WHERE 1=1${wf.sql}`;
-      const params: unknown[] = [...wf.params];
-      if (shadow === "1" || shadow === "true") sql += " AND shadow IS NOT NULL";
-
-      if (typeof status === "string" && status.trim() !== "") {
-        sql += " AND status = ?";
-        params.push(status.trim().toUpperCase());
-      }
-      if (typeof method === "string" && method.trim() !== "") {
-        sql += " AND method = ?";
-        params.push(method.trim().toUpperCase());
-      }
-      if (typeof search === "string" && search.trim() !== "") {
-        sql += " AND path LIKE ? ESCAPE '\\'";
-        params.push(`%${escapeLike(search.trim().slice(0, 200))}%`);
-      }
-      if (typeof from === "string" && from.trim() !== "") {
-        const fromDate = new Date(from.trim());
-        if (!Number.isNaN(fromDate.getTime())) {
-          sql += " AND timestamp >= ?";
-          params.push(fromDate.toISOString());
-        }
-      }
-      if (typeof to === "string" && to.trim() !== "") {
-        const toDate = new Date(to.trim());
-        if (!Number.isNaN(toDate.getTime())) {
-          sql += " AND timestamp <= ?";
-          params.push(toDate.toISOString());
-        }
-      }
+      const filter = logFilterSql(req.query);
+      let sql = `SELECT * FROM agent_logs WHERE 1=1${wf.sql}${filter.sql}`;
+      const params: unknown[] = [...wf.params, ...filter.params];
 
       const parsedLimit = Math.min(Math.max(Math.trunc(Number(limit)) || 100, 1), 1000);
       sql += " ORDER BY id DESC LIMIT ?";
       params.push(parsedLimit);
 
       const rows = await db.all<Record<string, unknown>>(sql, params);
-      // The chain fields are for /audit/verify; the snapshot can be large: keep list responses lean.
+      // Snapshots and responses can be large: keep list responses lean (GET /logs/:id has them).
       res.json(
         rows.map((row) => {
           const r: Record<string, unknown> = { ...row };
           r.has_snapshot = row.request_snapshot !== null;
+          r.has_response = row.response_payload !== null;
+          r.end_user_verified = row.end_user_verified === 1;
           r.sealed = row.row_hash !== null;
           r.workspace_slug = ctx.workspaces.get((row.workspace_id as number | null) ?? 1)?.slug ?? null;
           delete r.request_snapshot;
+          delete r.response_payload;
+          delete r.response_pending;
           delete r.prev_hash;
           return r;
         })
       );
     } catch (err) {
       sendInternalError(res, "Logs error", err, "Could not load audit logs.");
+    }
+  });
+
+  /**
+   * One audit row with everything recorded about it (all already redacted when stored):
+   * the request (body / query / headers from the snapshot), the response, attribution and the
+   * row's place in the hash chain.
+   */
+  router.get("/logs/:id", async (req: Request, res: Response, next: NextFunction) => {
+    const raw = String(req.params.id);
+    if (!/^\d+$/.test(raw)) return next(); // /logs/export.csv and friends
+    const scoped = readScope(ctx, req, res);
+    if (scoped === undefined) return;
+    try {
+      const wf = workspaceFilter(scoped?.id ?? null);
+      const row = await db.get<Record<string, unknown>>(`SELECT * FROM agent_logs WHERE id = ?${wf.sql}`, [Number(raw), ...wf.params]);
+      if (!row) {
+        sendError(res, 404, "Not Found", `No audit row #${raw}.`);
+        return;
+      }
+      const parse = (v: unknown): unknown => {
+        if (typeof v !== "string") return null;
+        try {
+          return JSON.parse(v) as unknown;
+        } catch {
+          return v;
+        }
+      };
+      const snapshot = parse(row.request_snapshot) as { body?: unknown; query?: unknown; headers?: unknown; truncated?: boolean; bodyUnknown?: boolean } | null;
+      const out: Record<string, unknown> = { ...row };
+      delete out.request_snapshot;
+      out.workspace_slug = ctx.workspaces.get((row.workspace_id as number | null) ?? 1)?.slug ?? null;
+      out.sealed = row.row_hash !== null;
+      out.end_user_verified = row.end_user_verified === 1;
+      out.response_pending = row.response_pending === 1 && row.row_hash === null;
+      out.request =
+        snapshot && typeof snapshot === "object"
+          ? {
+              body: snapshot.body ?? null,
+              query: snapshot.query ?? null,
+              headers: snapshot.headers ?? null,
+              ...(snapshot.truncated ? { truncated: true } : {}),
+              ...(snapshot.bodyUnknown ? { bodyUnknown: true } : {}),
+            }
+          : null;
+      out.response = parse(row.response_payload);
+      delete out.response_payload;
+      res.json(out);
+    } catch (err) {
+      sendInternalError(res, "Log detail error", err, "Could not load the audit row.");
     }
   });
 
@@ -168,7 +262,7 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
         intervened: number;
       }>(
         `SELECT
-           COALESCE(NULLIF(TRIM(user_agent), ''), 'Unknown Agent') AS agent,
+           ${AGENT_LABEL_SQL} AS agent,
            COUNT(*) AS total,
            SUM(CASE WHEN status IN ('ALLOWED', 'APPROVED') THEN 1 ELSE 0 END) AS allowed,
            SUM(CASE WHEN status IN ('BLOCKED', 'RATE_LIMITED', 'REJECTED') THEN 1 ELSE 0 END) AS intervened

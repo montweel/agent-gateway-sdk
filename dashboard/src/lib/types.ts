@@ -92,6 +92,23 @@ export interface BudgetUsage {
   remaining: number
 }
 
+/** GET /audit/digest: last 24h in one template sentence (computed locally, no LLM). */
+export interface AuditDigest {
+  windowHours: number
+  since: string
+  generatedAt: string
+  workspaceId: number | null
+  totalRequests: number
+  blocked: number
+  rateLimited: number
+  rejected: number
+  riskyCalls: number
+  moneyPrevented: number
+  riskyCallsWithAmount: number
+  pendingApprovals: number
+  summary: string
+}
+
 export interface ProtectionSummary {
   windowHours: number
   since: string
@@ -128,6 +145,37 @@ export interface LogRow {
   row_hash?: string | null
   sealed?: boolean
   has_snapshot?: boolean
+  /** The human the agent acted for (x-forwarded-user on the agent's request; asserted by the agent). */
+  end_user?: string | null
+  /** True when the trusted identity proxy vouched for end_user (SSO shared secret); false = agent-claimed. */
+  end_user_verified?: boolean
+  /** Admin who approved a held action (APPROVED rows). */
+  approved_by?: string | null
+  has_response?: boolean
+}
+
+/** GET /logs/:id — everything stored about one audit row (already redacted server-side). */
+export interface LogDetail extends Omit<LogRow, 'has_snapshot' | 'has_response'> {
+  prev_hash: string | null
+  row_hash: string | null
+  sealed: boolean
+  /** The response is still in flight (the row is sealed once it lands). */
+  response_pending: boolean
+  request: {
+    body: unknown
+    query: unknown
+    headers: Record<string, string> | null
+    truncated?: boolean
+    bodyUnknown?: boolean
+  } | null
+  response: {
+    status: number
+    contentType: string | null
+    bytes: number
+    body: unknown
+    truncated?: boolean
+    note?: string
+  } | string | null
 }
 
 export interface HourlyBucket {
@@ -341,6 +389,15 @@ export interface GatewayConfig {
   ssoSharedSecretConfigured?: boolean
   ssoUserHeader?: string
   ssoRoleHeader?: string
+  /** Compliance audit trail (config.json "audit"). */
+  audit?: AuditConfig
+}
+
+export interface AuditConfig {
+  /** Store the redacted upstream response with each ALLOWED / APPROVED row. */
+  capturePayloads: boolean
+  /** Extra whole-key names to redact, on top of the built-in secret list. */
+  redactKeys: string[]
 }
 
 export interface TeamUser {

@@ -73,6 +73,32 @@ const WEB_TERMS: Term[] = [
   { id: "webhook", label: "webhooks", dep: "webhook", keyword: "webhook" },
 ];
 
+/**
+ * High-intent targeted searches (FinTech + Travel/PMS + Shopify agent builders). Run before the
+ * generic AI x web combos so they get priority within --max-repos.
+ * `q` uses OR / (group) syntax; GitHub's REST search rejects parentheses and >5 operators, so each
+ * query is expanded into plain AND queries (cartesian product of its OR groups) at runtime.
+ */
+interface TargetedQuery {
+  id: string;
+  q: string;
+  ai: string;
+  web: string;
+}
+const TARGETED_QUERIES: TargetedQuery[] = [
+  { id: "stripe-agent-toolkit", q: '"@stripe/agent-toolkit" OR "@stripe/mcp" OR "mcp-stripe"', ai: "Stripe agent toolkit/MCP", web: "Stripe" },
+  { id: "payments-agent", q: '("stripe" OR "razorpay" OR "chargebee") ("mcp" OR "langchain" OR "ai-sdk") ("refund" OR "webhook")', ai: "AI agent", web: "Payments" },
+  { id: "travel-pms-agent", q: '("hostaway" OR "guesty" OR "amadeus" OR "duffel") ("openai" OR "anthropic" OR "mcp" OR "agent")', ai: "AI agent", web: "Travel/PMS" },
+  { id: "shopify-admin-agent", q: '("shopify-api-node" OR "@shopify/admin-api-client") ("openai" OR "anthropic" OR "mcp")', ai: "AI agent", web: "Shopify" },
+];
+
+/** '("a" OR "b") ("c" OR "d")' -> ['"a" "c"', '"a" "d"', '"b" "c"', '"b" "d"']; ungrouped 'x OR y' -> ['x', 'y']. */
+function expandQuery(q: string): string[] {
+  const groups = [...q.matchAll(/\(([^)]*)\)/g)].map((m) => m[1]);
+  const parts = (groups.length ? groups : [q]).map((g) => g.split(/\s+OR\s+/).map((s) => s.trim()).filter(Boolean));
+  return parts.reduce<string[]>((acc, alts) => acc.flatMap((a) => alts.map((b) => (a ? `${a} ${b}` : b))), [""]);
+}
+
 const SUBREDDITS = ["mcp", "AI_Agents", "shopify", "node", "LangChain"];
 const REDDIT_QUERY = '"rate limit" OR "human in the loop" OR approval OR "prompt injection" OR security OR guardrails OR "in production" OR runaway';
 const REDDIT_TOPICS: Array<{ id: string; re: RegExp }> = [
@@ -182,48 +208,62 @@ interface RepoHit {
 
 async function discoverRepos(): Promise<Map<string, RepoHit>> {
   const hits = new Map<string, RepoHit>();
-  const add = (repo: GhRepo, ai: Term, web: Term): void => {
+  const add = (repo: GhRepo, ai: string, web: string): void => {
     if (repo.fork || repo.archived) return;
     if (new Date(repo.pushed_at) < SINCE) return;
     const hit = hits.get(repo.full_name) ?? { repo, ai: new Set<string>(), web: new Set<string>() };
-    hit.ai.add(ai.label);
-    hit.web.add(web.label);
+    hit.ai.add(ai);
+    hit.web.add(web);
     hits.set(repo.full_name, hit);
   };
+
+  // Code search -> candidate repos -> fetch each and filter by pushed_at (code search has no date filter).
+  const fromCodeSearch = async (q: string, ai: string, web: string, label: string): Promise<void> => {
+    const data = await github<{ items: Array<{ repository: { full_name: string } }> }>(
+      `https://api.github.com/search/code?q=${encodeURIComponent(q)}&per_page=30`,
+      "code"
+    );
+    const names = [...new Set((data?.items ?? []).map((i) => i.repository.full_name))];
+    log(`code search ${label}: ${names.length} candidate repos`);
+    for (const name of names) {
+      if (hits.size >= MAX_REPOS) break;
+      const existing = hits.get(name);
+      if (existing) {
+        existing.ai.add(ai);
+        existing.web.add(web);
+        continue;
+      }
+      const repo = await github<GhRepo>(`https://api.github.com/repos/${name}`);
+      if (repo) add(repo, ai, web);
+    }
+  };
+  const fromRepoSearch = async (q: string, ai: string, web: string, label: string): Promise<void> => {
+    const full = `${q} pushed:>=${SINCE_DAY} fork:false archived:false`;
+    const data = await github<{ items: GhRepo[] }>(
+      `https://api.github.com/search/repositories?q=${encodeURIComponent(full)}&sort=updated&order=desc&per_page=30`,
+      "search"
+    );
+    log(`repo search ${label}: ${(data?.items ?? []).length} repos`);
+    for (const repo of data?.items ?? []) add(repo, ai, web);
+  };
+
+  // High-intent targeted queries first.
+  for (const t of TARGETED_QUERIES) {
+    for (const q of expandQuery(t.q)) {
+      if (hits.size >= MAX_REPOS) break;
+      const label = `[${t.id}] ${q}`;
+      if (TOKEN) await fromCodeSearch(q, t.ai, t.web, label);
+      else await fromRepoSearch(q, t.ai, t.web, label);
+    }
+  }
 
   const combos = AI_TERMS.flatMap((ai) => WEB_TERMS.map((web) => ({ ai, web })));
   for (const { ai, web } of combos) {
     if (hits.size >= MAX_REPOS) break;
-    if (TOKEN) {
-      // Precise: both strings in the same package.json. Code search cannot filter on push date,
-      // so each candidate repo is fetched and filtered by pushed_at.
-      const q = `${ai.dep} ${web.dep} filename:package.json`;
-      const data = await github<{ items: Array<{ repository: { full_name: string } }> }>(
-        `https://api.github.com/search/code?q=${encodeURIComponent(q)}&per_page=30`,
-        "code"
-      );
-      const names = [...new Set((data?.items ?? []).map((i) => i.repository.full_name))];
-      log(`code search ${ai.id} + ${web.id}: ${names.length} candidate repos`);
-      for (const name of names) {
-        if (hits.size >= MAX_REPOS) break;
-        const existing = hits.get(name);
-        if (existing) {
-          existing.ai.add(ai.label);
-          existing.web.add(web.label);
-          continue;
-        }
-        const repo = await github<GhRepo>(`https://api.github.com/repos/${name}`);
-        if (repo) add(repo, ai, web);
-      }
-    } else {
-      const q = `${ai.keyword} ${web.keyword} pushed:>=${SINCE_DAY} fork:false archived:false`;
-      const data = await github<{ items: GhRepo[] }>(
-        `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&sort=updated&order=desc&per_page=30`,
-        "search"
-      );
-      log(`repo search ${ai.id} + ${web.id}: ${(data?.items ?? []).length} repos`);
-      for (const repo of data?.items ?? []) add(repo, ai, web);
-    }
+    const label = `${ai.id} + ${web.id}`;
+    // Precise with a token: both strings in the same package.json.
+    if (TOKEN) await fromCodeSearch(`${ai.dep} ${web.dep} filename:package.json`, ai.label, web.label, label);
+    else await fromRepoSearch(`${ai.keyword} ${web.keyword}`, ai.label, web.label, label);
   }
   return hits;
 }
@@ -301,6 +341,8 @@ function trimSentence(text: string, max = 90): string {
 const WEB_RISK: Record<string, string> = {
   Stripe: "once an agent can reach Stripe-backed endpoints, a single injected instruction can turn into a burst of refunds or charges",
   Shopify: "once an agent can touch Shopify orders or refunds, one injected instruction in a ticket or product review can act on the whole store",
+  Payments: "once an agent can issue refunds or react to payment webhooks, a single injected instruction can turn into a burst of refunds or charges",
+  "Travel/PMS": "once an agent can modify bookings, rates or guest records, one injected instruction in a guest message can cancel or rebook at scale",
   webhooks: "webhook-triggered agent actions are a common place for an injected payload to slip straight into a write call",
   Express: "every Express route the agent can call becomes something a prompt injection can call too",
 };

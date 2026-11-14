@@ -112,7 +112,24 @@ function createAgentGateway(options = {}) {
     const agentKeys = (0, agentKeys_1.createAgentKeyStore)(db);
     const settings = (0, settingsStore_1.createSettingsStore)(db);
     const blocklist = (0, callerBlocklist_1.createCallerBlocklist)(db);
-    const redactor = (0, redactor_1.createRedactor)(() => settings.privacy());
+    // config.json audit.redactKeys, normalised once per change. Redaction runs several times per
+    // request, so config.json (a stat() per load) is consulted at most once a second.
+    let redactKeysSource = "";
+    let redactKeySet = new Set();
+    let redactKeysCheckedAt = 0;
+    const redactor = (0, redactor_1.createRedactor)(() => settings.privacy(), () => {
+        const now = Date.now();
+        if (now - redactKeysCheckedAt < 1000)
+            return redactKeySet;
+        redactKeysCheckedAt = now;
+        const keys = config.load().audit.redactKeys;
+        const source = keys.join("\n");
+        if (source !== redactKeysSource) {
+            redactKeysSource = source;
+            redactKeySet = new Set(keys.map(redactor_1.normalizeRedactKey).filter(Boolean));
+        }
+        return redactKeySet;
+    });
     const endpoints = {
         telegramApiBase: (options.telegramApiBase ?? "https://api.telegram.org").replace(/\/+$/, ""),
         slackApiBase: (options.slackApiBase ?? "https://slack.com/api").replace(/\/+$/, ""),

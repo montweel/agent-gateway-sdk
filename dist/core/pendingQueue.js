@@ -9,6 +9,9 @@ const constants_2 = require("./constants");
 const crypto_1 = require("./crypto");
 const utils_1 = require("./utils");
 const notify_1 = require("./notify");
+const justification_1 = require("./justification");
+/** agent_logs / pending_actions.end_user_verified: 1 verified, 0 agent-claimed, NULL no end user. */
+const verifiedFlag = (c) => (c?.endUser ? (c.endUserVerified ? 1 : 0) : null);
 /**
  * The redacted copy of a request kept with its audit row, so "Test rules against history" can
  * replay it later. Same scrubbing as everything else stored; capped at MAX_SNAPSHOT_CHARS (a
@@ -30,8 +33,8 @@ function buildSnapshot(ctx, s) {
 }
 function createAudit(ctx) {
     async function logStrict(e) {
-        const write = ctx.db.run(`INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, shadow, request_snapshot)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+        const write = ctx.db.run(`INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, shadow, request_snapshot, end_user, end_user_verified, response_pending)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             new Date().toISOString(),
             e.method,
             (0, utils_1.truncate)(ctx.redactor.text(e.path), constants_1.MAX_LOG_PATH_LENGTH),
@@ -45,10 +48,14 @@ function createAudit(ctx) {
             e.workspaceId ?? constants_2.DEFAULT_WORKSPACE_ID,
             e.shadow ?? null,
             e.snapshot ?? null,
+            e.caller?.endUser ?? null,
+            verifiedFlag(e.caller),
+            e.responsePending ? 1 : null,
         ]);
         try {
-            await (0, utils_1.withTimeout)(write, ctx.dbTimeoutMs, "audit log write");
+            const { lastID } = await (0, utils_1.withTimeout)(write, ctx.dbTimeoutMs, "audit log write");
             ctx.ledger.kick();
+            return lastID;
         }
         catch (err) {
             // The request is about to be refused. If the timed-out row still lands later, it must
@@ -67,10 +74,11 @@ function createAudit(ctx) {
     async function correctLateRow(id, e) {
         const note = "Refused (fail-closed): the audit write timed out, so the request was not forwarded.";
         try {
-            const r = await ctx.db.run("UPDATE agent_logs SET status = 'BLOCKED', detail = ? WHERE id = ? AND row_hash IS NULL", [note, id]);
+            // Nothing was forwarded, so no response is coming: clearing response_pending also lets the sealer go on.
+            const r = await ctx.db.run("UPDATE agent_logs SET status = 'BLOCKED', detail = ?, response_pending = NULL WHERE id = ? AND row_hash IS NULL", [note, id]);
             if (r.changes === 0) {
-                await ctx.db.run(`INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id)
-           VALUES (?, ?, ?, 'BLOCKED', ?, ?, ?, ?, ?, NULL, ?)`, [
+                await ctx.db.run(`INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, end_user, end_user_verified)
+           VALUES (?, ?, ?, 'BLOCKED', ?, ?, ?, ?, ?, NULL, ?, ?, ?)`, [
                     new Date().toISOString(),
                     e.method,
                     (0, utils_1.truncate)(ctx.redactor.text(e.path), constants_1.MAX_LOG_PATH_LENGTH),
@@ -80,6 +88,8 @@ function createAudit(ctx) {
                     e.caller?.ip ?? null,
                     `Correction for log #${id}: ${note}`,
                     e.workspaceId ?? constants_2.DEFAULT_WORKSPACE_ID,
+                    e.caller?.endUser ?? null,
+                    verifiedFlag(e.caller),
                 ]);
             }
             ctx.ledger.kick();
@@ -123,15 +133,18 @@ async function queuePending(ctx, audit, q) {
         ? `${redactedBody.slice(0, constants_1.MAX_PENDING_DISPLAY_CHARS)}… [truncated]`
         : redactedBody;
     const query = r.json((0, utils_1.redactQueryObject)(q.query));
-    const agentReason = q.agentReason ? r.text(q.agentReason) : null;
+    // The agent's justification: an explicit header / _meta value, else a justification / reason /
+    // summary field in the payload (HTTP body or MCP tool arguments).
+    const justification = q.agentReason ?? (0, justification_1.justificationFromBodyText)(q.originalBody);
+    const agentReason = justification ? r.text(justification) : null;
     const queuedAt = new Date().toISOString();
     const expiresAt = Date.now() + constants_1.PENDING_TTL_MS;
     const displayPath = (0, utils_1.truncate)(r.text((0, utils_1.redactQueryString)(q.originalPath)), constants_1.MAX_LOG_PATH_LENGTH);
     const userAgent = (0, utils_1.truncate)(r.text(q.caller.userAgent), constants_1.MAX_LOG_UA_LENGTH);
     const insert = ctx.db.run(`INSERT INTO pending_actions
        (timestamp, method, path, headers, body, status, expires_at, agent_key, encrypted_payload,
-        query_json, caller_ip, caller_ua, agent_key_id, agent_key_prefix, agent_reason, matched_policy, kind, owner, workspace_id)
-     VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+        query_json, caller_ip, caller_ua, agent_key_id, agent_key_prefix, agent_reason, matched_policy, kind, owner, workspace_id, end_user, end_user_verified)
+     VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
         queuedAt,
         q.method,
         displayPath,
@@ -150,6 +163,8 @@ async function queuePending(ctx, audit, q) {
         q.kind,
         q.kind === "mcp" ? ctx.instanceId : null,
         wsId,
+        q.caller.endUser ?? null,
+        verifiedFlag(q.caller),
     ]);
     // If the insert outlives the timeout, or anything after it fails, the agent is told the
     // request failed, so the queued row must never be approvable: expire it when it lands.

@@ -13,6 +13,7 @@ import { encryptPayload } from "./crypto";
 import { DbTimeoutError, redactQueryObject, redactQueryString, truncate, withTimeout } from "./utils";
 import type { Workspace } from "./workspaces";
 import { workspaceNotice } from "./notify";
+import { justificationFromBodyText } from "./justification";
 
 /**
  * Audit logging and the approval queue, shared by the HTTP interceptor and the MCP tool guard.
@@ -29,7 +30,14 @@ export interface Caller {
   agentKeyName: string | null;
   agentKeyId: number | null;
   agentKeyPrefix: string | null;
+  /** The human the agent acts for (SSO user header, default x-forwarded-user). */
+  endUser?: string | null;
+  /** True only when the identity proxy proved itself with the SSO shared secret; otherwise agent-claimed. */
+  endUserVerified?: boolean;
 }
+
+/** agent_logs / pending_actions.end_user_verified: 1 verified, 0 agent-claimed, NULL no end user. */
+const verifiedFlag = (c: Caller | null | undefined): number | null => (c?.endUser ? (c.endUserVerified ? 1 : 0) : null);
 
 export interface AuditEntry {
   method: string;
@@ -47,6 +55,11 @@ export interface AuditEntry {
   shadow?: string | null;
   /** Redacted request snapshot (see buildSnapshot) for the policy time-machine. */
   snapshot?: string | null;
+  /**
+   * The response will be attached later (payloadCapture.ts): the ledger holds this row unsealed
+   * until it is, or until RESPONSE_CAPTURE_GRACE_MS passes.
+   */
+  responsePending?: boolean;
 }
 
 export interface SnapshotInput {
@@ -77,17 +90,17 @@ export function buildSnapshot(ctx: GatewayContext, s: SnapshotInput): string {
 }
 
 export interface Audit {
-  /** Throws on failure (including timeouts). Use before anything is forwarded or queued. */
-  logStrict(e: AuditEntry): Promise<void>;
+  /** Throws on failure (including timeouts). Use before anything is forwarded or queued. Resolves with the row id. */
+  logStrict(e: AuditEntry): Promise<number>;
   /** Best-effort, for refusals: the request is refused whether or not the row lands. */
   logRefusal(e: AuditEntry): Promise<void>;
 }
 
 export function createAudit(ctx: GatewayContext): Audit {
-  async function logStrict(e: AuditEntry): Promise<void> {
+  async function logStrict(e: AuditEntry): Promise<number> {
     const write = ctx.db.run(
-      `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, shadow, request_snapshot)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, shadow, request_snapshot, end_user, end_user_verified, response_pending)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         new Date().toISOString(),
         e.method,
@@ -102,11 +115,15 @@ export function createAudit(ctx: GatewayContext): Audit {
         e.workspaceId ?? DEFAULT_WORKSPACE_ID,
         e.shadow ?? null,
         e.snapshot ?? null,
+        e.caller?.endUser ?? null,
+        verifiedFlag(e.caller),
+        e.responsePending ? 1 : null,
       ]
     );
     try {
-      await withTimeout(write, ctx.dbTimeoutMs, "audit log write");
+      const { lastID } = await withTimeout(write, ctx.dbTimeoutMs, "audit log write");
       ctx.ledger.kick();
+      return lastID;
     } catch (err) {
       // The request is about to be refused. If the timed-out row still lands later, it must
       // not claim the request was ALLOWED/QUEUED.
@@ -128,11 +145,12 @@ export function createAudit(ctx: GatewayContext): Audit {
   async function correctLateRow(id: number, e: AuditEntry): Promise<void> {
     const note = "Refused (fail-closed): the audit write timed out, so the request was not forwarded.";
     try {
-      const r = await ctx.db.run("UPDATE agent_logs SET status = 'BLOCKED', detail = ? WHERE id = ? AND row_hash IS NULL", [note, id]);
+      // Nothing was forwarded, so no response is coming: clearing response_pending also lets the sealer go on.
+      const r = await ctx.db.run("UPDATE agent_logs SET status = 'BLOCKED', detail = ?, response_pending = NULL WHERE id = ? AND row_hash IS NULL", [note, id]);
       if (r.changes === 0) {
         await ctx.db.run(
-          `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id)
-           VALUES (?, ?, ?, 'BLOCKED', ?, ?, ?, ?, ?, NULL, ?)`,
+          `INSERT INTO agent_logs (timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, end_user, end_user_verified)
+           VALUES (?, ?, ?, 'BLOCKED', ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
           [
             new Date().toISOString(),
             e.method,
@@ -143,6 +161,8 @@ export function createAudit(ctx: GatewayContext): Audit {
             e.caller?.ip ?? null,
             `Correction for log #${id}: ${note}`,
             e.workspaceId ?? DEFAULT_WORKSPACE_ID,
+            e.caller?.endUser ?? null,
+            verifiedFlag(e.caller),
           ]
         );
       }
@@ -220,7 +240,10 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
       ? `${redactedBody.slice(0, MAX_PENDING_DISPLAY_CHARS)}… [truncated]`
       : redactedBody;
   const query = r.json(redactQueryObject(q.query)) as Record<string, unknown>;
-  const agentReason = q.agentReason ? r.text(q.agentReason) : null;
+  // The agent's justification: an explicit header / _meta value, else a justification / reason /
+  // summary field in the payload (HTTP body or MCP tool arguments).
+  const justification = q.agentReason ?? justificationFromBodyText(q.originalBody);
+  const agentReason = justification ? r.text(justification) : null;
   const queuedAt = new Date().toISOString();
   const expiresAt = Date.now() + PENDING_TTL_MS;
   const displayPath = truncate(r.text(redactQueryString(q.originalPath)), MAX_LOG_PATH_LENGTH);
@@ -229,8 +252,8 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
   const insert = ctx.db.run(
     `INSERT INTO pending_actions
        (timestamp, method, path, headers, body, status, expires_at, agent_key, encrypted_payload,
-        query_json, caller_ip, caller_ua, agent_key_id, agent_key_prefix, agent_reason, matched_policy, kind, owner, workspace_id)
-     VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        query_json, caller_ip, caller_ua, agent_key_id, agent_key_prefix, agent_reason, matched_policy, kind, owner, workspace_id, end_user, end_user_verified)
+     VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       queuedAt,
       q.method,
@@ -250,6 +273,8 @@ export async function queuePending(ctx: GatewayContext, audit: Audit, q: QueueRe
       q.kind,
       q.kind === "mcp" ? ctx.instanceId : null,
       wsId,
+      q.caller.endUser ?? null,
+      verifiedFlag(q.caller),
     ]
   );
 

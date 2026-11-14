@@ -21,7 +21,12 @@ const CREATE_AGENT_LOGS_SQL = `
     original_payload TEXT,
     modified_payload TEXT,
     prev_hash TEXT,
-    row_hash TEXT
+    row_hash TEXT,
+    end_user TEXT,
+    approved_by TEXT,
+    response_payload TEXT,
+    response_pending INTEGER,
+    end_user_verified INTEGER
   )
 `;
 
@@ -78,6 +83,14 @@ const AGENT_LOGS_EXTRA_COLUMNS: Record<string, string> = {
   modified_payload: "TEXT",
   prev_hash: "TEXT",
   row_hash: "TEXT",
+  // Compliance audit trail. end_user / approved_by / response_payload are part of the row hash;
+  // response_pending (1 while the response is still in flight) only tells the sealer to wait.
+  end_user: "TEXT",
+  approved_by: "TEXT",
+  response_payload: "TEXT",
+  response_pending: "INTEGER",
+  // 1 = the identity proxy vouched for end_user (SSO shared secret), 0 = agent-claimed. Hashed.
+  end_user_verified: "INTEGER",
 };
 
 const PENDING_EXTRA_COLUMNS: Record<string, string> = {
@@ -100,6 +113,8 @@ const PENDING_EXTRA_COLUMNS: Record<string, string> = {
   modified_body: "TEXT",
   modified_query: "TEXT",
   patch_encrypted: "TEXT",
+  end_user: "TEXT",
+  end_user_verified: "INTEGER",
 };
 
 const CREATE_BLOCKED_CALLERS_SQL = `
@@ -145,7 +160,9 @@ const CREATE_PENDING_ACTIONS_SQL = `
     workspace_id INTEGER,
     modified_body TEXT,
     modified_query TEXT,
-    patch_encrypted TEXT
+    patch_encrypted TEXT,
+    end_user TEXT,
+    end_user_verified INTEGER
   )
 `;
 

@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import type { Db } from "./db";
+import { RESPONSE_CAPTURE_GRACE_MS } from "./constants";
 
 /**
  * Tamper-evident, hash-chained audit ledger over agent_logs.
@@ -12,6 +13,17 @@ import type { Db } from "./db";
  *   route            = "<METHOD> <path>"
  *   decision         = status (ALLOWED, BLOCKED, QUEUED, APPROVED, ...)
  *   redacted_payload = detail + request_snapshot (both redacted before they were stored)
+ *
+ * Compliance attribution (v2.1): when a row has end_user, approved_by or response_payload, the
+ * canonical array gets a 14th element [end_user, approved_by, response_payload]. Rows without
+ * them hash exactly as before, so a ledger sealed by an older version still verifies. When the end
+ * user was vouched for by the identity proxy (end_user_verified = 1), `true` is appended to that
+ * element, so turning an agent-claimed user into a "verified" one breaks the chain.
+ *
+ * Response capture: an ALLOWED row is written BEFORE the request is forwarded (fail-closed), so its
+ * response arrives later. Such a row is written with response_pending = 1; the sealer stops at it
+ * (rows are always sealed in id order) until the response lands or RESPONSE_CAPTURE_GRACE_MS
+ * passes, after which it is sealed without one and a late response is dropped.
  *
  * prev_hash of the first row is 64 zeros (or the retention checkpoint, below). Editing any field
  * of any row changes its hash; deleting a row breaks the next row's prev_hash link; deleting rows
@@ -51,18 +63,27 @@ export interface LedgerRow {
   request_snapshot: string | null;
   original_payload: string | null;
   modified_payload: string | null;
+  end_user: string | null;
+  end_user_verified: number | null;
+  approved_by: string | null;
+  response_payload: string | null;
+  /** Not hashed: 1 while the row waits for its response (see the header comment). */
+  response_pending: number | null;
   prev_hash: string | null;
   row_hash: string | null;
 }
 
 const LEDGER_COLUMNS =
-  "id, timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, shadow, request_snapshot, original_payload, modified_payload, prev_hash, row_hash";
+  "id, timestamp, method, path, status, user_agent, agent_key, action_id, caller_ip, detail, amount, workspace_id, shadow, request_snapshot, original_payload, modified_payload, end_user, end_user_verified, approved_by, response_payload, response_pending, prev_hash, row_hash";
 
-export function computeRowHash(prevHash: string, r: Omit<LedgerRow, "prev_hash" | "row_hash">): string {
+type Attribution = "end_user" | "end_user_verified" | "approved_by" | "response_payload";
+type HashInput = Omit<LedgerRow, "prev_hash" | "row_hash" | "response_pending" | Attribution> & Partial<Pick<LedgerRow, Attribution>>;
+
+export function computeRowHash(prevHash: string, r: HashInput): string {
   const caller = `${r.agent_key ?? ""}|${r.caller_ip ?? ""}`;
   const route = `${r.method} ${r.path}`;
   const payload = [r.detail ?? null, r.request_snapshot ?? null];
-  const canonical = JSON.stringify([
+  const fields: unknown[] = [
     r.id,
     r.timestamp,
     caller,
@@ -76,7 +97,13 @@ export function computeRowHash(prevHash: string, r: Omit<LedgerRow, "prev_hash" 
     r.shadow ?? null,
     r.original_payload ?? null,
     r.modified_payload ?? null,
-  ]);
+  ];
+  const attribution: unknown[] = [r.end_user ?? null, r.approved_by ?? null, r.response_payload ?? null];
+  if (attribution.some((v) => v !== null)) {
+    if (r.end_user_verified === 1) attribution.push(true);
+    fields.push(attribution);
+  }
+  const canonical = JSON.stringify(fields);
   return crypto.createHash("sha256").update(`${prevHash}\n${canonical}`, "utf8").digest("hex");
 }
 
@@ -158,13 +185,29 @@ export function createAuditLedger(db: Db): AuditLedger {
       const rows = await db.all<LedgerRow>(`SELECT ${LEDGER_COLUMNS} FROM agent_logs WHERE row_hash IS NULL AND id > ? ORDER BY id LIMIT ?`, [after, SEAL_BATCH]);
       if (rows.length === 0) return total;
       let lastPoint: ChainPoint | null = null;
+      let waiting = false;
+      const graceCutoff = Date.now() - RESPONSE_CAPTURE_GRACE_MS;
       for (const r of rows) {
+        // Its response is still in flight: everything from here on waits (rows seal in id order).
+        if (r.response_pending && Date.parse(r.timestamp) > graceCutoff) {
+          waiting = true;
+          break;
+        }
         const hash = computeRowHash(prev, r);
-        const u = await db.run("UPDATE agent_logs SET prev_hash = ?, row_hash = ? WHERE id = ? AND row_hash IS NULL", [prev, hash, r.id]);
+        // "response_pending IS ?" makes the seal fail if the response landed after we read the row,
+        // so the hash is never computed over stale content.
+        const u = await db.run(
+          "UPDATE agent_logs SET prev_hash = ?, row_hash = ?, response_pending = NULL WHERE id = ? AND row_hash IS NULL AND response_pending IS ?",
+          [prev, hash, r.id, r.response_pending]
+        );
         if (u.changes === 0) {
           // Another process sealed it first (same inputs, so the same hash): continue from its value.
           const sealed = await db.get<{ row_hash: string | null }>("SELECT row_hash FROM agent_logs WHERE id = ?", [r.id]);
-          if (!sealed?.row_hash) break; // row vanished (pruned): start over from the new tail
+          // Row vanished (pruned) or changed under us (its response landed): start over from the new tail.
+          if (!sealed?.row_hash) {
+            waiting = Boolean(sealed);
+            break;
+          }
           prev = sealed.row_hash;
         } else {
           prev = hash;
@@ -173,6 +216,10 @@ export function createAuditLedger(db: Db): AuditLedger {
         lastPoint = { id: r.id, hash: prev };
       }
       if (lastPoint) await advance(HEAD_KEY, lastPoint);
+      if (waiting) {
+        if (!lastPoint) return total; // nothing could move; the next kick / tick retries
+        continue; // sealed some rows before the one that changed: retry from the new tail
+      }
       if (rows.length < SEAL_BATCH) return total;
       // Long backlog (first start after an upgrade): let request traffic in between batches.
       await new Promise((r) => setImmediate(r));

@@ -114,12 +114,18 @@ Licenses are offline Ed25519 keys and nothing phones home. Every new install get
 | **Zero-Tunnel Telegram / Slack buttons** & Telegram bot commands | — (alerts arrive; approve in the dashboard) | ✅ | ✅ |
 | **Edit & Approve** (change a payload before it runs) | — | ✅ | ✅ |
 | Compensating rollback webhook on Revoke | — | ✅ | ✅ |
+| Agent discovery manifest (`/.well-known/agent.json`), unknown-endpoint report, approval idempotency | ✅ | ✅ | ✅ |
+| Credential masking in the admin API & dashboard (Show / Copy for admins) | ✅ | ✅ | ✅ |
 | **Multi-Workspace** (one install, many client stores) | 1 workspace | 3 workspaces | 25 workspaces (or as licensed) |
+| **All-Clients Overview** dashboard | — | — | ✅ |
+| **Per-client Telegram chat / Slack channel** approval routing | — | — (all workspaces use the main chat) | ✅ |
 | Agent API keys | 2 | 500 | 500 |
 | Team accounts (Admin / Read-only auditor), SSO header trust, Prometheus metrics, 7-day analytics | — | ✅ | ✅ |
 | Price | $0 | $30/mo or $250/yr | [montweel.com](https://montweel.com) |
 
 Activate a key in **Gateway Setup → License & Plan** and it takes effect immediately. You can also set `MONT_LICENSE_KEY`, or pass `licenseKey` to `createAgentGateway()`. If a license lapses, paid features switch off cleanly. Workspaces beyond the plan are refused (`402`), and their traffic is never forwarded unguarded.
+
+A paid admin endpoint called without the right plan answers **`402 Payment Required`** with `proRequired: true` (plus `agencyRequired: true` for Agency-only features), the `feature` name and an `upgradeUrl`, so clients can show an upgrade prompt. An invalid or forged key never unlocks anything. Free 90-day trial keys are limited to one per machine and must be activated within 100 days of first install.
 
 ---
 
@@ -167,6 +173,7 @@ Rule keys are `"/api/x"` (any method), `"POST /api/x"` (one method), or wildcard
   - The rule is re-checked against your edit.
   - The edited body goes out with a fresh `Content-Length`.
   - The original and modified payloads are both audited (redacted).
+- **Exactly-once decisions.** Every approval is decided once. A second decision (or a simultaneous approve + reject from two phones) gets *"Action already taken"* and changes nothing. Past the 24 h window an action becomes `EXPIRED` and can no longer be approved.
 - **Revoke & Block Caller.** On any approved action, this blocks the agent key and/or IP, auto-rejects its queued requests, and (Pro) calls your **compensating rollback webhook** (HMAC-signed, idempotency key included).
 - **Emergency switch.**
   - **Lockdown** refuses every agent request (nothing waiting can be approved).
@@ -227,6 +234,7 @@ Every JSON-RPC `tools/call` gets the same rules, payload policies (on `params.ar
   - It is recorded only; it never grants access.
 - **Approver attribution** (`approved_by`). The admin who released a held action is recorded on its `APPROVED` row: the signed-in account, or the SSO identity once the shared secret has checked out. The end user follows the action from its queued row to that decision row.
 - **Row details.** Expand any row in **Audit Logs** to see the redacted request and response, the end user and approver, and the row's ledger hash (`GET /logs/:id`).
+- **Filters.** Audit logs filter by status, method, path (contains or exact), request / approval id (`#736` from Telegram), user agent, date range, shadow hits (`shadow=1`) and **unknown endpoints** (`unknown=1`: calls that matched no rule and were refused by default deny, with their payload, so you can see what agents are trying to reach). The CSV export uses the same filters.
 - **Industry compliance templates.** Pick a preset in **Settings → Audit & PII Redaction**, or call `POST /compliance/apply-template`.
 
   | Template | Frameworks | Adds redaction for | Suggested approval rules |
@@ -255,9 +263,26 @@ Each **workspace** has its own rules, budgets, upstream URL, emergency switch, b
 | Header | `x-mont-workspace: acme` |
 | Bearer key | `Authorization: Bearer mws_…` |
 
-- **Dashboard:** a **Workspace Switcher** in the top bar and an **All Clients Overview** with mode, money protected, refusals, waiting approvals and shadow hits per client.
-- **Approvals per client:** each client's approvals go to its own chat, and a button tapped in the wrong chat is refused.
+- **Dashboard:** a **Workspace Switcher** in the top bar (Pro and Agency) and, on Agency, an **All Clients Overview** (`GET /workspaces/overview`) with mode, money protected, refusals, waiting approvals and shadow hits per client.
+- **Approvals per client (Agency):** each client's approvals go to its own Telegram chat or Slack channel, a button tapped in the wrong chat is refused, and a client's chat can run bot commands for that client only. On Pro, every workspace's approvals go to the main chat / channel.
+- **Key rotation:** `POST /workspaces/:slug/rotate-key` issues a new `mws_…` key and retires the old one.
 - **MCP:** `mcp-http --workspace <slug>`, `/w/<slug>/mcp`, or `mcp-stdio --workspace <slug>`.
+
+### 7. Access control & identity
+
+- **Agent API keys.** Create `agk_…` keys in **Settings → Agent Keys** (2 on Community, 500 on Pro). Agents send them as `x-agent-key` or `Authorization: Bearer agk_…`. The raw key is shown once; only its SHA-256 is stored. Every audit row, budget (`per: "agent"`) and blocklist entry is tied to the key.
+- **Caller blocklist.** Agent keys and IPs blocked from **Revoke & Block Caller** are listed under `GET /blocked-callers` and can be unblocked there.
+- **Team accounts (Pro).** The owner account is created on first boot with the setup key. Add **Admin** and **Read-only auditor** users, reset passwords and change roles in the **Team** tab. Auditors can read everything but change nothing.
+- **Static tokens.** `ADMIN_TOKEN` / `VIEWER_TOKEN` for CI/CD and read-only automation.
+- **SSO (Pro).** Trust `x-forwarded-user` / `x-forwarded-role` from an identity proxy that also sends the shared `x-gateway-sso-secret` (see [Behind an SSO / OAuth2 proxy](#deploy-with-docker)).
+- **Credential masking.** Bot tokens, webhook URLs, signing secrets and the SSO shared secret are always masked in `GET /setup` and `GET /config`, even for admins. Read-only users don't see webhook URLs at all. Saving a form that still holds the masked values keeps the stored secrets. Admins can reveal or copy one credential at a time with `GET /secrets/:field` (allow-listed fields only, never cached). The Auditor Evidence Pack never contains a credential.
+- **Agent discovery.** `GET /.well-known/agent.json` publishes the endpoints agents may call (`ALLOW` and `REQUIRE_APPROVAL` rules), their descriptions and rate limits. Blocked routes are not listed.
+
+### 8. Observability
+
+- **Analytics** (`GET /logs/analytics?window=24h|1w`): decisions over time, pending approvals and top agents. The 7-day window is Pro; Community falls back to 24 h.
+- **Prometheus metrics** (Pro): `GET /metrics` on the admin API. Scrapers can authenticate with `Authorization: Bearer <VIEWER_TOKEN>`.
+- **Test notifications:** `POST /setup/test-notification` checks your Telegram / Slack / webhook settings.
 
 ---
 
@@ -333,11 +358,24 @@ The image is multi-stage on Node 20 Alpine. Slack Socket Mode's WebSocket client
 
 | Area | Endpoints |
 |---|---|
-| Rules & approvals | `rules`, `approvals/:id/decide`, `approvals/:id/revoke` |
-| Logs & ledger | `logs`, `logs/:id`, `logs/export.csv`, `audit/verify`, `audit/export-pack`, `simulate/history` |
+| Auth & team | `auth/status`, `auth/setup`, `auth/login`, `auth/logout`, `auth/change-password`, `users`, `users/:id`, `users/:id/reset-password` |
+| Rules & approvals | `rules`, `approvals`, `approvals/counts`, `approvals/:id/decide`, `approvals/:id/revoke`, `blocked-callers`, `blocked-callers/:id` |
+| Agent keys | `agent-keys`, `agent-keys/:id` |
+| Logs & ledger | `logs`, `logs/:id`, `logs/analytics`, `logs/export.csv`, `audit/verify`, `audit/head`, `audit/digest`, `audit/export-pack`, `simulate/history` |
 | Compliance | `compliance/templates`, `compliance/apply-template` |
-| Protection | `protection/summary`, `emergency`, `guards/usage` |
-| Workspaces & setup | `workspaces`, `setup`, `setup/presets/:id/apply`, `license` |
+| Protection & alerts | `protection/summary`, `emergency`, `guards/usage`, `alerts/digest` |
+| Settings & setup | `config`, `setup`, `setup/presets`, `setup/presets/:id/apply`, `setup/test-notification`, `secrets/:field` |
+| Workspaces | `workspaces`, `workspaces/overview`, `workspaces/:slug`, `workspaces/:slug/rotate-key` |
+| License & metrics | `license`, `metrics` |
+
+**CLI** (`npx agent-gateway-sdk <command>`, also installed as `mont-gateway`):
+
+| Command | Key options |
+|---|---|
+| `start` | `--target <url>`, `--port`, `--host`, `--admin-port`, `--admin-host`, `--data-dir` |
+| `mcp-http` | `--upstream <url>` (required), `--port` (8090), `--host`, `--path` (`/mcp`), `--wait-seconds` (300), `--workspace <slug>`, `--admin-port`, `--admin-host`, `--data-dir` |
+| `mcp-stdio` | `--wait-seconds`, `--admin-port` (skipped if busy), `--no-admin`, `--data-dir` (share it between sessions to share rules and approvals), `--workspace <slug>`, then `-- <server command>` |
+| `--version`, `help` | |
 
 **Signing license keys** (needs your Ed25519 private key; never leaves your machine):
 
@@ -353,7 +391,8 @@ npm run keygen -- verify MONT-V2.eyJ2Ijoy...
 ```bash
 npm install && npm --prefix dashboard install
 npm run typecheck      # gateway + tools
-npm test               # 4 suites, 58 tests: fail-closed chaos, v1.2, v1.3 shop kit, v2.0 enterprise
+npm test               # 9 suites, 93 tests: fail-closed chaos, v1.2, v1.3 shop kit, v2.0 enterprise, owner UX,
+                       # audit trail, compliance, secret masking, license gating
 npm run build:all      # dist/ + dashboard/dist/
 npm run dev            # gateway with reload; dashboard: npm --prefix dashboard run dev
 ```

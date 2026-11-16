@@ -280,9 +280,12 @@ features) {
             console.error("Notifications skipped:", err);
             return [];
         }
+        // Per-client chat / channel routing is Agency-only; otherwise every workspace uses the main chat.
+        const routed = features().perClientRouting;
         // Defence in depth: callers pass already-redacted data, but nothing leaves unscrubbed.
         const n = {
             ...raw,
+            workspace: raw.workspace && !routed ? { ...raw.workspace, telegramChatId: null, slackChannel: null } : raw.workspace,
             path: redactor.text(raw.path),
             body: redactor.jsonText(raw.body),
             query: redactor.json(raw.query),
@@ -435,6 +438,10 @@ function settledSlackBlocks(original, outcome) {
     // Slack allows 50 blocks per message; ours has 4-6, but never fail an update on a long one.
     return kept.length > 0 ? [...kept.slice(0, 49), outcomeBlock] : [{ type: "section", text: { type: "mrkdwn", text: escSlack(outcome) } }];
 }
+/** Agency-only: whether workspaces' own Telegram chats / Slack channels are honoured. */
+function clientRouting(ctx) {
+    return ctx.license.current().features.perClientRouting;
+}
 function telegramChatMatcher(chat) {
     return (configured) => {
         const c = configured.trim();
@@ -455,7 +462,7 @@ async function decideFromButton(ctx, token, actor, origin) {
         return { ok: false, settled: false, text: "This button is not valid for that request." };
     }
     // The request's workspace decides which chat / channel may approve it.
-    const ws = ctx.workspaces.get(row.workspace_id ?? constants_1.DEFAULT_WORKSPACE_ID);
+    const ws = clientRouting(ctx) ? ctx.workspaces.get(row.workspace_id ?? constants_1.DEFAULT_WORKSPACE_ID) : undefined;
     const n = ctx.settings.get().notifications;
     const allowed = origin.channel === "telegram"
         ? origin.chatMatches(ws?.telegramChatId || n.telegram.chatId)
@@ -517,7 +524,8 @@ function createApprovalBridges(ctx, endpoints) {
         const chat = cq.message?.chat;
         const matcher = chat ? telegramChatMatcher(chat) : null;
         // The global chat, or a client workspace's own chat.
-        const chatMatches = matcher !== null && (matcher(s.chatId) || ctx.workspaces.list().some((w) => w.telegramChatId !== null && matcher(w.telegramChatId)));
+        const chatMatches = matcher !== null &&
+            (matcher(s.chatId) || (clientRouting(ctx) && ctx.workspaces.list().some((w) => w.telegramChatId !== null && matcher(w.telegramChatId))));
         if (!chatMatches || !matcher) {
             console.error(`[agent-gateway] Ignored a Telegram button from an unexpected chat (${chat?.id ?? "none"}).`);
             await answer("This chat is not allowed to decide gateway approvals.", true);
@@ -557,7 +565,9 @@ function createApprovalBridges(ctx, endpoints) {
         const matcher = telegramChatMatcher(m.chat);
         // A client workspace's own chat controls that workspace; the global chat controls the default
         // workspace and the global switch.
-        const scoped = ctx.workspaces.list().find((w) => !w.isDefault && w.telegramChatId !== null && matcher(w.telegramChatId));
+        const scoped = clientRouting(ctx)
+            ? ctx.workspaces.list().find((w) => !w.isDefault && w.telegramChatId !== null && matcher(w.telegramChatId))
+            : undefined;
         if (!scoped && !matcher(s.chatId)) {
             console.error(`[agent-gateway] Ignored a Telegram command from an unexpected chat (${m.chat.id}).`);
             return;
@@ -712,7 +722,7 @@ function createApprovalBridges(ctx, endpoints) {
             return;
         const channelId = p.channel?.id ?? "";
         // The global channel, or a client workspace's own channel.
-        if (!channelId || (channelId !== s.channelId && !ctx.workspaces.list().some((w) => w.slackChannel === channelId))) {
+        if (!channelId || (channelId !== s.channelId && !(clientRouting(ctx) && ctx.workspaces.list().some((w) => w.slackChannel === channelId)))) {
             console.error(`[agent-gateway] Ignored a Slack button from an unexpected channel (${p.channel?.id ?? "none"}).`);
             return;
         }

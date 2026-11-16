@@ -372,9 +372,12 @@ export function createNotifier(
       console.error("Notifications skipped:", err);
       return [];
     }
+    // Per-client chat / channel routing is Agency-only; otherwise every workspace uses the main chat.
+    const routed = features().perClientRouting;
     // Defence in depth: callers pass already-redacted data, but nothing leaves unscrubbed.
     const n: PendingNotice = {
       ...raw,
+      workspace: raw.workspace && !routed ? { ...raw.workspace, telegramChatId: null, slackChannel: null } : raw.workspace,
       path: redactor.text(raw.path),
       body: redactor.jsonText(raw.body),
       query: redactor.json(raw.query) as Record<string, unknown>,
@@ -587,6 +590,11 @@ export function settledSlackBlocks(original: unknown[] | undefined, outcome: str
 /** Where a button tap came from. A client's approvals can only be decided from that client's chat / channel. */
 type TapOrigin = { channel: "telegram"; chatMatches: (configured: string) => boolean } | { channel: "slack"; channelId: string };
 
+/** Agency-only: whether workspaces' own Telegram chats / Slack channels are honoured. */
+function clientRouting(ctx: GatewayContext): boolean {
+  return ctx.license.current().features.perClientRouting;
+}
+
 function telegramChatMatcher(chat: { id: number; username?: string }): (configured: string) => boolean {
   return (configured) => {
     const c = configured.trim();
@@ -607,7 +615,7 @@ async function decideFromButton(ctx: GatewayContext, token: string, actor: strin
     return { ok: false, settled: false, text: "This button is not valid for that request." };
   }
   // The request's workspace decides which chat / channel may approve it.
-  const ws = ctx.workspaces.get(row.workspace_id ?? DEFAULT_WORKSPACE_ID);
+  const ws = clientRouting(ctx) ? ctx.workspaces.get(row.workspace_id ?? DEFAULT_WORKSPACE_ID) : undefined;
   const n = ctx.settings.get().notifications;
   const allowed =
     origin.channel === "telegram"
@@ -679,7 +687,9 @@ export function createApprovalBridges(ctx: GatewayContext, endpoints: BridgeEndp
     const chat = cq.message?.chat;
     const matcher = chat ? telegramChatMatcher(chat) : null;
     // The global chat, or a client workspace's own chat.
-    const chatMatches = matcher !== null && (matcher(s.chatId) || ctx.workspaces.list().some((w) => w.telegramChatId !== null && matcher(w.telegramChatId)));
+    const chatMatches =
+      matcher !== null &&
+      (matcher(s.chatId) || (clientRouting(ctx) && ctx.workspaces.list().some((w) => w.telegramChatId !== null && matcher(w.telegramChatId))));
     if (!chatMatches || !matcher) {
       console.error(`[agent-gateway] Ignored a Telegram button from an unexpected chat (${chat?.id ?? "none"}).`);
       await answer("This chat is not allowed to decide gateway approvals.", true);
@@ -720,7 +730,9 @@ export function createApprovalBridges(ctx: GatewayContext, endpoints: BridgeEndp
     const matcher = telegramChatMatcher(m.chat);
     // A client workspace's own chat controls that workspace; the global chat controls the default
     // workspace and the global switch.
-    const scoped = ctx.workspaces.list().find((w) => !w.isDefault && w.telegramChatId !== null && matcher(w.telegramChatId));
+    const scoped = clientRouting(ctx)
+      ? ctx.workspaces.list().find((w) => !w.isDefault && w.telegramChatId !== null && matcher(w.telegramChatId))
+      : undefined;
     if (!scoped && !matcher(s.chatId)) {
       console.error(`[agent-gateway] Ignored a Telegram command from an unexpected chat (${m.chat.id}).`);
       return;
@@ -882,7 +894,7 @@ export function createApprovalBridges(ctx: GatewayContext, endpoints: BridgeEndp
     if (!action || (action.action_id !== "mont_approve" && action.action_id !== "mont_reject")) return;
     const channelId = p.channel?.id ?? "";
     // The global channel, or a client workspace's own channel.
-    if (!channelId || (channelId !== s.channelId && !ctx.workspaces.list().some((w) => w.slackChannel === channelId))) {
+    if (!channelId || (channelId !== s.channelId && !(clientRouting(ctx) && ctx.workspaces.list().some((w) => w.slackChannel === channelId)))) {
       console.error(`[agent-gateway] Ignored a Slack button from an unexpected channel (${p.channel?.id ?? "none"}).`);
       return;
     }

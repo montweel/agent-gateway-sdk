@@ -3,7 +3,7 @@ import type { GatewayContext } from "../context";
 import type { AuthenticatedRequest } from "../types";
 import type { Workspace } from "../workspaces";
 import { WORKSPACE_HEADER } from "../constants";
-import { sendError } from "../utils";
+import { sendError, sendProRequired } from "../utils";
 
 /**
  * Admin API workspace scope. The dashboard's Workspace Switcher sends the selected client as the
@@ -54,7 +54,7 @@ export function actorOf(req: AuthenticatedRequest): string {
   return req.user ? (req.user.sso ? `sso:${req.user.username}` : req.user.username) : "admin";
 }
 
-/** 402 with the same `proRequired` marker the dashboard already understands. */
-export function sendLicenseRequired(res: Response, feature: string, message: string): void {
-  sendError(res, 402, "Payment Required", message, { proRequired: true, feature, upgradeUrl: "https://montweel.com/#license-renewal" });
+/** 402 with the same `proRequired` marker the dashboard already understands (+ `agencyRequired` for Agency-only). */
+export function sendLicenseRequired(res: Response, feature: string, message: string, agency = false): void {
+  sendProRequired(res, feature, { message, agency });
 }

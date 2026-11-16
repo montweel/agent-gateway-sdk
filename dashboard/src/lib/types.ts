@@ -220,6 +220,10 @@ export interface LicenseFeatures {
   rollbackWebhooks: boolean
   payloadPatching: boolean
   auditVerification: boolean
+  /** Agency only. */
+  allClientsOverview?: boolean
+  /** Agency only. */
+  perClientRouting?: boolean
 }
 
 export interface LicenseStatus {
@@ -240,9 +244,12 @@ export interface LicenseStatus {
   keyVersion?: 1 | 2
 }
 
-/** Body of a Pro-gated call the current license does not cover (HTTP 200, never 403). */
+/** Body of a paid-feature call the current license does not cover (HTTP 402 Payment Required). */
 export interface ProRequiredResponse {
   proRequired: true
+  /** Set when only an Agency key unlocks the feature. */
+  agencyRequired?: boolean
+  feature?: string
   message: string
   upgradeUrl: string
 }
@@ -491,7 +498,15 @@ export interface Workspace {
 
 export interface WorkspacesResponse {
   workspaces: Workspace[]
-  license: { tier: LicenseTier; maxWorkspaces: number; multiWorkspace: boolean }
+  license: {
+    tier: LicenseTier
+    maxWorkspaces: number
+    multiWorkspace: boolean
+    /** Agency only (absent from older gateways). */
+    allClientsOverview?: boolean
+    /** Agency only (absent from older gateways). */
+    perClientRouting?: boolean
+  }
 }
 
 export interface WorkspaceOverviewRow {

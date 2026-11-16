@@ -54,7 +54,7 @@ function requireWorkspace(ctx, req, res) {
 function actorOf(req) {
     return req.user ? (req.user.sso ? `sso:${req.user.username}` : req.user.username) : "admin";
 }
-/** 402 with the same `proRequired` marker the dashboard already understands. */
-function sendLicenseRequired(res, feature, message) {
-    (0, utils_1.sendError)(res, 402, "Payment Required", message, { proRequired: true, feature, upgradeUrl: "https://montweel.com/#license-renewal" });
+/** 402 with the same `proRequired` marker the dashboard already understands (+ `agencyRequired` for Agency-only). */
+function sendLicenseRequired(res, feature, message, agency = false) {
+    (0, utils_1.sendProRequired)(res, feature, { message, agency });
 }

@@ -70,6 +70,10 @@ export interface LicenseFeatures {
   payloadPatching: boolean;
   /** GET /audit/verify: prove the hash-chained audit ledger was not modified. */
   auditVerification: boolean;
+  /** Agency only: the "All Clients" overview across every workspace (GET /workspaces/overview). */
+  allClientsOverview: boolean;
+  /** Agency only: isolated per-client Telegram chat / Slack channel routing for workspace approvals. */
+  perClientRouting: boolean;
 }
 
 export const COMMUNITY_MAX_WORKSPACES = 1;
@@ -79,12 +83,15 @@ export const MAX_LICENSED_WORKSPACES = 10_000;
 
 export function featuresFor(tier: LicenseTier, maxWorkspaces: number): LicenseFeatures {
   const paid = tier !== "COMMUNITY";
+  const agency = tier === "AGENCY";
   return {
     multiWorkspace: paid && maxWorkspaces > 1,
     interactiveApprovals: paid,
     rollbackWebhooks: paid,
     payloadPatching: paid,
     auditVerification: paid,
+    allClientsOverview: agency,
+    perClientRouting: agency,
   };
 }
 

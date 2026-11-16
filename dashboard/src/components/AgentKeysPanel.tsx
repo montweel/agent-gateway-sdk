@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Check, Copy, KeyRound, Plus, Trash2 } from 'lucide-react'
-import { api, errorMessage } from '../lib/api'
+import { api, errorMessage, proRequiredFrom } from '../lib/api'
 import { isProRequired } from '../lib/types'
 import type { AgentKey, ProRequiredResponse } from '../lib/types'
 import { INPUT_CLASS, formatTime } from '../lib/utils'
@@ -90,7 +90,9 @@ export function AgentKeysPanel({
       setName('')
       await load()
     } catch (err) {
-      setError(errorMessage(err))
+      const pro = proRequiredFrom(err)
+      if (pro) setProNotice(pro)
+      else setError(errorMessage(err))
     } finally {
       setCreating(false)
     }

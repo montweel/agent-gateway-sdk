@@ -17,6 +17,15 @@ export function ProBadge() {
   )
 }
 
+/** Small "AGENCY" pill for features that need a Mont Agency key. */
+export function AgencyBadge() {
+  return (
+    <span className="inline-flex items-center rounded-full bg-violet-600 px-2 py-0.5 text-[10px] font-bold tracking-wide text-white">
+      AGENCY
+    </span>
+  )
+}
+
 /** "PRO · Renew free ↗" prompt that opens Settings & Discovery, where the license card lives. */
 export function ProLockLink({ onOpen, label = 'Renew free ↗' }: { onOpen: () => void; label?: string }) {
   return (

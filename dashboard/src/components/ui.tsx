@@ -82,25 +82,39 @@ export function ErrorBanner({ message, onDismiss }: { message: string; onDismiss
   )
 }
 
-/** Non-error callout shown when an API call answers `proRequired: true`. */
-export function ProCallout({ message, upgradeUrl, onDismiss }: { message?: string; upgradeUrl?: string; onDismiss?: () => void }) {
+/** Non-error callout shown when an API call answers 402 `proRequired: true` (`agency` for Agency-only features). */
+export function ProCallout({
+  message,
+  upgradeUrl,
+  onDismiss,
+  agency = false,
+}: {
+  message?: string
+  upgradeUrl?: string
+  onDismiss?: () => void
+  agency?: boolean
+}) {
   return (
     <div
       role="status"
-      className="mb-4 flex items-start justify-between gap-3 rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900"
+      className={`mb-4 flex items-start justify-between gap-3 rounded-lg border px-4 py-3 text-sm ${
+        agency ? 'border-violet-200 bg-violet-50 text-violet-900' : 'border-indigo-200 bg-indigo-50 text-indigo-900'
+      }`}
     >
       <span className="flex flex-wrap items-center gap-2">
-        <span className="inline-flex items-center rounded-full bg-indigo-600 px-2 py-0.5 text-[10px] font-bold tracking-wide text-white">
-          PRO FEATURE
+        <span
+          className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold tracking-wide text-white ${agency ? 'bg-violet-600' : 'bg-indigo-600'}`}
+        >
+          {agency ? 'AGENCY FEATURE' : 'PRO FEATURE'}
         </span>
         <span>{message ?? 'Pro feature — claim your free 90-day trial key (no payment card required).'}</span>
         <a
-          href={upgradeUrl ?? 'https://montweel.com/#license-renewal'}
+          href={agency ? 'https://montweel.com/#pricing' : (upgradeUrl ?? 'https://montweel.com/#license-renewal')}
           target="_blank"
           rel="noopener noreferrer"
-          className="font-semibold underline hover:text-indigo-700"
+          className="font-semibold underline hover:opacity-80"
         >
-          Get your free 90-day trial key ↗
+          {agency ? 'Get an Agency license ↗' : 'Get your free 90-day trial key ↗'}
         </a>
       </span>
       {onDismiss && (

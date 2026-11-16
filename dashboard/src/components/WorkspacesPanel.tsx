@@ -1,11 +1,14 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { Building2, Copy, KeyRound, Lock, Plus, Save, Trash2 } from 'lucide-react'
-import { api, errorMessage, setWorkspace } from '../lib/api'
-import type { Workspace } from '../lib/types'
+import { api, errorMessage, proRequiredFrom, setWorkspace } from '../lib/api'
+import type { ProRequiredResponse, Workspace } from '../lib/types'
 import { INPUT_CLASS, READ_ONLY_HINT } from '../lib/utils'
 import type { WorkspacesApi } from '../hooks/useWorkspaces'
-import { ErrorBanner, Spinner, SuccessBanner } from './ui'
+import { ErrorBanner, ProCallout, Spinner, SuccessBanner } from './ui'
+import { AgencyBadge } from './LicenseCard'
+
+const ROUTING_LOCKED_HINT = 'Per-client Telegram / Slack routing needs a Mont Agency key. Approvals go to your main chat / channel.'
 
 interface Draft {
   name: string
@@ -34,11 +37,20 @@ export function WorkspacesPanel({ workspacesApi, readOnly }: { workspacesApi: Wo
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [proNotice, setProNotice] = useState<ProRequiredResponse | null>(null)
   const [revealed, setRevealed] = useState<{ slug: string; key: string } | null>(null)
 
   const workspaces = data?.workspaces ?? []
   const license = data?.license
   const atLimit = license ? workspaces.length >= license.maxWorkspaces : false
+  // Older gateways do not send the flag: leave the fields editable and let the server decide.
+  const routingLocked = license?.perClientRouting === false
+
+  const fail = (err: unknown) => {
+    const pro = proRequiredFrom(err)
+    if (pro) setProNotice(pro)
+    else setError(errorMessage(err))
+  }
 
   async function create(e: FormEvent) {
     e.preventDefault()
@@ -49,15 +61,15 @@ export function WorkspacesPanel({ workspacesApi, readOnly }: { workspacesApi: Wo
       const body: Record<string, unknown> = { name: form.name.trim(), requireKey: form.requireKey }
       if (form.slug.trim()) body.slug = form.slug.trim()
       if (form.upstreamUrl.trim()) body.upstreamUrl = form.upstreamUrl.trim()
-      if (form.telegramChatId.trim()) body.telegramChatId = form.telegramChatId.trim()
-      if (form.slackChannel.trim()) body.slackChannel = form.slackChannel.trim()
+      if (!routingLocked && form.telegramChatId.trim()) body.telegramChatId = form.telegramChatId.trim()
+      if (!routingLocked && form.slackChannel.trim()) body.slackChannel = form.slackChannel.trim()
       const res = await api.post<{ workspace: Workspace; apiKey: string }>('/workspaces', body)
       setRevealed({ slug: res.data.workspace.slug, key: res.data.apiKey })
       setNotice(`Workspace "${res.data.workspace.name}" created. Copy its API key now: it is shown only once.`)
       setForm({ name: '', slug: '', upstreamUrl: '', telegramChatId: '', slackChannel: '', requireKey: true })
       await reload()
     } catch (err) {
-      setError(errorMessage(err))
+      fail(err)
     } finally {
       setBusy(null)
     }
@@ -69,7 +81,10 @@ export function WorkspacesPanel({ workspacesApi, readOnly }: { workspacesApi: Wo
     setBusy(w.slug)
     setError(null)
     try {
-      const body: Record<string, unknown> = { name: d.name, telegramChatId: d.telegramChatId || null, slackChannel: d.slackChannel || null }
+      const body: Record<string, unknown> = { name: d.name }
+      // Without Agency, routing can only be cleared (never set), so a leftover value never blocks other edits.
+      if (!routingLocked || !d.telegramChatId) body.telegramChatId = d.telegramChatId || null
+      if (!routingLocked || !d.slackChannel) body.slackChannel = d.slackChannel || null
       if (!w.isDefault) {
         body.upstreamUrl = d.upstreamUrl || null
         body.requireKey = d.requireKey
@@ -79,7 +94,7 @@ export function WorkspacesPanel({ workspacesApi, readOnly }: { workspacesApi: Wo
       setNotice(`Saved "${d.name}".`)
       await reload()
     } catch (err) {
-      setError(errorMessage(err))
+      fail(err)
     } finally {
       setBusy(null)
     }
@@ -123,6 +138,9 @@ export function WorkspacesPanel({ workspacesApi, readOnly }: { workspacesApi: Wo
     <div>
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
       {notice && <SuccessBanner message={notice} onDismiss={() => setNotice(null)} />}
+      {proNotice && (
+        <ProCallout agency={proNotice.agencyRequired} message={proNotice.message} upgradeUrl={proNotice.upgradeUrl} onDismiss={() => setProNotice(null)} />
+      )}
       {revealed && (
         <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
           <p className="font-semibold">API key for “{revealed.slug}” (shown once)</p>
@@ -217,26 +235,22 @@ export function WorkspacesPanel({ workspacesApi, readOnly }: { workspacesApi: Wo
                     onChange={(e) => edit(w, { upstreamUrl: e.target.value })}
                   />
                 </label>
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-slate-600">Telegram chat for approvals</span>
-                  <input
-                    className={`${INPUT_CLASS} font-mono`}
-                    value={field(w.slug, 'telegramChatId', w) as string}
-                    disabled={readOnly}
-                    placeholder="blank = the global chat"
-                    onChange={(e) => edit(w, { telegramChatId: e.target.value })}
-                  />
-                </label>
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-slate-600">Slack channel (Socket Mode)</span>
-                  <input
-                    className={`${INPUT_CLASS} font-mono`}
-                    value={field(w.slug, 'slackChannel', w) as string}
-                    disabled={readOnly}
-                    placeholder="blank = the global channel"
-                    onChange={(e) => edit(w, { slackChannel: e.target.value })}
-                  />
-                </label>
+                <RoutingField
+                  label="Telegram chat for approvals"
+                  value={field(w.slug, 'telegramChatId', w) as string}
+                  placeholder="blank = the global chat"
+                  readOnly={readOnly}
+                  locked={routingLocked}
+                  onChange={(v) => edit(w, { telegramChatId: v })}
+                />
+                <RoutingField
+                  label="Slack channel (Socket Mode)"
+                  value={field(w.slug, 'slackChannel', w) as string}
+                  placeholder="blank = the global channel"
+                  readOnly={readOnly}
+                  locked={routingLocked}
+                  onChange={(v) => edit(w, { slackChannel: v })}
+                />
               </div>
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                 {!w.isDefault ? (
@@ -284,16 +298,18 @@ export function WorkspacesPanel({ workspacesApi, readOnly }: { workspacesApi: Wo
           />
           <input
             className={`${INPUT_CLASS} font-mono`}
-            placeholder="Telegram chat id (optional)"
-            value={form.telegramChatId}
-            disabled={readOnly}
+            placeholder={routingLocked ? 'Telegram chat id (Agency)' : 'Telegram chat id (optional)'}
+            value={routingLocked ? '' : form.telegramChatId}
+            disabled={readOnly || routingLocked}
+            title={routingLocked ? ROUTING_LOCKED_HINT : undefined}
             onChange={(e) => setForm({ ...form, telegramChatId: e.target.value })}
           />
           <input
             className={`${INPUT_CLASS} font-mono`}
-            placeholder="Slack channel id (optional)"
-            value={form.slackChannel}
-            disabled={readOnly}
+            placeholder={routingLocked ? 'Slack channel id (Agency)' : 'Slack channel id (optional)'}
+            value={routingLocked ? '' : form.slackChannel}
+            disabled={readOnly || routingLocked}
+            title={routingLocked ? ROUTING_LOCKED_HINT : undefined}
             onChange={(e) => setForm({ ...form, slackChannel: e.target.value })}
           />
           <button
@@ -307,7 +323,53 @@ export function WorkspacesPanel({ workspacesApi, readOnly }: { workspacesApi: Wo
           </button>
         </div>
         {atLimit && <p className="mt-2 text-xs text-amber-700">Your plan's workspace limit is reached. Activate a Mont Agency key for more clients.</p>}
+        {routingLocked && license?.multiWorkspace && (
+          <p className="mt-2 flex items-center gap-1.5 text-xs text-slate-500">
+            <AgencyBadge /> {ROUTING_LOCKED_HINT}
+          </p>
+        )}
       </form>
     </div>
+  )
+}
+
+/** A per-workspace chat / channel input. Agency-only: locked (but still clearable) on other plans. */
+function RoutingField({
+  label,
+  value,
+  placeholder,
+  readOnly,
+  locked,
+  onChange,
+}: {
+  label: string
+  value: string
+  placeholder: string
+  readOnly: boolean
+  locked: boolean
+  onChange: (v: string) => void
+}) {
+  return (
+    <label className="block">
+      <span className="mb-1 flex items-center gap-1.5 text-xs font-medium text-slate-600">
+        {label}
+        {locked && <AgencyBadge />}
+      </span>
+      <div className="flex items-center gap-2">
+        <input
+          className={`${INPUT_CLASS} font-mono ${locked ? 'bg-slate-50 text-slate-400' : ''}`}
+          value={value}
+          disabled={readOnly || locked}
+          title={locked ? ROUTING_LOCKED_HINT : undefined}
+          placeholder={locked ? 'Agency feature: the main chat is used' : placeholder}
+          onChange={(e) => onChange(e.target.value)}
+        />
+        {locked && value && !readOnly && (
+          <button type="button" onClick={() => onChange('')} className="shrink-0 text-xs font-medium text-slate-500 underline hover:text-slate-700">
+            Clear
+          </button>
+        )}
+      </div>
+    </label>
   )
 }

@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { isProRequired, type ProRequiredResponse } from './types'
  
 // =====================================================================
 // API client: base URL, session token handling, error text
@@ -96,6 +97,12 @@ api.interceptors.response.use(
   }
 )
  
+/** The upgrade details of a 402 Payment Required reply (a Pro / Agency feature), else null. */
+export function proRequiredFrom(err: unknown): ProRequiredResponse | null {
+  if (axios.isAxiosError(err) && err.response?.status === 402 && isProRequired(err.response.data)) return err.response.data
+  return null
+}
+
 export function errorMessage(err: unknown): string {
   if (axios.isAxiosError(err)) {
     if (err.response) {

@@ -60,12 +60,15 @@ exports.AGENCY_DEFAULT_MAX_WORKSPACES = 25;
 exports.MAX_LICENSED_WORKSPACES = 10000;
 function featuresFor(tier, maxWorkspaces) {
     const paid = tier !== "COMMUNITY";
+    const agency = tier === "AGENCY";
     return {
         multiWorkspace: paid && maxWorkspaces > 1,
         interactiveApprovals: paid,
         rollbackWebhooks: paid,
         payloadPatching: paid,
         auditVerification: paid,
+        allClientsOverview: agency,
+        perClientRouting: agency,
     };
 }
 const V2_PREFIX = "MONT-V2.";

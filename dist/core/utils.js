@@ -38,11 +38,18 @@ function sendError(res, status, error, message, extra) {
 exports.UPGRADE_URL = "https://montweel.com/#license-renewal";
 exports.PRO_REQUIRED_MESSAGE = "Pro feature — claim your free 90-day trial key (no payment card required) or upgrade at https://montweel.com";
 /**
- * Team Pro gate. Deliberately NOT an error status: replies 200 with `proRequired: true` so
- * clients can show an upgrade prompt instead of a failure. `feature` is kept for call-site clarity.
+ * Paid-feature gate: 402 Payment Required with `proRequired: true` (and `agencyRequired: true` for
+ * Agency-only features) so clients show an upgrade prompt instead of a generic failure.
  */
-function sendProRequired(res, _feature) {
-    res.status(200).json({ proRequired: true, message: exports.PRO_REQUIRED_MESSAGE, upgradeUrl: exports.UPGRADE_URL });
+function sendProRequired(res, feature, opts = {}) {
+    res.status(402).json({
+        error: "Payment Required",
+        message: opts.message ?? exports.PRO_REQUIRED_MESSAGE,
+        proRequired: true,
+        ...(opts.agency ? { agencyRequired: true } : {}),
+        ...(feature ? { feature } : {}),
+        upgradeUrl: exports.UPGRADE_URL,
+    });
 }
 function sendCaughtError(res, err) {
     if (res.headersSent)

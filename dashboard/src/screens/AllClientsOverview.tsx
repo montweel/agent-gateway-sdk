@@ -1,21 +1,41 @@
 import { useEffect, useState } from 'react'
 import { ArrowRight, Lock } from 'lucide-react'
-import { api, errorMessage, setWorkspace } from '../lib/api'
-import type { WorkspaceOverview } from '../lib/types'
-import { Badge, ErrorBanner, PageHeader, RefreshButton } from '../components/ui'
+import { api, errorMessage, proRequiredFrom, setWorkspace } from '../lib/api'
+import type { ProRequiredResponse, WorkspaceOverview } from '../lib/types'
+import { Badge, ErrorBanner, PageHeader, ProCallout, RefreshButton } from '../components/ui'
 import type { Tone } from '../components/ui'
+import { AgencyBadge } from '../components/LicenseCard'
 
 const money = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 2 })
 const MODE_TONE: Record<string, Tone> = { normal: 'green', approval_only: 'amber', lockdown: 'red' }
 const MODE_LABEL: Record<string, string> = { normal: 'Normal', approval_only: 'Approval-only', lockdown: 'Lockdown' }
 
 /** Every workspace side by side for the last `hours`. Never throws. */
-async function fetchOverview(hours: number): Promise<{ overview: WorkspaceOverview } | { error: string }> {
+async function fetchOverview(
+  hours: number
+): Promise<{ overview: WorkspaceOverview } | { locked: ProRequiredResponse } | { error: string }> {
   try {
     return { overview: (await api.get<WorkspaceOverview>('/workspaces/overview', { params: { hours } })).data }
   } catch (err) {
-    return { error: errorMessage(err) }
+    const locked = proRequiredFrom(err)
+    return locked ? { locked } : { error: errorMessage(err) }
   }
+}
+
+/** Shown instead of the table when the license does not include the Agency overview. */
+function LockedOverview({ notice }: { notice: ProRequiredResponse }) {
+  return (
+    <>
+      <PageHeader title="All Clients Overview" subtitle="Every client workspace side by side, with a one-click jump into each." />
+      <ProCallout agency message={notice.message} upgradeUrl={notice.upgradeUrl} />
+      <div className="rounded-xl border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-500" aria-disabled="true">
+        <div className="mb-2 flex items-center justify-center gap-2 font-semibold text-slate-400">
+          <Lock className="h-4 w-4" aria-hidden="true" /> All-Clients Overview <AgencyBadge />
+        </div>
+        Pick a single client in the workspace switcher above to manage its rules, approvals and logs.
+      </div>
+    </>
+  )
 }
 
 /** Agency view: every client workspace side by side, with a one-click jump into each. */
@@ -23,6 +43,7 @@ export function AllClientsOverview() {
   const [data, setData] = useState<WorkspaceOverview | null>(null)
   const [hours, setHours] = useState(24)
   const [error, setError] = useState<string | null>(null)
+  const [locked, setLocked] = useState<ProRequiredResponse | null>(null)
   // The Refresh button bumps this, which re-runs the fetch effect for the same window.
   const [reloadToken, setReloadToken] = useState(0)
   const requestKey = `${hours}#${reloadToken}`
@@ -39,7 +60,9 @@ export function AllClientsOverview() {
         if ('overview' in r) {
           setData(r.overview)
           setError(null)
-        } else setError(r.error)
+          setLocked(null)
+        } else if ('locked' in r) setLocked(r.locked)
+        else setError(r.error)
         setLoadedKey(requestKey)
       })
     refresh()
@@ -53,6 +76,8 @@ export function AllClientsOverview() {
   }, [hours, requestKey])
 
   const load = () => setReloadToken((t) => t + 1)
+
+  if (locked) return <LockedOverview notice={locked} />
 
   const t = data?.totals
   return (

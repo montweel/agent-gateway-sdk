@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import axios from 'axios'
 import { Check, Copy, Eye, EyeOff, Globe } from 'lucide-react'
-import { api, BASE_URL, DISPLAY_HOST, errorMessage } from '../lib/api'
+import { api, BASE_URL, DISPLAY_HOST, errorMessage, proRequiredFrom } from '../lib/api'
 import { isProRequired } from '../lib/types'
 import type { GatewayConfig, ProRequiredResponse } from '../lib/types'
 import { INPUT_CLASS, READ_ONLY_HINT } from '../lib/utils'
@@ -151,6 +151,13 @@ export function SettingsTab({ readOnly, licenseApi }: { readOnly: boolean; licen
       setSaved('Settings saved. They apply immediately to the next request.')
       void loadManifest()
     } catch (err) {
+      const pro = proRequiredFrom(err)
+      if (pro) {
+        // SSO is a Pro feature: nothing was saved, so revert the form and show the upgrade callout.
+        setProNotice(pro)
+        if (config) applyConfig(config)
+        return
+      }
       const message = errorMessage(err)
       setError(message)
       setSelfLoopHint(/itself/i.test(message))

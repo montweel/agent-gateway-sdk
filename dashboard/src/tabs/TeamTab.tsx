@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Check, Copy, KeyRound, Plus, Sparkles, Trash2 } from 'lucide-react'
-import { api, errorMessage } from '../lib/api'
+import { api, errorMessage, proRequiredFrom } from '../lib/api'
 import { isProRequired } from '../lib/types'
 import type { AuthUser, ProRequiredResponse, TeamUser, UserRole } from '../lib/types'
 import { formatTime, INPUT_CLASS } from '../lib/utils'
 import { Badge, ErrorBanner, ProCallout, PageHeader, RefreshButton, Spinner } from '../components/ui'
+import { ProLockLink } from '../components/LicenseCard'
  
 /** GET /users. Never throws. */
 async function fetchUsers(): Promise<{ users: TeamUser[] } | { error: string }> {
@@ -23,7 +24,16 @@ interface IssuedCreds {
   isReset: boolean
 }
  
-export function TeamTab({ currentUser }: { currentUser: AuthUser }) {
+export function TeamTab({
+  currentUser,
+  isPro,
+  onOpenLicense,
+}: {
+  currentUser: AuthUser
+  /** Extra Admin / Read-Only Auditor accounts are a Pro feature (existing accounts always keep working). */
+  isPro?: boolean
+  onOpenLicense?: () => void
+}) {
   const [users, setUsers] = useState<TeamUser[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -96,7 +106,9 @@ export function TeamTab({ currentUser }: { currentUser: AuthUser }) {
       setNewUsername('')
       setNewRole('viewer')
     } catch (err) {
-      setError(errorMessage(err))
+      const pro = proRequiredFrom(err)
+      if (pro) setProNotice(pro)
+      else setError(errorMessage(err))
     } finally {
       setCreating(false)
     }
@@ -228,7 +240,10 @@ export function TeamTab({ currentUser }: { currentUser: AuthUser }) {
       )}
  
       <form onSubmit={createUser} className="mb-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <h2 className="text-sm font-semibold text-slate-900">Create a team member</h2>
+        <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+          Create a team member
+          {isPro === false && onOpenLicense && <ProLockLink onOpen={onOpenLicense} label="Unlock team accounts ↗" />}
+        </h2>
         <p className="mt-0.5 text-xs text-slate-500">
           Admins can edit rules, approve requests, and manage users. Viewers have read-only access to rules and logs.
         </p>

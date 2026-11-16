@@ -37,6 +37,20 @@ export function registerWorkspaceRoutes(router: Router, ctx: GatewayContext): vo
     if (!ws) sendError(res, 404, "Not Found", `Unknown workspace "${String(slug)}".`);
     return ws;
   };
+  /** Per-client Telegram / Slack routing is Agency-only. Clearing it (null / "") is always allowed. */
+  const routingAllowed = (body: Record<string, unknown>, res: Response): boolean => {
+    const sets = (v: unknown) => v !== undefined && v !== null && !(typeof v === "string" && v.trim() === "");
+    if ((sets(body.telegramChatId) || sets(body.slackChannel)) && !ctx.license.current().features.perClientRouting) {
+      sendLicenseRequired(
+        res,
+        "perClientRouting",
+        "Isolated per-client Telegram / Slack routing is a Mont Agency feature. Approvals for this workspace go to your main chat / channel; activate an Agency key to route each client separately.",
+        true
+      );
+      return false;
+    }
+    return true;
+  };
   const handle = (res: Response, err: unknown, context: string): void => {
     if (err instanceof WorkspaceInputError) sendError(res, 400, "Bad Request", err.message);
     else sendInternalError(res, context, err, "Could not update the workspace.");
@@ -48,7 +62,13 @@ export function registerWorkspaceRoutes(router: Router, ctx: GatewayContext): vo
       const license = ctx.license.current();
       res.json({
         workspaces: ctx.workspaces.list().map(view),
-        license: { tier: license.tier, maxWorkspaces: license.maxWorkspaces, multiWorkspace: license.features.multiWorkspace },
+        license: {
+          tier: license.tier,
+          maxWorkspaces: license.maxWorkspaces,
+          multiWorkspace: license.features.multiWorkspace,
+          allClientsOverview: license.features.allClientsOverview,
+          perClientRouting: license.features.perClientRouting,
+        },
       });
     } catch (err) {
       sendInternalError(res, "Workspaces error", err, "Could not load workspaces.");
@@ -56,6 +76,10 @@ export function registerWorkspaceRoutes(router: Router, ctx: GatewayContext): vo
   });
 
   router.get("/workspaces/overview", async (req: AuthenticatedRequest, res: Response) => {
+    if (!ctx.license.current().features.allClientsOverview) {
+      sendLicenseRequired(res, "allClientsOverview", "The All-Clients Overview dashboard is a Mont Agency feature. Activate an Agency key to see every client at a glance.", true);
+      return;
+    }
     try {
       const hours = Math.min(Math.max(Math.trunc(Number(req.query.hours)) || 24, 1), 24 * 31);
       const out = [];
@@ -101,8 +125,9 @@ export function registerWorkspaceRoutes(router: Router, ctx: GatewayContext): vo
       );
       return;
     }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!routingAllowed(body, res)) return;
     try {
-      const body = (req.body ?? {}) as Record<string, unknown>;
       const { workspace, apiKey } = await ctx.workspaces.create(body, parseUpstream);
       res.status(201).json({ success: true, workspace: view(workspace), apiKey });
     } catch (err) {
@@ -114,8 +139,10 @@ export function registerWorkspaceRoutes(router: Router, ctx: GatewayContext): vo
     if (!admin(req, res)) return;
     const ws = find(req.params.slug, res);
     if (!ws) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!routingAllowed(body, res)) return;
     try {
-      const updated = await ctx.workspaces.update(ws.id, (req.body ?? {}) as Record<string, unknown>, parseUpstream);
+      const updated = await ctx.workspaces.update(ws.id, body, parseUpstream);
       res.json({ success: true, workspace: view(updated) });
     } catch (err) {
       handle(res, err, "Update workspace error");

@@ -182,7 +182,9 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
               {tab === 'analytics' && (
                 <AnalyticsTab isPro={licenseApi.isPro} onOpenLicense={openLicense} onViewLogs={openLogs} onEditRule={openRuleFor} readOnly={readOnly} />
               )}
-              {tab === 'team' && !readOnly && <TeamTab currentUser={user} />}
+              {tab === 'team' && !readOnly && (
+                <TeamTab currentUser={user} isPro={licenseApi.license ? licenseApi.isPro : undefined} onOpenLicense={openLicense} />
+              )}
               {tab === 'setup' && (
                 <SetupTab
                   rulesApi={rulesApi}

@@ -36,6 +36,15 @@ function registerWorkspaceRoutes(router, ctx) {
             (0, utils_1.sendError)(res, 404, "Not Found", `Unknown workspace "${String(slug)}".`);
         return ws;
     };
+    /** Per-client Telegram / Slack routing is Agency-only. Clearing it (null / "") is always allowed. */
+    const routingAllowed = (body, res) => {
+        const sets = (v) => v !== undefined && v !== null && !(typeof v === "string" && v.trim() === "");
+        if ((sets(body.telegramChatId) || sets(body.slackChannel)) && !ctx.license.current().features.perClientRouting) {
+            (0, scope_1.sendLicenseRequired)(res, "perClientRouting", "Isolated per-client Telegram / Slack routing is a Mont Agency feature. Approvals for this workspace go to your main chat / channel; activate an Agency key to route each client separately.", true);
+            return false;
+        }
+        return true;
+    };
     const handle = (res, err, context) => {
         if (err instanceof workspaces_1.WorkspaceInputError)
             (0, utils_1.sendError)(res, 400, "Bad Request", err.message);
@@ -48,7 +57,13 @@ function registerWorkspaceRoutes(router, ctx) {
             const license = ctx.license.current();
             res.json({
                 workspaces: ctx.workspaces.list().map(view),
-                license: { tier: license.tier, maxWorkspaces: license.maxWorkspaces, multiWorkspace: license.features.multiWorkspace },
+                license: {
+                    tier: license.tier,
+                    maxWorkspaces: license.maxWorkspaces,
+                    multiWorkspace: license.features.multiWorkspace,
+                    allClientsOverview: license.features.allClientsOverview,
+                    perClientRouting: license.features.perClientRouting,
+                },
             });
         }
         catch (err) {
@@ -56,6 +71,10 @@ function registerWorkspaceRoutes(router, ctx) {
         }
     });
     router.get("/workspaces/overview", async (req, res) => {
+        if (!ctx.license.current().features.allClientsOverview) {
+            (0, scope_1.sendLicenseRequired)(res, "allClientsOverview", "The All-Clients Overview dashboard is a Mont Agency feature. Activate an Agency key to see every client at a glance.", true);
+            return;
+        }
         try {
             const hours = Math.min(Math.max(Math.trunc(Number(req.query.hours)) || 24, 1), 24 * 31);
             const out = [];
@@ -95,8 +114,10 @@ function registerWorkspaceRoutes(router, ctx) {
                 : "Multiple workspaces (one per client store) are a Mont Pro / Agency feature. Activate a license key to add clients.");
             return;
         }
+        const body = (req.body ?? {});
+        if (!routingAllowed(body, res))
+            return;
         try {
-            const body = (req.body ?? {});
             const { workspace, apiKey } = await ctx.workspaces.create(body, parseUpstream);
             res.status(201).json({ success: true, workspace: view(workspace), apiKey });
         }
@@ -110,8 +131,11 @@ function registerWorkspaceRoutes(router, ctx) {
         const ws = find(req.params.slug, res);
         if (!ws)
             return;
+        const body = (req.body ?? {});
+        if (!routingAllowed(body, res))
+            return;
         try {
-            const updated = await ctx.workspaces.update(ws.id, (req.body ?? {}), parseUpstream);
+            const updated = await ctx.workspaces.update(ws.id, body, parseUpstream);
             res.json({ success: true, workspace: view(updated) });
         }
         catch (err) {

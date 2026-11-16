@@ -30,11 +30,18 @@ export const PRO_REQUIRED_MESSAGE =
   "Pro feature — claim your free 90-day trial key (no payment card required) or upgrade at https://montweel.com";
 
 /**
- * Team Pro gate. Deliberately NOT an error status: replies 200 with `proRequired: true` so
- * clients can show an upgrade prompt instead of a failure. `feature` is kept for call-site clarity.
+ * Paid-feature gate: 402 Payment Required with `proRequired: true` (and `agencyRequired: true` for
+ * Agency-only features) so clients show an upgrade prompt instead of a generic failure.
  */
-export function sendProRequired(res: Response, _feature?: string): void {
-  res.status(200).json({ proRequired: true, message: PRO_REQUIRED_MESSAGE, upgradeUrl: UPGRADE_URL });
+export function sendProRequired(res: Response, feature?: string, opts: { agency?: boolean; message?: string } = {}): void {
+  res.status(402).json({
+    error: "Payment Required",
+    message: opts.message ?? PRO_REQUIRED_MESSAGE,
+    proRequired: true,
+    ...(opts.agency ? { agencyRequired: true } : {}),
+    ...(feature ? { feature } : {}),
+    upgradeUrl: UPGRADE_URL,
+  });
 }
 
 export function sendCaughtError(res: Response, err: unknown): void {

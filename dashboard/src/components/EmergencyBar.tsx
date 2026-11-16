@@ -8,6 +8,15 @@ import { Spinner } from './ui'
 
 const money = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 2 })
 
+/** Last 24 h protection summary (mode, money protected, ...). Never throws. */
+async function fetchSummary(): Promise<{ summary: ProtectionSummary } | { error: string }> {
+  try {
+    return { summary: (await api.get<ProtectionSummary>('/protection/summary', { params: { hours: 24 } })).data }
+  } catch (err) {
+    return { error: errorMessage(err) }
+  }
+}
+
 const MODES: { mode: EmergencyMode; label: string; hint: string; active: string; icon: ReactNode }[] = [
   {
     mode: 'normal',
@@ -73,23 +82,33 @@ export function EmergencyBar({
     }
   }
 
-  const load = useCallback(async () => {
-    try {
-      const res = await api.get<ProtectionSummary>('/protection/summary', { params: { hours: 24 } })
-      setSummary(res.data)
+  const show = useCallback((r: Awaited<ReturnType<typeof fetchSummary>>) => {
+    if ('summary' in r) {
+      setSummary(r.summary)
       setError(null)
-    } catch (err) {
-      setError(errorMessage(err))
-    }
+    } else setError(r.error)
   }, [])
 
+  /** After switching modes. */
+  const load = useCallback(async () => {
+    show(await fetchSummary())
+  }, [show])
+
   useEffect(() => {
-    void load()
+    let live = true
+    const refresh = () =>
+      void fetchSummary().then((r) => {
+        if (live) show(r)
+      })
+    refresh()
     const id = window.setInterval(() => {
-      if (!document.hidden) void load()
+      if (!document.hidden) refresh()
     }, 10000)
-    return () => window.clearInterval(id)
-  }, [load])
+    return () => {
+      live = false
+      window.clearInterval(id)
+    }
+  }, [show])
 
   async function switchTo(mode: EmergencyMode) {
     if (readOnly || !summary || summary.emergency.mode === mode) return

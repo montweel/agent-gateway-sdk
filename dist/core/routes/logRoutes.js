@@ -6,6 +6,7 @@ exports.registerLogRoutes = registerLogRoutes;
 const utils_1 = require("../utils");
 const protection_1 = require("../protection");
 const scope_1 = require("./scope");
+const approvals_1 = require("../approvals");
 // window -> total span and bucket size (both in ms)
 const WINDOWS = {
     "1h": { spanMs: 60 * 60000, stepMs: 5 * 60000 },
@@ -164,6 +165,17 @@ function registerLogRoutes(router, ctx) {
                     : null;
             out.response = parse(row.response_payload);
             delete out.response_payload;
+            // The outcome of a held request, so its QUEUED row can say who approved / rejected it
+            // (decision rows carry it in approved_by already).
+            if (typeof row.action_id === "number") {
+                const p = await db.get("SELECT status, decided_by, revoked_by FROM pending_actions WHERE id = ?", [row.action_id]);
+                out.approval = p
+                    ? { status: p.status, by: p.decided_by ? (0, approvals_1.approverLabel)(p.decided_by) : null, revokedBy: p.revoked_by ? (0, approvals_1.approverLabel)(p.revoked_by) : null }
+                    : { status: "UNKNOWN", by: null, revokedBy: null }; // pruned from the approval queue's retention
+            }
+            else {
+                out.approval = null; // never held for approval
+            }
             res.json(out);
         }
         catch (err) {

@@ -60,7 +60,11 @@ const SECRET_PATTERNS = [
     /\bxox[abposr]-[A-Za-z0-9-]{10,}/g, // Slack tokens
     /\bxapp-[A-Za-z0-9-]{10,}/g,
     /\bAKIA[0-9A-Z]{16}\b/g, // AWS access key id
-    /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/g, // Telegram bot token
+    // Telegram bot token, bare or inside an API URL (".../bot123456789:AA.../sendMessage", where a
+    // plain \b before the digits would not match).
+    /(?:\bbot|\b)\d{6,12}:[A-Za-z0-9_-]{30,}/g,
+    // Slack incoming-webhook / workflow URLs: the path IS the credential.
+    /https?:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9/_-]+/gi,
     /\bagk_[A-Za-z0-9]{8,}/g, // Mont agent keys
     /\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}/g, // OpenAI / Anthropic style keys
 ];

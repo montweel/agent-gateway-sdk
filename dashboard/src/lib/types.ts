@@ -161,6 +161,12 @@ export interface LogDetail extends Omit<LogRow, 'has_snapshot' | 'has_response'>
   sealed: boolean
   /** The response is still in flight (the row is sealed once it lands). */
   response_pending: boolean
+  /** Outcome of the held request this row belongs to; null = never held for approval. */
+  approval: {
+    status: 'PENDING' | 'EXECUTING' | 'APPROVED' | 'REJECTED' | 'FAILED' | 'EXPIRED' | 'UNKNOWN'
+    by: string | null
+    revokedBy: string | null
+  } | null
   request: {
     body: unknown
     query: unknown
@@ -398,6 +404,36 @@ export interface AuditConfig {
   capturePayloads: boolean
   /** Extra whole-key names to redact, on top of the built-in secret list. */
   redactKeys: string[]
+  activeTemplate?: ComplianceTemplateId
+  complianceFrameworks?: string[]
+}
+
+export type ComplianceTemplateId = 'fintech' | 'retail' | 'travel' | 'custom'
+
+export interface ComplianceTemplate {
+  id: ComplianceTemplateId
+  name: string
+  summary: string
+  frameworks: string[]
+  redactKeys: string[]
+  rules: Record<string, { mode: string; description: string }>
+}
+
+/** GET /compliance/templates */
+export interface ComplianceTemplatesResponse {
+  templates: ComplianceTemplate[]
+  knownFrameworks: string[]
+  activeTemplate: ComplianceTemplateId | null
+  complianceFrameworks: string[]
+}
+
+/** POST /compliance/apply-template */
+export interface ApplyTemplateResponse {
+  success: boolean
+  template: ComplianceTemplateId
+  addedRedactKeys: string[]
+  rules: { added: string[]; skipped: Array<{ key: string; reason: string }>; workspace: string } | null
+  config: { audit: AuditConfig }
 }
 
 export interface TeamUser {

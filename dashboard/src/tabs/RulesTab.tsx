@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import { AlertCircle, ArrowRight, Plus, SlidersHorizontal, Trash2 } from 'lucide-react'
 import { api, errorMessage } from '../lib/api'
@@ -87,14 +87,19 @@ function RuleRow({
   const [limitDraft, setLimitDraft] = useState(currentLimit === null ? '' : String(currentLimit))
   const [limitError, setLimitError] = useState(false)
 
-  useEffect(() => {
+  // A saved (or reloaded) value replaces the draft. Adjusted during render, not in an effect:
+  // React's pattern for state that follows a prop.
+  const [syncedDescription, setSyncedDescription] = useState(rule.description)
+  if (syncedDescription !== rule.description) {
+    setSyncedDescription(rule.description)
     setDraft(rule.description)
-  }, [rule.description])
-
-  useEffect(() => {
+  }
+  const [syncedLimit, setSyncedLimit] = useState(currentLimit)
+  if (syncedLimit !== currentLimit) {
+    setSyncedLimit(currentLimit)
     setLimitDraft(currentLimit === null ? '' : String(currentLimit))
     setLimitError(false)
-  }, [currentLimit])
+  }
 
   function commitLimit() {
     if (readOnly) return

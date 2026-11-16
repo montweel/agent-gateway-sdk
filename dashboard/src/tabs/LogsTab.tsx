@@ -1,16 +1,19 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowRight, ChevronDown, ChevronRight, Download, Filter, Plus, Search, ShieldOff, UserCheck, UserRound, X } from 'lucide-react'
+import { ArrowRight, ChevronDown, ChevronRight, Download, FileCheck2, Filter, Plus, Search, ShieldOff, UserCheck, UserRound, X } from 'lucide-react'
 import { api, errorMessage } from '../lib/api'
 import { useDebouncedValue } from '../hooks/useDebouncedValue'
 import type { RulesApi } from '../hooks/useRules'
 import type { LogRow, RevokeResponse, Rules } from '../lib/types'
 import { formatTime, hasRule, INPUT_CLASS, READ_ONLY_HINT, ruleKey, suggestedMode } from '../lib/utils'
-import { Badge, ErrorBanner, LOG_TONES, MethodBadge, PageHeader, RefreshButton, Spinner, SuccessBanner } from '../components/ui'
+import { Badge, ErrorBanner, MethodBadge, PageHeader, RefreshButton, Spinner, SuccessBanner } from '../components/ui'
+import { LOG_TONES } from '../lib/tones'
 import { RevokeModal } from '../components/RevokeModal'
 import type { RevokeTarget } from '../components/RevokeModal'
 import { LedgerVerifyBadge } from '../components/LedgerVerifyBadge'
 import { LogDetailPanel } from '../components/LogDetailPanel'
 import { EndUserBadge } from '../components/EndUserBadge'
+import { AuditorPackModal } from '../components/AuditorPackModal'
+import { ProBadge } from '../components/LicenseCard'
 
 /**
  * Calls that matched no rule and were refused by default deny. The gateway writes exactly
@@ -50,6 +53,8 @@ export function LogsTab({
   initialFilter = null,
   onCreateRule,
   onOpenApproval,
+  isPro = true,
+  onOpenLicense,
 }: {
   rulesApi: RulesApi
   readOnly: boolean
@@ -58,6 +63,9 @@ export function LogsTab({
   onCreateRule?: (method: string, path: string) => void
   /** Open Pending Approvals on this request id. */
   onOpenApproval?: (id: number) => void
+  /** The Auditor Evidence Pack is Pro. */
+  isPro?: boolean
+  onOpenLicense?: () => void
 }) {
   const { rules, setRules, loading: rulesLoading, reload: reloadRules } = rulesApi
   const [logs, setLogs] = useState<LogRow[]>([])
@@ -67,6 +75,7 @@ export function LogsTab({
   const [notice, setNotice] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
+  const [packOpen, setPackOpen] = useState(false)
   const requestId = useRef(0)
 
   function toggleExpanded(id: number) {
@@ -266,6 +275,20 @@ export function LogsTab({
               {exporting ? <Spinner /> : <Download className="h-4 w-4" aria-hidden="true" />}
               Export CSV
             </button>
+            <button
+              type="button"
+              onClick={() => (isPro ? setPackOpen(true) : onOpenLicense?.())}
+              title={
+                isPro
+                  ? 'Download an auditor attestation report or a checksummed JSON evidence bundle'
+                  : 'The Auditor Evidence Pack is a Mont Pro feature. Click to activate a key.'
+              }
+              className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
+            >
+              <FileCheck2 className="h-4 w-4 text-indigo-600" aria-hidden="true" />
+              Export Auditor Pack
+              {!isPro && <ProBadge />}
+            </button>
             <RefreshButton onClick={() => void refreshAll()} loading={loading} />
           </div>
         }
@@ -427,16 +450,27 @@ export function LogsTab({
         </div>
       </div>
 
-      <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200">
+      <div className="w-full max-w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+        {/* Fixed layout: the table is exactly as wide as this box (long paths and chips wrap instead of
+            widening it), so the expanded row, the Actions column and the page never run off-screen.
+            Below the minimum width it scrolls sideways inside this box only. */}
+        <div className="w-full max-w-full overflow-x-auto">
+          <table className="w-full min-w-[52rem] table-fixed divide-y divide-slate-200">
+            <colgroup>
+              <col className="w-[12rem]" />
+              <col className="w-[6rem]" />
+              <col />
+              <col className="w-[10.5rem]" />
+              <col className="w-[6rem]" />
+              <col className="w-[10.5rem]" />
+            </colgroup>
             <thead className="bg-slate-50">
               <tr>
                 {['Timestamp', 'Request ID', 'Path', 'Status', 'Method', 'Actions'].map((h) => (
                   <th
                     key={h}
                     scope="col"
-                    className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500"
+                    className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500"
                   >
                     {h}
                   </th>
@@ -448,15 +482,15 @@ export function LogsTab({
                 [0, 1, 2, 3, 4].map((i) => (
                   <tr key={i} className="animate-pulse">
                     {[40, 12, 48, 24, 16, 20].map((w, j) => (
-                      <td key={j} className="px-6 py-4">
-                        <div className="h-4 rounded bg-slate-200" style={{ width: `${w * 3}px` }} />
+                      <td key={j} className="px-4 py-4">
+                        <div className="h-4 max-w-full rounded bg-slate-200" style={{ width: `${w * 3}px` }} />
                       </td>
                     ))}
                   </tr>
                 ))
               ) : logs.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-6 py-16 text-center text-sm text-slate-500">
+                  <td colSpan={6} className="px-4 py-16 text-center text-sm text-slate-500">
                     {hasActiveFilters ? 'No audit logs match the selected filters.' : 'No requests logged yet.'}
                   </td>
                 </tr>
@@ -470,7 +504,7 @@ export function LogsTab({
                   return (
                     <Fragment key={log.id}>
                     <tr className={`transition ${unknown ? 'bg-orange-50/40 hover:bg-orange-50' : 'hover:bg-slate-50'} ${open ? 'bg-slate-50' : ''}`}>
-                      <td className="whitespace-nowrap px-6 py-3.5 text-sm text-slate-600">
+                      <td className="whitespace-nowrap px-4 py-3.5 text-sm text-slate-600">
                         <button
                           type="button"
                           onClick={() => toggleExpanded(log.id)}
@@ -482,7 +516,7 @@ export function LogsTab({
                           {formatTime(log.timestamp)}
                         </button>
                       </td>
-                      <td className="whitespace-nowrap px-6 py-3.5 font-mono text-sm">
+                      <td className="whitespace-nowrap px-4 py-3.5 font-mono text-sm">
                         {log.action_id ? (
                           onOpenApproval ? (
                             <button
@@ -500,9 +534,9 @@ export function LogsTab({
                           <span className="text-slate-300" title="Only requests that went to approval have a request ID">—</span>
                         )}
                       </td>
-                      <td className="whitespace-nowrap px-6 py-3.5">
-                        <div className="flex items-center gap-3">
-                          <span className="font-mono text-sm text-slate-900">{log.path}</span>
+                      <td className="min-w-0 px-4 py-3.5">
+                        <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                          <span className="min-w-0 break-all font-mono text-sm text-slate-900">{log.path}</span>
                           {log.workspace_slug && log.workspace_slug !== 'default' && (
                             <span className="rounded-md bg-indigo-50 px-1.5 py-0.5 text-xs font-medium text-indigo-700">{log.workspace_slug}</span>
                           )}
@@ -525,9 +559,9 @@ export function LogsTab({
                             </span>
                           )}
                           {log.end_user && (
-                            <span className="inline-flex items-center gap-1">
+                            <span className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1">
                               <span
-                                className="inline-flex max-w-[12rem] items-center gap-1 rounded-md bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-800"
+                                className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-md bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-800"
                                 title={`On behalf of ${log.end_user}`}
                               >
                                 <UserRound className="h-3 w-3 shrink-0" aria-hidden="true" />
@@ -536,13 +570,18 @@ export function LogsTab({
                               <EndUserBadge verified={Boolean(log.end_user_verified)} />
                             </span>
                           )}
-                          {log.approved_by && (
+                          {log.approved_by && (log.status === 'APPROVED' || log.status === 'REJECTED') && (
                             <span
-                              className="inline-flex max-w-[12rem] items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-800"
-                              title={`Approved by ${log.approved_by}`}
+                              className={`inline-flex min-w-0 max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium ${
+                                log.status === 'APPROVED' ? 'bg-emerald-50 text-emerald-800' : 'bg-red-50 text-red-800'
+                              }`}
+                              title={`${log.status === 'APPROVED' ? 'Approved' : 'Rejected'} by ${log.approved_by}`}
                             >
                               <UserCheck className="h-3 w-3 shrink-0" aria-hidden="true" />
-                              <span className="truncate">{log.approved_by}</span>
+                              {/* Compact in the list (full name on hover and in the expanded row). */}
+                              <span className="truncate">
+                                {log.status === 'APPROVED' ? 'approved by' : 'rejected by'} {log.approved_by}
+                              </span>
                             </span>
                           )}
                           {unregistered && (
@@ -559,7 +598,7 @@ export function LogsTab({
                           )}
                         </div>
                       </td>
-                      <td className="whitespace-nowrap px-6 py-3.5">
+                      <td className="px-4 py-3.5">
                         {unknown ? (
                           <span
                             title="No rule matched this endpoint, so the gateway blocked it (default deny). The agent was told 403 Forbidden."
@@ -572,10 +611,10 @@ export function LogsTab({
                           <Badge tone={LOG_TONES[log.status] ?? 'slate'}>{log.status.replace(/_/g, ' ')}</Badge>
                         )}
                       </td>
-                      <td className="whitespace-nowrap px-6 py-3.5">
+                      <td className="whitespace-nowrap px-4 py-3.5">
                         <MethodBadge method={log.method} />
                       </td>
-                      <td className="whitespace-nowrap px-6 py-3.5">
+                      <td className="whitespace-nowrap px-4 py-3.5">
                         {log.status === 'APPROVED' && log.action_id ? (
                           revokedActions.has(log.action_id) ? (
                             <span className="text-xs font-medium text-red-700">Revoked</span>
@@ -615,7 +654,7 @@ export function LogsTab({
                             <span className="text-xs text-slate-500">{unregistered ? 'No rule matched' : 'Rule added since'}</span>
                           )
                         ) : log.detail ? (
-                          <span className="block max-w-[16rem] truncate text-xs text-slate-500" title={log.detail}>
+                          <span className="block max-w-full truncate text-xs text-slate-500" title={log.detail}>
                             {log.detail}
                           </span>
                         ) : null}
@@ -623,7 +662,7 @@ export function LogsTab({
                     </tr>
                     {open && (
                       <tr className="bg-slate-50">
-                        <td colSpan={6} className="border-t border-slate-100 px-6 py-4">
+                        <td colSpan={6} className="min-w-0 border-t border-slate-100 px-4 py-4">
                           <LogDetailPanel id={log.id} />
                         </td>
                       </tr>
@@ -636,6 +675,14 @@ export function LogsTab({
           </table>
         </div>
       </div>
+
+      {packOpen && (
+        <AuditorPackModal
+          agents={[...new Set(logs.map((l) => l.agent_key).filter((a): a is string => Boolean(a)))].sort()}
+          onClose={() => setPackOpen(false)}
+          onOpenLicense={onOpenLicense}
+        />
+      )}
 
       {revokeTarget && <RevokeModal target={revokeTarget} onClose={() => setRevokeTarget(null)} onDone={onRevoked} />}
     </>

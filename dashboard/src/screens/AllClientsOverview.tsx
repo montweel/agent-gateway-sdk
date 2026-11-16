@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ArrowRight, Lock } from 'lucide-react'
 import { api, errorMessage, setWorkspace } from '../lib/api'
 import type { WorkspaceOverview } from '../lib/types'
@@ -9,33 +9,50 @@ const money = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 
 const MODE_TONE: Record<string, Tone> = { normal: 'green', approval_only: 'amber', lockdown: 'red' }
 const MODE_LABEL: Record<string, string> = { normal: 'Normal', approval_only: 'Approval-only', lockdown: 'Lockdown' }
 
+/** Every workspace side by side for the last `hours`. Never throws. */
+async function fetchOverview(hours: number): Promise<{ overview: WorkspaceOverview } | { error: string }> {
+  try {
+    return { overview: (await api.get<WorkspaceOverview>('/workspaces/overview', { params: { hours } })).data }
+  } catch (err) {
+    return { error: errorMessage(err) }
+  }
+}
+
 /** Agency view: every client workspace side by side, with a one-click jump into each. */
 export function AllClientsOverview() {
   const [data, setData] = useState<WorkspaceOverview | null>(null)
   const [hours, setHours] = useState(24)
-  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await api.get<WorkspaceOverview>('/workspaces/overview', { params: { hours } })
-      setData(res.data)
-      setError(null)
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setLoading(false)
-    }
-  }, [hours])
+  // The Refresh button bumps this, which re-runs the fetch effect for the same window.
+  const [reloadToken, setReloadToken] = useState(0)
+  const requestKey = `${hours}#${reloadToken}`
+  // "Loading" = the data on screen is not the answer to the current request yet (derived, so the
+  // effect only sets state once a request has settled). Background polls do not show the spinner.
+  const [loadedKey, setLoadedKey] = useState<string | null>(null)
+  const loading = loadedKey !== requestKey
 
   useEffect(() => {
-    void load()
+    let live = true
+    const refresh = () =>
+      void fetchOverview(hours).then((r) => {
+        if (!live) return
+        if ('overview' in r) {
+          setData(r.overview)
+          setError(null)
+        } else setError(r.error)
+        setLoadedKey(requestKey)
+      })
+    refresh()
     const id = window.setInterval(() => {
-      if (!document.hidden) void load()
+      if (!document.hidden) refresh()
     }, 15000)
-    return () => window.clearInterval(id)
-  }, [load])
+    return () => {
+      live = false
+      window.clearInterval(id)
+    }
+  }, [hours, requestKey])
+
+  const load = () => setReloadToken((t) => t + 1)
 
   const t = data?.totals
   return (
@@ -55,7 +72,7 @@ export function AllClientsOverview() {
               <option value={168}>Last 7 days</option>
               <option value={720}>Last 30 days</option>
             </select>
-            <RefreshButton onClick={() => void load()} loading={loading} />
+            <RefreshButton onClick={load} loading={loading} />
           </div>
         }
       />

@@ -108,6 +108,8 @@ Licenses are offline Ed25519 keys and nothing phones home. Every new install get
 | Shadow (dry-run) rules & Policy Time-Machine replay | ✅ | ✅ | ✅ |
 | **Hash-Chained Audit Ledger**: every row chained | ✅ | ✅ | ✅ |
 | **Compliance audit trail**: response capture, custom redaction keys, end-user & approver attribution | ✅ | ✅ | ✅ |
+| **Industry compliance templates** (Fintech, Retail, Travel, Custom) | ✅ | ✅ | ✅ |
+| **Auditor Evidence Pack** (attestation report + checksummed JSON bundle) | — | ✅ | ✅ |
 | Hash-Chained Audit Ledger: one-click integrity **verification** | — | ✅ | ✅ |
 | **Zero-Tunnel Telegram / Slack buttons** & Telegram bot commands | — (alerts arrive; approve in the dashboard) | ✅ | ✅ |
 | **Edit & Approve** (change a payload before it runs) | — | ✅ | ✅ |
@@ -225,6 +227,20 @@ Every JSON-RPC `tools/call` gets the same rules, payload policies (on `params.ar
   - It is recorded only; it never grants access.
 - **Approver attribution** (`approved_by`). The admin who released a held action is recorded on its `APPROVED` row: the signed-in account, or the SSO identity once the shared secret has checked out. The end user follows the action from its queued row to that decision row.
 - **Row details.** Expand any row in **Audit Logs** to see the redacted request and response, the end user and approver, and the row's ledger hash (`GET /logs/:id`).
+- **Industry compliance templates.** Pick a preset in **Settings → Audit & PII Redaction**, or call `POST /compliance/apply-template`.
+
+  | Template | Frameworks | Adds redaction for | Suggested approval rules |
+  |---|---|---|---|
+  | Fintech & Banking | PCI-DSS, SOC2 | `cvv`, `pan`, `iban`, `swift`, `routing_number`, `account_number`, `ifsc`, `tax_id`, `ssn`… | transfers, payouts, refunds, deletes |
+  | Retail & E-Commerce | GDPR, CCPA | `card_number`, `billing_address`, `shipping_address`, `phone_number`, `gift_card_code`, `dob`… | refunds, price changes, discounts, customer deletes |
+  | Travel & Hospitality | GDPR, PCI-DSS | `passport_number`, `pnr`, `ticket_number`, `visa_number`, `national_id`, `frequent_flyer_id`… | cancellations, booking changes, ticket issuance |
+  | Custom | your tags (SOC2, HIPAA, ISO 27001…) | your keys | none |
+
+  - Templates only ever *add*. Their keys are merged into `audit.redactKeys`, and nothing is removed.
+  - With `includeRules: true`, their `REQUIRE_APPROVAL` rules are added to the selected workspace, but never over a rule you already have. A route you explicitly block stays blocked.
+- **Auditor Evidence Pack** (Pro; **Export Auditor Pack** on the Audit Logs page, or `GET /audit/export-pack?format=report|json&from&to&agentName&endUser`). It is one download for your auditor:
+  - **Attestation report (`.md`):** audit scope, a live ledger-integrity certificate (pass/fail, rows verified, genesis and latest hash), the policy and redaction snapshot (secrets omitted), summary metrics per agent and per verified vs agent-claimed end user, and the scoped transaction table.
+  - **JSON evidence bundle (`.json`):** the same data with every row and full hashes, plus `bundleSha256`. That is the SHA-256 of `JSON.stringify({ metadata, ledgerVerification, policySnapshot, summary, logs })`, so anyone can confirm the file was not changed after download. It is a checksum, not a signature. For proof against the gateway itself, compare the ledger head hash with the one in the daily digest.
 - **Money protected** shows how much agents tried to move and were stopped, next to what was executed.
 - **CSV export** for accounting and chargeback disputes (formula-injection safe).
 - **Shadow rules & Policy Time-Machine.** Try a policy as `SHADOW_*` on live traffic, or click **Test Rules Against History**. The last N real requests are replayed through your rules, including rate limits, budgets and duplicate protection, and you see exactly which ones would now be blocked, held or rate-limited.
@@ -298,7 +314,9 @@ The image is multi-stage on Node 20 Alpine. Slack Socket Mode's WebSocket client
 ```json
 "audit": {
   "capturePayloads": true,
-  "redactKeys": ["password", "token", "authorization", "credit_card", "ssn", "secret", "key"]
+  "redactKeys": ["password", "token", "authorization", "credit_card", "ssn", "secret", "key"],
+  "activeTemplate": "fintech",
+  "complianceFrameworks": ["PCI-DSS", "SOC2"]
 }
 ```
 
@@ -316,7 +334,8 @@ The image is multi-stage on Node 20 Alpine. Slack Socket Mode's WebSocket client
 | Area | Endpoints |
 |---|---|
 | Rules & approvals | `rules`, `approvals/:id/decide`, `approvals/:id/revoke` |
-| Logs & ledger | `logs`, `logs/:id`, `logs/export.csv`, `audit/verify`, `simulate/history` |
+| Logs & ledger | `logs`, `logs/:id`, `logs/export.csv`, `audit/verify`, `audit/export-pack`, `simulate/history` |
+| Compliance | `compliance/templates`, `compliance/apply-template` |
 | Protection | `protection/summary`, `emergency`, `guards/usage` |
 | Workspaces & setup | `workspaces`, `setup`, `setup/presets/:id/apply`, `license` |
 

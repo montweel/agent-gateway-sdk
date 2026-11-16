@@ -19,50 +19,82 @@ export interface ApprovalCounts {
 export const APPROVALS_PAGE = 100
 const DEFAULT_QUERY: ApprovalsQuery = { status: 'ALL', id: null, limit: APPROVALS_PAGE }
 
+type ApprovalsResult = { approvals: Approval[]; counts: ApprovalCounts } | { error: string; online: boolean }
+
+/** The list for `query` plus the overall counts. Never throws. */
+async function fetchApprovals(query: ApprovalsQuery): Promise<ApprovalsResult> {
+  try {
+    const params: Record<string, string> = { limit: String(query.limit) }
+    if (query.status === 'PENDING') params.status = 'PENDING'
+    if (query.id !== null) params.id = String(query.id)
+    const [list, totals] = await Promise.all([api.get<Approval[]>('/approvals', { params }), api.get<ApprovalCounts>('/approvals/counts')])
+    return { approvals: list.data, counts: totals.data }
+  } catch (err) {
+    return { error: errorMessage(err), online: !(axios.isAxiosError(err) && !err.response) }
+  }
+}
+
 export function useApprovals() {
   const [approvals, setApprovals] = useState<Approval[]>([])
   const [counts, setCounts] = useState<ApprovalCounts>({ total: 0, pending: 0 })
   const [query, setQueryState] = useState<ApprovalsQuery>(DEFAULT_QUERY)
-  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [online, setOnline] = useState(true)
   const requestId = useRef(0)
 
+  // "Loading" = the list on screen is not for the current query yet, or a manual refresh runs.
+  // Derived, so the fetch effect below only sets state once a request has settled.
+  const queryKey = JSON.stringify(query)
+  const [loadedKey, setLoadedKey] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const loading = loadedKey !== queryKey || refreshing
+
+  /** Applies a response, unless a newer request has started since (the query changed). */
+  const show = useCallback((thisRequest: number, key: string, r: ApprovalsResult) => {
+    if (thisRequest !== requestId.current) return
+    if ('approvals' in r) {
+      setApprovals(r.approvals)
+      setCounts(r.counts)
+      setError(null)
+      setOnline(true)
+    } else {
+      setError(r.error)
+      setOnline(r.online)
+    }
+    setLoadedKey(key)
+  }, [])
+
+  /** Refresh after an action. `silent` keeps the list on screen instead of showing the spinner. */
   const reload = useCallback(
     async (silent = false) => {
       const thisRequest = ++requestId.current
-      if (!silent) setLoading(true)
+      if (!silent) setRefreshing(true)
       try {
-        const params: Record<string, string> = { limit: String(query.limit) }
-        if (query.status === 'PENDING') params.status = 'PENDING'
-        if (query.id !== null) params.id = String(query.id)
-        const [list, totals] = await Promise.all([
-          api.get<Approval[]>('/approvals', { params }),
-          api.get<ApprovalCounts>('/approvals/counts'),
-        ])
-        if (thisRequest !== requestId.current) return // the query changed while this was in flight
-        setApprovals(list.data)
-        setCounts(totals.data)
-        setError(null)
-        setOnline(true)
-      } catch (err) {
-        if (thisRequest !== requestId.current) return
-        setError(errorMessage(err))
-        setOnline(!(axios.isAxiosError(err) && !err.response))
+        show(thisRequest, queryKey, await fetchApprovals(query))
       } finally {
-        if (!silent && thisRequest === requestId.current) setLoading(false)
+        if (!silent) setRefreshing(false)
       }
     },
-    [query]
+    [query, queryKey, show]
   )
 
   useEffect(() => {
-    void reload()
+    let live = true // false once the query changed: drop anything still in flight for the old one
+    const run = () => {
+      const thisRequest = ++requestId.current
+      void fetchApprovals(query).then((r) => {
+        if (live) show(thisRequest, queryKey, r)
+      })
+    }
+    run()
     const id = window.setInterval(() => {
-      if (!document.hidden) void reload(true)
+      if (!document.hidden) run()
     }, 5000)
-    return () => window.clearInterval(id)
-  }, [reload])
+    return () => {
+      live = false
+      window.clearInterval(id)
+    }
+  }, [query, queryKey, show])
 
   /** Merges into the current query; changing the status or id starts again from the first page. */
   const setQuery = useCallback((patch: Partial<ApprovalsQuery>) => {

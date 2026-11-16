@@ -23,36 +23,44 @@ type AppState =
   | { status: 'locked' }
   | { status: 'ready'; user: AuthUser; lastUsedPassword: string }
 
+/** Asks the server where this browser stands. Never throws. */
+async function fetchAuthState(): Promise<AppState> {
+  try {
+    const res = await api.get<AuthStatusResponse>('/auth/status')
+    if (res.data.needsSetup) {
+      return { status: 'setup', setupTokenRequired: Boolean(res.data.requiresSetupToken ?? res.data.setupTokenRequired) }
+    }
+    if (res.data.authenticated && res.data.user) return { status: 'ready', user: res.data.user, lastUsedPassword: '' }
+    return { status: 'locked' }
+  } catch (err) {
+    return { status: 'offline', message: errorMessage(err) }
+  }
+}
+
 export default function App() {
   const [state, setState] = useState<AppState>({ status: 'loading' })
 
-  const checkAuth = useCallback(async () => {
+  /** Re-check after an event (retry, sign-out, expired session): show the spinner, then the answer. */
+  const checkAuth = useCallback(() => {
     setState({ status: 'loading' })
-    try {
-      const res = await api.get<AuthStatusResponse>('/auth/status')
-      if (res.data.needsSetup) {
-        setState({
-          status: 'setup',
-          setupTokenRequired: Boolean(res.data.requiresSetupToken ?? res.data.setupTokenRequired),
-        })
-      } else if (res.data.authenticated && res.data.user) {
-        setState({ status: 'ready', user: res.data.user, lastUsedPassword: '' })
-      } else {
-        setState({ status: 'locked' })
-      }
-    } catch (err) {
-      setState({ status: 'offline', message: errorMessage(err) })
-    }
+    void fetchAuthState().then(setState)
   }, [])
 
+  // First load: the state already starts as "loading", so only the answer is set.
   useEffect(() => {
-    void checkAuth()
-  }, [checkAuth])
+    let live = true
+    void fetchAuthState().then((s) => {
+      if (live) setState(s)
+    })
+    return () => {
+      live = false
+    }
+  }, [])
 
   // The server rejected our session while we were using the dashboard (expired, revoked,
   // password reset by an admin): go back to the sign-in screen instead of showing errors everywhere.
   useEffect(() => {
-    const onExpired = () => void checkAuth()
+    const onExpired = () => checkAuth()
     window.addEventListener(AUTH_EXPIRED_EVENT, onExpired)
     return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired)
   }, [checkAuth])
@@ -94,7 +102,7 @@ export default function App() {
       // ignore network error during logout
     }
     setAuthToken(null)
-    void checkAuth()
+    checkAuth()
   }, [checkAuth])
 
   if (state.status === 'loading') {
@@ -116,7 +124,7 @@ export default function App() {
           <p className="mt-2 text-sm text-slate-600">{state.message}</p>
           <button
             type="button"
-            onClick={() => void checkAuth()}
+            onClick={() => checkAuth()}
             className="mt-4 inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500"
           >
             <RefreshCw className="h-4 w-4" aria-hidden="true" />

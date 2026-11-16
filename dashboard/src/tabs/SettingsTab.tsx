@@ -14,6 +14,16 @@ import { Badge, ErrorBanner, PageHeader, ProCallout, RefreshButton, Spinner, Suc
 
 const scrollToLicense = () => document.getElementById('mont-license')?.scrollIntoView({ behavior: 'smooth' })
 
+/** The public agent manifest, pretty-printed. Never throws. */
+async function fetchManifest(): Promise<{ manifest: string } | { error: string }> {
+  try {
+    const res = await axios.get<unknown>(`${BASE_URL}/.well-known/agent.json`)
+    return { manifest: JSON.stringify(res.data, null, 2) }
+  } catch (err) {
+    return { error: errorMessage(err) }
+  }
+}
+
 export function SettingsTab({ readOnly, licenseApi }: { readOnly: boolean; licenseApi: LicenseApi }) {
   const isPro = licenseApi.isPro
   const [config, setConfig] = useState<GatewayConfig | null>(null)
@@ -39,18 +49,19 @@ export function SettingsTab({ readOnly, licenseApi }: { readOnly: boolean; licen
   const [manifestError, setManifestError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
 
-  const loadManifest = useCallback(async () => {
-    setManifestLoading(true)
-    try {
-      const res = await axios.get<unknown>(`${BASE_URL}/.well-known/agent.json`)
-      setManifest(JSON.stringify(res.data, null, 2))
+  const showManifest = useCallback((r: { manifest: string } | { error: string }) => {
+    if ('manifest' in r) {
+      setManifest(r.manifest)
       setManifestError(null)
-    } catch (err) {
-      setManifestError(errorMessage(err))
-    } finally {
-      setManifestLoading(false)
-    }
+    } else setManifestError(r.error)
+    setManifestLoading(false)
   }, [])
+
+  /** Refresh button / after saving. */
+  const loadManifest = useCallback(() => {
+    setManifestLoading(true)
+    void fetchManifest().then(showManifest)
+  }, [showManifest])
 
   const applyConfig = useCallback((c: GatewayConfig) => {
     setConfig(c)
@@ -62,23 +73,29 @@ export function SettingsTab({ readOnly, licenseApi }: { readOnly: boolean; licen
     setSsoRoleHeader(c.ssoRoleHeader ?? 'x-forwarded-role')
   }, [])
 
-  const loadConfig = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await api.get<GatewayConfig>('/config')
-      applyConfig(res.data)
-      setError(null)
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setLoading(false)
-    }
-  }, [applyConfig])
-
+  // First load. Both "loading" flags start true, so only the answers are set here.
   useEffect(() => {
-    void loadConfig()
-    void loadManifest()
-  }, [loadConfig, loadManifest])
+    let live = true
+    api.get<GatewayConfig>('/config').then(
+      (res) => {
+        if (!live) return
+        applyConfig(res.data)
+        setError(null)
+        setLoading(false)
+      },
+      (err: unknown) => {
+        if (!live) return
+        setError(errorMessage(err))
+        setLoading(false)
+      }
+    )
+    void fetchManifest().then((r) => {
+      if (live) showManifest(r)
+    })
+    return () => {
+      live = false
+    }
+  }, [applyConfig, showManifest])
 
   useEffect(() => {
     if (!copied) return
@@ -152,12 +169,38 @@ export function SettingsTab({ readOnly, licenseApi }: { readOnly: boolean; licen
     }
   }
 
+  // The server only ever sends the secret masked; Show / Copy fetch the real value on demand
+  // (admins only). It is tied to the mask it was fetched for, so a rotation discards it.
   const ssoSecret = config?.ssoSharedSecret ?? ''
+  const [revealedSso, setRevealedSso] = useState<{ forMask: string; value: string } | null>(null)
+  const ssoPlain = revealedSso?.forMask === ssoSecret ? revealedSso.value : null
+
+  async function revealSsoSecret(): Promise<string | null> {
+    if (ssoPlain !== null) return ssoPlain
+    try {
+      const res = await api.get<{ value: string }>('/secrets/sso.sharedSecret')
+      setRevealedSso({ forMask: ssoSecret, value: res.data.value })
+      return res.data.value
+    } catch (err) {
+      setError(errorMessage(err))
+      return null
+    }
+  }
+
+  async function toggleSecret() {
+    if (showSecret) {
+      setShowSecret(false)
+      return
+    }
+    if ((await revealSsoSecret()) !== null) setShowSecret(true)
+  }
 
   async function copySecret() {
     if (!ssoSecret) return
+    const value = await revealSsoSecret()
+    if (value === null) return
     try {
-      await navigator.clipboard.writeText(ssoSecret)
+      await navigator.clipboard.writeText(value)
       setSecretCopied(true)
       window.setTimeout(() => setSecretCopied(false), 1500)
     } catch {
@@ -314,11 +357,11 @@ export function SettingsTab({ readOnly, licenseApi }: { readOnly: boolean; licen
               {ssoSecret ? (
                 <div className="mt-2 flex items-center gap-2">
                   <code className="min-w-0 flex-1 break-all rounded-md bg-slate-50 px-3 py-2 font-mono text-slate-800 ring-1 ring-inset ring-slate-200">
-                    {showSecret ? ssoSecret : '•'.repeat(32)}
+                    {showSecret && ssoPlain !== null ? ssoPlain : '•'.repeat(32)}
                   </code>
                   <button
                     type="button"
-                    onClick={() => setShowSecret((v) => !v)}
+                    onClick={() => void toggleSecret()}
                     aria-label={showSecret ? 'Hide secret' : 'Show secret'}
                     className="rounded-lg border border-slate-200 p-2 text-slate-600 hover:bg-slate-50"
                   >
@@ -386,10 +429,9 @@ export function SettingsTab({ readOnly, licenseApi }: { readOnly: boolean; licen
 
       {config?.audit && (
         <AuditSettingsCard
-          key={JSON.stringify(config.audit)}
           audit={config.audit}
           readOnly={readOnly}
-          onSaved={(c) => setConfig((prev) => (prev ? { ...prev, audit: c.audit } : prev))}
+          onSaved={(audit) => setConfig((prev) => (prev ? { ...prev, audit } : prev))}
         />
       )}
 

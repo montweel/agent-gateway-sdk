@@ -3,6 +3,7 @@ import { DEFAULT_CONFIG, HEADER_NAME_REGEX } from "./constants";
 import { randomHex } from "./crypto";
 import { createFileCache } from "./fileCache";
 import { writeJsonAtomic } from "./utils";
+import { COMPLIANCE_TEMPLATE_IDS, cleanFrameworks } from "./complianceTemplates";
 
 interface RawConfigFile extends Partial<GatewayConfig> {
   adminToken?: unknown;
@@ -59,10 +60,16 @@ export function cleanRedactKeys(value: unknown): string[] | null {
 function parseAuditConfig(value: unknown): AuditConfig {
   const d = DEFAULT_CONFIG.audit;
   const raw = typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
-  return {
+  const out: AuditConfig = {
     capturePayloads: typeof raw.capturePayloads === "boolean" ? raw.capturePayloads : d.capturePayloads,
     redactKeys: cleanRedactKeys(raw.redactKeys) ?? [...d.redactKeys],
   };
+  if (typeof raw.activeTemplate === "string" && (COMPLIANCE_TEMPLATE_IDS as string[]).includes(raw.activeTemplate)) {
+    out.activeTemplate = raw.activeTemplate as AuditConfig["activeTemplate"];
+  }
+  const frameworks = cleanFrameworks(raw.complianceFrameworks);
+  if (frameworks) out.complianceFrameworks = frameworks;
+  return out;
 }
 
 const newSecret = (): string => randomHex(32);
@@ -141,7 +148,12 @@ export function createConfigStore(configPath: string, options: AgentGatewayOptio
       ssoTrustProxyHeader: config.ssoTrustProxyHeader,
       ssoUserHeader: config.ssoUserHeader,
       ssoRoleHeader: config.ssoRoleHeader,
-      audit: { capturePayloads: config.audit.capturePayloads, redactKeys: [...config.audit.redactKeys] },
+      audit: {
+        capturePayloads: config.audit.capturePayloads,
+        redactKeys: [...config.audit.redactKeys],
+        ...(config.audit.activeTemplate ? { activeTemplate: config.audit.activeTemplate } : {}),
+        ...(config.audit.complianceFrameworks ? { complianceFrameworks: [...config.audit.complianceFrameworks] } : {}),
+      },
     };
     if (secret) merged.ssoSharedSecret = secret;
     persist(merged);

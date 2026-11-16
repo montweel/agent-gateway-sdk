@@ -2,20 +2,20 @@ import { useState } from 'react'
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
 
 /** Keys that deserve a second look before approving (substring, case-insensitive). Mirrors the server list. */
-export const HIGH_RISK_FIELDS = ['amount', 'price', 'delete', 'email', 'destination']
+const HIGH_RISK_FIELDS = ['amount', 'price', 'delete', 'email', 'destination']
 
-export function isHighRiskKey(key: string): boolean {
+function isHighRiskKey(key: string): boolean {
   const k = key.toLowerCase()
   return HIGH_RISK_FIELDS.some((r) => k.includes(r))
 }
 
-export interface RiskHit {
+interface RiskHit {
   path: string
   value: unknown
 }
 
 /** Every primitive value under a high-risk key, as dot paths. */
-export function findHighRisk(value: unknown, prefix = 'body', depth = 0, out: RiskHit[] = []): RiskHit[] {
+function findHighRisk(value: unknown, prefix = 'body', depth = 0, out: RiskHit[] = []): RiskHit[] {
   if (depth > 12 || out.length >= 50) return out
   if (Array.isArray(value)) {
     value.forEach((v, i) => findHighRisk(v, `${prefix}.${i}`, depth + 1, out))
@@ -29,7 +29,7 @@ export function findHighRisk(value: unknown, prefix = 'body', depth = 0, out: Ri
   return out
 }
 
-export function parseJsonSafe(text: string | null | undefined): { ok: true; value: unknown } | { ok: false; raw: string } | null {
+function parseJsonSafe(text: string | null | undefined): { ok: true; value: unknown } | { ok: false; raw: string } | null {
   if (text === null || text === undefined || text === '') return null
   try {
     return { ok: true, value: JSON.parse(text) as unknown }
@@ -40,7 +40,8 @@ export function parseJsonSafe(text: string | null | undefined): { ok: true; valu
 
 function Primitive({ value }: { value: unknown }) {
   if (value === null) return <span className="text-slate-400">null</span>
-  if (typeof value === 'string') return <span className="break-all text-emerald-300">"{value}"</span>
+  // Long values (justifications, tokens, URLs) wrap inside the box instead of widening the page.
+  if (typeof value === 'string') return <span className="whitespace-pre-wrap text-emerald-300 [overflow-wrap:anywhere]">"{value}"</span>
   if (typeof value === 'number') return <span className="text-amber-300">{String(value)}</span>
   if (typeof value === 'boolean') return <span className="text-violet-300">{String(value)}</span>
   return <span className="text-slate-300">{String(value)}</span>
@@ -135,12 +136,15 @@ function Node({
   )
 }
 
+/** The dark box: never wider than its parent, scrolls (both ways) inside itself, text wraps anywhere. */
+const BOX = 'min-w-0 max-w-full overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-xs leading-relaxed text-slate-100 [overflow-wrap:anywhere]'
+
 /** Collapsible, syntax-highlighted JSON tree. High-risk keys are flagged in red. */
 export function JsonInspector({
   text,
   emptyLabel = 'No body',
   defaultExpandDepth = 3,
-  maxHeight = 'max-h-80',
+  maxHeight = 'max-h-[300px]',
 }: {
   text: string | null | undefined
   emptyLabel?: string
@@ -153,13 +157,11 @@ export function JsonInspector({
   }
   if (!parsed.ok) {
     return (
-      <pre className={`${maxHeight} overflow-auto whitespace-pre-wrap break-all rounded-lg bg-slate-900 p-3 font-mono text-xs leading-relaxed text-slate-100`}>
-        {parsed.raw}
-      </pre>
+      <pre className={`${maxHeight} ${BOX} whitespace-pre-wrap`}>{parsed.raw}</pre>
     )
   }
   return (
-    <div className={`${maxHeight} overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-xs leading-relaxed text-slate-100`}>
+    <div className={`${maxHeight} ${BOX}`}>
       <div className="-ml-4">
         <Node name={null} value={parsed.value} depth={0} defaultExpandDepth={defaultExpandDepth} risky={false} isLast />
       </div>

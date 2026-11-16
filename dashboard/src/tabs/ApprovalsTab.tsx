@@ -9,16 +9,8 @@ import { formatTime, INPUT_CLASS, prettyJson, READ_ONLY_HINT } from '../lib/util
 import { HighRiskSummary, JsonInspector } from '../components/JsonInspector'
 import { RevokeModal } from '../components/RevokeModal'
 import type { RevokeTarget } from '../components/RevokeModal'
-import {
-  APPROVAL_TONES,
-  Badge,
-  ErrorBanner,
-  MethodBadge,
-  PageHeader,
-  RefreshButton,
-  Spinner,
-  SuccessBanner,
-} from '../components/ui'
+import { Badge, ErrorBanner, MethodBadge, PageHeader, RefreshButton, Spinner, SuccessBanner } from '../components/ui'
+import { APPROVAL_TONES } from '../lib/tones'
 
 const DECIDED_VERB: Record<string, string> = {
   APPROVED: 'Approved',

@@ -12,21 +12,33 @@ export interface LicenseApi {
   setLicense: (status: LicenseStatus) => void
 }
 
+/** GET /license, or null when it cannot be read. Never throws. */
+async function fetchLicense(): Promise<LicenseStatus | null> {
+  try {
+    return (await api.get<LicenseStatus>('/license')).data
+  } catch {
+    return null
+  }
+}
+
 export function useLicense(): LicenseApi {
   const [license, setLicense] = useState<LicenseStatus | null>(null)
 
   const refresh = useCallback(async () => {
-    try {
-      const res = await api.get<LicenseStatus>('/license')
-      setLicense(res.data)
-    } catch {
-      // Keep the last known status; the rest of the dashboard works without it.
-    }
+    const status = await fetchLicense()
+    // Keep the last known status on failure; the rest of the dashboard works without it.
+    if (status) setLicense(status)
   }, [])
 
   useEffect(() => {
-    void refresh()
-  }, [refresh])
+    let live = true
+    void fetchLicense().then((status) => {
+      if (live && status) setLicense(status)
+    })
+    return () => {
+      live = false
+    }
+  }, [])
 
   // PRO and AGENCY (and the Pro trial) unlock the paid features.
   return { license, isPro: license !== null && license.tier !== 'COMMUNITY', refresh, setLicense }

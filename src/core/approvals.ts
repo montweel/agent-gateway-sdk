@@ -58,6 +58,22 @@ export interface ApprovalService {
   revoke(id: number, options: RevokeOptions, actorName: string): Promise<ServiceResult>;
 }
 
+/**
+ * Who decided, as recorded in agent_logs.approved_by and shown to auditors. `actor` is the raw
+ * decider id used everywhere else (decided_by, API responses): the dashboard account, "sso:<user>",
+ * "telegram:@user", "slack:<user>", "mobile-link" (signed link) or "auto:caller-blocked-by:<actor>".
+ */
+export function approverLabel(actor: string): string {
+  if (actor === "api-token-admin" || actor === "admin") return "Admin (Dashboard)";
+  if (actor === "mobile-link") return "Admin (Signed link)";
+  if (actor.startsWith("sso:")) return `${actor.slice(4)} (SSO)`;
+  if (actor.startsWith("telegram:")) return `Admin (Telegram ${actor.slice(9)})`;
+  if (actor.startsWith("slack:")) return `Admin (Slack ${actor.slice(6)})`;
+  const AUTO = "auto:caller-blocked-by:";
+  if (actor.startsWith(AUTO)) return `Auto-rejected (caller blocked by ${approverLabel(actor.slice(AUTO.length))})`;
+  return `${actor} (Dashboard)`; // a named dashboard account
+}
+
 const err = (status: number, error: string, message: string, extra: Record<string, unknown> = {}): ServiceResult => ({
   status,
   body: { error, message, ...extra },
@@ -170,8 +186,9 @@ export function createApprovalService(ctx: GatewayContext): ApprovalService {
         payloads.modified,
         row.end_user ?? null,
         row.end_user ? (row.end_user_verified === 1 ? 1 : 0) : null,
-        // actorName is the verified dashboard identity (SSO only after the shared-secret check), never a raw header.
-        status === "APPROVED" ? actorName : null,
+        // Who decided (approved OR rejected). actorName is the verified identity (SSO only after the
+        // shared-secret check, chat users only from the configured chat), never a raw header.
+        status === "APPROVED" || status === "REJECTED" ? approverLabel(actorName) : null,
         payloads.response ?? null,
       ]
     );

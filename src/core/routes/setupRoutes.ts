@@ -8,6 +8,7 @@ import { HHMM, isValidTimeZone } from "../settingsStore";
 import { isWithinBusinessHours } from "../operatingMode";
 import { validateResponseGuard } from "../responseGuard";
 import { requireWorkspace } from "./scope";
+import { SECRET_MASK, isMasked, maskSecret, maskUrl } from "../secretMask";
 
 /**
  * No-Code Setup wizard API.
@@ -25,30 +26,43 @@ import { requireWorkspace } from "./scope";
 const SLACK_PREFIX = "https://hooks.slack.com/";
 const TELEGRAM_TOKEN = /^\d{5,15}:[A-Za-z0-9_-]{30,64}$/;
 const TELEGRAM_CHAT = /^(?:-?\d{1,20}|@[A-Za-z0-9_]{5,64})$/;
-const MASK = "••••••••";
 
-function mask(value: string): string {
-  if (!value) return "";
-  return value.length <= 8 ? MASK : `${MASK}${value.slice(-4)}`;
-}
-
+/**
+ * What the browser may see. Credentials are masked for EVERY role (the Slack incoming-webhook URL
+ * is one: its path is the secret). Viewers also get the custom / rollback webhook URLs reduced to
+ * their origin, since those can carry tokens in the query string.
+ */
 function viewForRole(s: GatewaySettings, isAdmin: boolean): GatewaySettings {
-  if (isAdmin) return s;
   return {
     ...s,
     notifications: {
       slack: {
         ...s.notifications.slack,
-        webhookUrl: mask(s.notifications.slack.webhookUrl),
-        botToken: mask(s.notifications.slack.botToken),
-        appToken: mask(s.notifications.slack.appToken),
+        webhookUrl: maskSecret(s.notifications.slack.webhookUrl),
+        botToken: maskSecret(s.notifications.slack.botToken),
+        appToken: maskSecret(s.notifications.slack.appToken),
       },
-      telegram: { ...s.notifications.telegram, botToken: mask(s.notifications.telegram.botToken) },
-      webhook: { ...s.notifications.webhook, secret: mask(s.notifications.webhook.secret) },
+      telegram: { ...s.notifications.telegram, botToken: maskSecret(s.notifications.telegram.botToken) },
+      webhook: {
+        ...s.notifications.webhook,
+        url: isAdmin ? s.notifications.webhook.url : maskUrl(s.notifications.webhook.url),
+        secret: maskSecret(s.notifications.webhook.secret),
+      },
     },
-    rollback: { ...s.rollback, secret: mask(s.rollback.secret) },
+    rollback: { url: isAdmin ? s.rollback.url : maskUrl(s.rollback.url), secret: maskSecret(s.rollback.secret) },
   };
 }
+
+/** Fields GET /secrets/:field may reveal to an administrator. */
+const REVEALABLE: Record<string, (ctx: GatewayContext) => string> = {
+  "telegram.botToken": (ctx) => ctx.settings.get().notifications.telegram.botToken,
+  "slack.webhookUrl": (ctx) => ctx.settings.get().notifications.slack.webhookUrl,
+  "slack.botToken": (ctx) => ctx.settings.get().notifications.slack.botToken,
+  "slack.appToken": (ctx) => ctx.settings.get().notifications.slack.appToken,
+  "webhook.secret": (ctx) => ctx.settings.get().notifications.webhook.secret,
+  "rollback.secret": (ctx) => ctx.settings.get().rollback.secret,
+  "sso.sharedSecret": (ctx) => ctx.config.load().ssoSharedSecret,
+};
 
 type Check<T> = { ok: true; value: T } | { ok: false; message: string };
 
@@ -99,6 +113,24 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
       withinBusinessHours: isWithinBusinessHours(settings.peek().schedule, settings.peek().timezone),
     };
   }
+
+  /**
+   * The real value of one stored credential, for the dashboard's Show / Copy buttons. Admin only;
+   * responses are never cached (the admin router sets Cache-Control: no-store).
+   */
+  router.get("/secrets/:field", (req: AuthenticatedRequest, res: Response) => {
+    if (req.user?.role !== "admin") {
+      sendError(res, 403, "Forbidden", "Only administrators can reveal stored credentials.");
+      return;
+    }
+    const field = String(req.params.field);
+    const read = Object.prototype.hasOwnProperty.call(REVEALABLE, field) ? REVEALABLE[field] : undefined;
+    if (!read) {
+      sendError(res, 404, "Not Found", `Unknown credential "${field}". Use one of: ${Object.keys(REVEALABLE).join(", ")}.`);
+      return;
+    }
+    res.json({ field, value: read(ctx) });
+  });
 
   // ---- Starter policy packs ----
   router.get("/setup/presets", (_req: AuthenticatedRequest, res: Response) => {
@@ -219,7 +251,8 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
           if (typeof n.slack.enabled !== "boolean") return fail("notifications.slack.enabled must be true or false.");
           next.notifications.slack.enabled = n.slack.enabled;
         }
-        if (n.slack.webhookUrl !== undefined) {
+        // A masked value sent back unchanged (the dashboard re-posts the form) keeps the stored credential.
+        if (n.slack.webhookUrl !== undefined && !isMasked(n.slack.webhookUrl)) {
           const url = typeof n.slack.webhookUrl === "string" ? n.slack.webhookUrl.trim() : null;
           if (url === null || (url !== "" && !url.startsWith(SLACK_PREFIX)) || url.length > 500) {
             return fail(`The Slack webhook URL must start with ${SLACK_PREFIX}`);
@@ -230,12 +263,12 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
           if (n.slack.mode !== "webhook" && n.slack.mode !== "socket") return fail('notifications.slack.mode must be "webhook" or "socket".');
           next.notifications.slack.mode = n.slack.mode;
         }
-        if (n.slack.botToken !== undefined) {
+        if (n.slack.botToken !== undefined && !isMasked(n.slack.botToken)) {
           const t = typeof n.slack.botToken === "string" ? n.slack.botToken.trim() : null;
           if (t === null || (t !== "" && !SLACK_BOT_TOKEN.test(t))) return fail("The Slack bot token must start with xoxb-.");
           next.notifications.slack.botToken = t;
         }
-        if (n.slack.appToken !== undefined) {
+        if (n.slack.appToken !== undefined && !isMasked(n.slack.appToken)) {
           const t = typeof n.slack.appToken === "string" ? n.slack.appToken.trim() : null;
           if (t === null || (t !== "" && !SLACK_APP_TOKEN.test(t))) return fail("The Slack app-level token must start with xapp-.");
           next.notifications.slack.appToken = t;
@@ -256,7 +289,7 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
           if (typeof n.telegram.enabled !== "boolean") return fail("notifications.telegram.enabled must be true or false.");
           next.notifications.telegram.enabled = n.telegram.enabled;
         }
-        if (n.telegram.botToken !== undefined) {
+        if (n.telegram.botToken !== undefined && !isMasked(n.telegram.botToken)) {
           const t = typeof n.telegram.botToken === "string" ? n.telegram.botToken.trim() : null;
           if (t === null || (t !== "" && !TELEGRAM_TOKEN.test(t))) return fail("The Telegram bot token looks wrong (expected 123456789:ABC...).");
           next.notifications.telegram.botToken = t;
@@ -281,13 +314,13 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
           if (typeof n.webhook.enabled !== "boolean") return fail("notifications.webhook.enabled must be true or false.");
           next.notifications.webhook.enabled = n.webhook.enabled;
         }
-        if (n.webhook.url !== undefined) {
+        if (n.webhook.url !== undefined && !isMasked(n.webhook.url) && !String(n.webhook.url).endsWith(`/${SECRET_MASK}`)) {
           if (typeof n.webhook.url !== "string") return fail("notifications.webhook.url must be a string.");
           const parsed = parseTargetUrl(n.webhook.url, port);
           if (!parsed.ok) return fail(`Webhook URL: ${parsed.message.replace(/^targetUrl/, "The URL")}`);
           next.notifications.webhook.url = parsed.url;
         }
-        if (n.webhook.secret !== undefined) {
+        if (n.webhook.secret !== undefined && !isMasked(n.webhook.secret)) {
           const s = checkSecret(n.webhook.secret, "notifications.webhook.secret");
           if (!s.ok) return fail(s.message);
           next.notifications.webhook.secret = s.value;
@@ -297,13 +330,13 @@ export function registerSetupRoutes(router: Router, ctx: GatewayContext): void {
 
     if (input.rollback !== undefined) {
       if (typeof input.rollback !== "object" || input.rollback === null) return fail("rollback must be an object.");
-      if (input.rollback.url !== undefined) {
+      if (input.rollback.url !== undefined && !isMasked(input.rollback.url) && !String(input.rollback.url).endsWith(`/${SECRET_MASK}`)) {
         if (typeof input.rollback.url !== "string") return fail("rollback.url must be a string.");
         const parsed = parseTargetUrl(input.rollback.url, port);
         if (!parsed.ok) return fail(`Rollback URL: ${parsed.message.replace(/^targetUrl/, "The URL")}`);
         next.rollback.url = parsed.url;
       }
-      if (input.rollback.secret !== undefined) {
+      if (input.rollback.secret !== undefined && !isMasked(input.rollback.secret)) {
         const s = checkSecret(input.rollback.secret, "rollback.secret");
         if (!s.ok) return fail(s.message);
         next.rollback.secret = s.value;

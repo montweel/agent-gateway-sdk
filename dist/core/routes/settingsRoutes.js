@@ -6,6 +6,7 @@ const utils_1 = require("../utils");
 const policy_1 = require("../policy");
 const scope_1 = require("./scope");
 const config_1 = require("../config");
+const secretMask_1 = require("../secretMask");
 /** Adds rateLimit to a rule only when it is a real limit, so rules.json stays clean. */
 function withRateLimit(rule, rateLimit) {
     return typeof rateLimit === "number" ? { ...rule, rateLimit } : rule;
@@ -43,9 +44,9 @@ function registerSettingsRoutes(router, ctx) {
         const role = req.user?.role ?? "admin";
         res.json({
             ...config,
-            // The shared secret lets anyone impersonate any user through the SSO headers,
-            // so only administrators ever receive it.
-            ...(role === "admin" ? { ssoSharedSecret } : {}),
+            // The shared secret lets anyone impersonate any user through the SSO headers: viewers never
+            // see it, and administrators get it masked (Show / Copy fetch it from GET /secrets/sso.sharedSecret).
+            ...(role === "admin" ? { ssoSharedSecret: (0, secretMask_1.maskSecret)(ssoSharedSecret) } : {}),
             ssoSharedSecretConfigured: ssoSharedSecret !== "",
             ssoProxySecretConfigured: ssoSharedSecret !== "", // older dashboards read this name
             authEnabled: true,
@@ -151,7 +152,8 @@ function registerSettingsRoutes(router, ctx) {
             if (updated.requireAgentApiKey) {
                 warnings.push("Agent keys are now required. Make sure your agents have one before they next call the gateway.");
             }
-            res.json({ success: true, config: configStore.load(), warnings });
+            const saved = configStore.load();
+            res.json({ success: true, config: { ...saved, ssoSharedSecret: (0, secretMask_1.maskSecret)(saved.ssoSharedSecret) }, warnings });
         }
         catch (err) {
             (0, utils_1.sendInternalError)(res, "Failed to save config", err, "Could not write config.json.");

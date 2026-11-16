@@ -205,6 +205,10 @@ export interface AuditConfig {
    * against the whole key ("credit_card" matches "creditCard", "key" does not match "monkey").
    */
   redactKeys: string[];
+  /** Industry compliance template last applied (complianceTemplates.ts). */
+  activeTemplate?: "fintech" | "retail" | "travel" | "custom";
+  /** Frameworks this install reports against, e.g. ["SOC2", "PCI-DSS"]. Shown in the auditor pack. */
+  complianceFrameworks?: string[];
 }
 
 export interface AuthUser {

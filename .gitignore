@@ -28,6 +28,9 @@ Thumbs.db
 # --- Packed tarballs ---
 *.tgz
 
+# --- Outreach lead lists (scripts/find-*leads.ts output; never commit) ---
+leads*.csv
+
 # --- Internal / stale files (not part of the release) ---
 claude/
 **/*_old*

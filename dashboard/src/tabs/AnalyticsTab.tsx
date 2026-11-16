@@ -153,7 +153,6 @@ export function AnalyticsTab({
 }) {
   const [windowParam, setWindowParam] = useState<WindowId>('24h')
   const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null)
-  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [hiddenStatuses, setHiddenStatuses] = useState<Set<LogStatus>>(new Set())
   const requestId = useRef(0)
@@ -182,25 +181,30 @@ export function AnalyticsTab({
     })
   }
 
-  const loadAnalytics = useCallback(async () => {
-    const thisRequest = ++requestId.current
-    setLoading(true)
-    try {
-      const res = await api.get<AnalyticsResponse>('/logs/analytics', { params: { window: windowParam } })
-      if (thisRequest !== requestId.current) return
-      setAnalytics(res.data)
-      setError(null)
-    } catch (err) {
-      if (thisRequest !== requestId.current) return
-      setError(errorMessage(err))
-    } finally {
-      if (thisRequest === requestId.current) setLoading(false)
-    }
-  }, [windowParam])
+  // The Refresh button bumps this, which re-runs the fetch effect for the same window.
+  const [reloadToken, setReloadToken] = useState(0)
+  const requestKey = `${windowParam}#${reloadToken}`
+  // "Loading" = what is on screen is not the answer to the current request yet. Derived, so the
+  // effect below only sets state once the request has settled.
+  const [loadedKey, setLoadedKey] = useState<string | null>(null)
+  const loading = loadedKey !== requestKey
 
   useEffect(() => {
-    void loadAnalytics()
-  }, [loadAnalytics])
+    const thisRequest = ++requestId.current
+    api.get<AnalyticsResponse>('/logs/analytics', { params: { window: windowParam } }).then(
+      (res) => {
+        if (thisRequest !== requestId.current) return
+        setAnalytics(res.data)
+        setError(null)
+        setLoadedKey(requestKey)
+      },
+      (err: unknown) => {
+        if (thisRequest !== requestId.current) return
+        setError(errorMessage(err))
+        setLoadedKey(requestKey)
+      }
+    )
+  }, [windowParam, requestKey])
 
   const summary = useMemo(() => {
     const counts: Record<LogStatus, number> = {
@@ -228,7 +232,8 @@ export function AnalyticsTab({
     return { ...counts, total }
   }, [analytics])
 
-  const hourly = analytics?.hourly ?? []
+  // Memoised so the chart memo below does not recompute on every render.
+  const hourly = useMemo(() => analytics?.hourly ?? [], [analytics])
   const topEndpoints = analytics?.topEndpoints ?? []
   const topAgents = analytics?.topAgents ?? []
 
@@ -304,7 +309,7 @@ export function AnalyticsTab({
                 )
               })}
             </div>
-            <RefreshButton onClick={() => void loadAnalytics()} loading={loading} />
+            <RefreshButton onClick={() => setReloadToken((t) => t + 1)} loading={loading} />
           </div>
         }
       />

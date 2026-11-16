@@ -1,43 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Building2, Check, ChevronDown, LayoutGrid, Lock } from 'lucide-react'
-import { api, getWorkspace, setWorkspace, WORKSPACE_CHANGED_EVENT } from '../lib/api'
-import type { Workspace, WorkspacesResponse } from '../lib/types'
+import { setWorkspace } from '../lib/api'
+import type { Workspace } from '../lib/types'
+import type { WorkspacesApi } from '../hooks/useWorkspaces'
 
 const MODE_DOT: Record<string, string> = { normal: 'bg-emerald-500', approval_only: 'bg-amber-500', lockdown: 'bg-red-500' }
-
-/** Keeps the list of workspaces fresh and the current selection valid. */
-export function useWorkspaces() {
-  const [data, setData] = useState<WorkspacesResponse | null>(null)
-  const [selected, setSelected] = useState<string>(getWorkspace())
-
-  const reload = useCallback(async () => {
-    try {
-      // The list is installation-wide: never scoped to the selected workspace.
-      const res = await api.get<WorkspacesResponse>('/workspaces', { headers: { 'x-mont-workspace': 'all' } })
-      setData(res.data)
-      const current = getWorkspace()
-      if (current !== 'all' && !res.data.workspaces.some((w) => w.slug === current)) setWorkspace('default')
-    } catch {
-      // keep the last list
-    }
-  }, [])
-
-  useEffect(() => {
-    void reload()
-    const onChange = () => setSelected(getWorkspace())
-    window.addEventListener(WORKSPACE_CHANGED_EVENT, onChange)
-    const id = window.setInterval(() => {
-      if (!document.hidden) void reload()
-    }, 15000)
-    return () => {
-      window.removeEventListener(WORKSPACE_CHANGED_EVENT, onChange)
-      window.clearInterval(id)
-    }
-  }, [reload])
-
-  return { data, selected, reload }
-}
-export type WorkspacesApi = ReturnType<typeof useWorkspaces>
 
 /**
  * Top-bar dropdown: switch between client workspaces, or open the "All Clients Overview".

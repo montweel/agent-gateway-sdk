@@ -10,6 +10,15 @@ import { ProLockLink } from './LicenseCard'
 
 const COMMUNITY_KEY_LIMIT = 2
 
+/** GET /agent-keys. Never throws. */
+async function fetchKeys(): Promise<{ keys: AgentKey[] } | { error: string }> {
+  try {
+    return { keys: (await api.get<AgentKey[]>('/agent-keys')).data }
+  } catch (err) {
+    return { error: errorMessage(err) }
+  }
+}
+
 /** Agent API keys (admin only). A new key is shown once; the server keeps only its hash. */
 export function AgentKeysPanel({
   required,
@@ -30,22 +39,30 @@ export function AgentKeysPanel({
   const [copied, setCopied] = useState(false)
   const [deleting, setDeleting] = useState<number | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await api.get<AgentKey[]>('/agent-keys')
-      setKeys(res.data)
+  const show = useCallback((r: Awaited<ReturnType<typeof fetchKeys>>) => {
+    if ('keys' in r) {
+      setKeys(r.keys)
       setError(null)
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setLoading(false)
-    }
+    } else setError(r.error)
+    setLoading(false)
   }, [])
 
+  /** Refresh button / after creating or deleting a key. */
+  const load = useCallback(async () => {
+    setLoading(true)
+    show(await fetchKeys())
+  }, [show])
+
+  // First load: "loading" already starts true, so only the answer is set.
   useEffect(() => {
-    void load()
-  }, [load])
+    let live = true
+    void fetchKeys().then((r) => {
+      if (live) show(r)
+    })
+    return () => {
+      live = false
+    }
+  }, [show])
 
   useEffect(() => {
     if (!copied) return

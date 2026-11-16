@@ -1,13 +1,15 @@
 import type { ReactNode } from 'react'
 import { AlertCircle, Check, Loader2, RefreshCw } from 'lucide-react'
-import type { ApprovalStatus, LogStatus, Mode } from '../lib/types'
+import type { Mode } from '../lib/types'
+import type { Tone } from '../lib/tones'
 import { MODE_META, MODE_ORDER, READ_ONLY_HINT } from '../lib/utils'
 
 export function Spinner({ className = 'h-4 w-4' }: { className?: string }) {
   return <Loader2 className={`animate-spin ${className}`} aria-hidden="true" />
 }
 
-export type Tone = 'green' | 'red' | 'amber' | 'violet' | 'slate'
+// Tone and the status -> tone maps live in lib/tones.ts (a component file may only export components).
+export type { Tone }
 
 const TONES: Record<Tone, { badge: string; dot: string }> = {
   green: { badge: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20', dot: 'bg-emerald-500' },
@@ -15,26 +17,6 @@ const TONES: Record<Tone, { badge: string; dot: string }> = {
   amber: { badge: 'bg-amber-50 text-amber-800 ring-amber-600/20', dot: 'bg-amber-500' },
   violet: { badge: 'bg-violet-50 text-violet-700 ring-violet-600/20', dot: 'bg-violet-500' },
   slate: { badge: 'bg-slate-50 text-slate-700 ring-slate-600/20', dot: 'bg-slate-400' },
-}
-
-export const LOG_TONES: Record<LogStatus, Tone> = {
-  ALLOWED: 'green',
-  BLOCKED: 'red',
-  QUEUED: 'amber',
-  RATE_LIMITED: 'violet',
-  APPROVED: 'green',
-  REJECTED: 'red',
-  RESPONSE_BLOCKED: 'red',
-  RESPONSE_SCRUBBED: 'amber',
-}
-
-export const APPROVAL_TONES: Record<ApprovalStatus, Tone> = {
-  PENDING: 'amber',
-  EXECUTING: 'violet',
-  APPROVED: 'green',
-  REJECTED: 'red',
-  FAILED: 'red',
-  EXPIRED: 'slate',
 }
 
 export function Badge({ tone, children }: { tone: Tone; children: ReactNode }) {

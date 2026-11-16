@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Copy, Link2, Lock, UserCheck, UserRound } from 'lucide-react'
+import { AlertTriangle, BadgeCheck, Link2, Lock, UserCheck, UserRound } from 'lucide-react'
 import { api, errorMessage } from '../lib/api'
 import type { LogDetail } from '../lib/types'
 import { JsonInspector } from './JsonInspector'
@@ -20,38 +20,46 @@ function Field({ icon, label, children, title }: { icon: ReactNode; label: strin
         {icon}
         {label}
       </dt>
-      <dd className="truncate text-sm text-slate-800">{children}</dd>
+      <dd className="break-words text-sm text-slate-800">{children}</dd>
     </div>
   )
 }
 
-function HashLine({ label, value }: { label: string; value: string | null }) {
-  const [copied, setCopied] = useState(false)
-  if (!value) return null
+function Pill({ tone, title, children }: { tone: 'emerald' | 'amber'; title: string; children: ReactNode }) {
+  const cls = tone === 'emerald' ? 'bg-emerald-50 text-emerald-800 ring-emerald-200' : 'bg-amber-50 text-amber-800 ring-amber-200'
   return (
-    <div className="flex min-w-0 items-center gap-2 text-xs">
-      <span className="w-20 shrink-0 font-medium text-slate-500">{label}</span>
-      <code className="min-w-0 flex-1 break-all font-mono text-slate-700">{value}</code>
-      <button
-        type="button"
-        onClick={() => {
-          void navigator.clipboard?.writeText(value).then(() => {
-            setCopied(true)
-            setTimeout(() => setCopied(false), 1200)
-          })
-        }}
-        aria-label={`Copy ${label}`}
-        className="shrink-0 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-      >
-        {copied ? <span className="text-[10px] font-semibold text-emerald-600">Copied</span> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}
-      </button>
-    </div>
+    <span title={title} className={`inline-flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ring-1 ring-inset ${cls}`}>
+      {tone === 'emerald' ? <BadgeCheck className="h-3 w-3" aria-hidden="true" /> : <AlertTriangle className="h-3 w-3" aria-hidden="true" />}
+      {children}
+    </span>
   )
+}
+
+/** The approval column: who approved / rejected this row, or what happened to the held request. */
+function approvalField(d: LogDetail): { label: string; value: ReactNode } {
+  // Rows decided before attribution existed carry the decider only in user_agent ("decided_by:<actor>").
+  const decider = d.approved_by ?? ((d.user_agent ?? '').startsWith('decided_by:') ? (d.user_agent ?? '').slice('decided_by:'.length) : null)
+  if (d.status === 'APPROVED') return { label: 'Approved by', value: decider ?? 'Not recorded' }
+  if (d.status === 'REJECTED') return { label: 'Rejected by', value: decider ?? 'Not recorded' }
+  const a = d.approval
+  if (!a) return { label: 'Approval status', value: <span className="text-slate-500">Not required</span> }
+  const revoked = a.revokedBy ? ` · revoked by ${a.revokedBy}` : ''
+  const value: Record<string, ReactNode> = {
+    PENDING: <span className="font-medium text-amber-700">Pending</span>,
+    EXECUTING: <span className="font-medium text-amber-700">Approved{a.by ? ` by ${a.by}` : ''}, executing</span>,
+    APPROVED: <span className="font-medium text-emerald-700">Approved by {a.by ?? 'an admin'}{revoked}</span>,
+    REJECTED: <span className="font-medium text-red-700">Rejected by {a.by ?? 'an admin'}</span>,
+    FAILED: <span className="font-medium text-red-700">Approved by {a.by ?? 'an admin'}, then failed{revoked}</span>,
+    EXPIRED: <span className="text-slate-600">Expired: nobody decided in time</span>,
+    UNKNOWN: <span className="text-slate-600">Decided (no longer in the approval queue)</span>,
+  }
+  return { label: 'Approval status', value: value[a.status] ?? a.status }
 }
 
 /**
- * Expanded audit row: attribution, the redacted request / response payloads and the row's link in
- * the SHA-256 hash chain. Loaded on demand from GET /logs/:id (the list stays lean).
+ * Expanded audit row: attribution (agent, end user, approver), seal status and the redacted
+ * request / response payloads. Loaded on demand from GET /logs/:id (the list stays lean). Full
+ * hashes live in the Auditor Evidence Pack; here only the first 8 characters, on hover.
  */
 export function LogDetailPanel({ id }: { id: number }) {
   const [detail, setDetail] = useState<LogDetail | null>(null)
@@ -79,33 +87,53 @@ export function LogDetailPanel({ id }: { id: number }) {
 
   const req = detail.request
   const resp = typeof detail.response === 'string' ? { status: 0, contentType: null, bytes: 0, body: detail.response } : detail.response
-  const isDecision = (detail.user_agent ?? '').startsWith('decided_by:')
   const hasQuery = typeof req?.query === 'object' && req.query !== null && Object.keys(req.query).length > 0
+  const approval = approvalField(detail)
 
   return (
-    <div className="space-y-4">
-      <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+    // min-w-0 on every grid cell: a long value or a JSON box can never stretch its column (and the
+    // row, and the page) wider than the table cell this panel lives in.
+    <div className="min-w-0 max-w-full space-y-4">
+      <dl className="grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Field icon={<UserRound className="h-3 w-3" aria-hidden="true" />} label="End user">
           {detail.end_user ? (
-            <span className="flex min-w-0 items-center gap-1.5">
-              <span className="truncate" title={detail.end_user}>
-                {detail.end_user}
-              </span>
+            <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <span className="min-w-0 break-all">{detail.end_user}</span>
               <EndUserBadge verified={Boolean(detail.end_user_verified)} />
             </span>
           ) : (
-            <span className="text-slate-400">not provided</span>
+            <span className="text-slate-500">Not provided</span>
           )}
         </Field>
         <Field icon={<Link2 className="h-3 w-3" aria-hidden="true" />} label="Agent">
-          {detail.agent_key ?? (isDecision ? <span className="text-slate-400">—</span> : (detail.caller_ip ?? <span className="text-slate-400">unknown</span>))}
+          {/* agent_key is only ever recorded from a key the gateway verified (agk_ agent key or mws_ workspace key). */}
+          {detail.agent_key ? (
+            <span className="flex flex-wrap items-center gap-1.5">
+              <span className="break-all">{detail.agent_key}</span>
+              <Pill tone="emerald" title="Authenticated with a registered agent (or workspace) API key">
+                Verified Key
+              </Pill>
+            </span>
+          ) : (
+            <span className="flex flex-wrap items-center gap-1.5" title={detail.caller_ip ? `Caller IP ${detail.caller_ip}` : undefined}>
+              <span>Anonymous</span>
+              <Pill tone="amber" title="No agent API key was sent: the caller is identified only by its IP address">
+                Unverified (No Key)
+              </Pill>
+            </span>
+          )}
         </Field>
-        <Field icon={<UserCheck className="h-3 w-3" aria-hidden="true" />} label="Approved by" title="The signed-in admin (or verified SSO identity) who released this held action">
-          {detail.approved_by ?? <span className="text-slate-400">{detail.action_id ? 'see the APPROVED row for this request ID' : 'not held for approval'}</span>}
+        <Field icon={<UserCheck className="h-3 w-3" aria-hidden="true" />} label={approval.label}>
+          {approval.value}
         </Field>
         <Field icon={<Lock className="h-3 w-3" aria-hidden="true" />} label="Ledger">
           {detail.sealed ? (
-            <span className="font-medium text-emerald-700">Sealed</span>
+            <span
+              className="cursor-help font-medium text-emerald-700 underline decoration-dotted underline-offset-2"
+              title={detail.row_hash ? `Row hash ${detail.row_hash.slice(0, 8)}… (full hashes are in the Auditor Evidence Pack)` : undefined}
+            >
+              Sealed
+            </span>
           ) : detail.response_pending ? (
             <span className="text-amber-700">Waiting for the response…</span>
           ) : (
@@ -114,8 +142,8 @@ export function LogDetailPanel({ id }: { id: number }) {
         </Field>
       </dl>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <section>
+      <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+        <section className="min-w-0">
           <h4 className="mb-1.5 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-slate-500">
             Request payload (redacted)
             {req?.truncated && <span className="normal-case tracking-normal text-amber-700">body too large to keep</span>}
@@ -132,8 +160,8 @@ export function LogDetailPanel({ id }: { id: number }) {
             </div>
           )}
         </section>
-        <section>
-          <h4 className="mb-1.5 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-slate-500">
+        <section className="min-w-0">
+          <h4 className="mb-1.5 flex flex-wrap items-center justify-between gap-x-2 text-xs font-semibold uppercase tracking-wider text-slate-500">
             Response payload (redacted)
             {resp && resp.status > 0 && (
               <span className="normal-case tracking-normal text-slate-600">
@@ -162,29 +190,17 @@ export function LogDetailPanel({ id }: { id: number }) {
       </div>
 
       {(detail.original_payload || detail.modified_payload) && (
-        <section className="grid gap-4 lg:grid-cols-2">
-          <div>
+        <section className="grid min-w-0 gap-4 lg:grid-cols-2">
+          <div className="min-w-0">
             <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-slate-500">As queued</h4>
             <JsonInspector text={detail.original_payload} defaultExpandDepth={2} maxHeight="max-h-48" />
           </div>
-          <div>
+          <div className="min-w-0">
             <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-slate-500">As edited by the approver</h4>
             <JsonInspector text={detail.modified_payload} defaultExpandDepth={2} maxHeight="max-h-48" />
           </div>
         </section>
       )}
-
-      <section className="rounded-lg border border-slate-200 bg-white px-3 py-2">
-        <h4 className="mb-1 text-xs font-semibold uppercase tracking-wider text-slate-500">Hash chain</h4>
-        {detail.row_hash ? (
-          <div className="space-y-1">
-            <HashLine label="Ledger hash" value={detail.row_hash} />
-            <HashLine label="Previous" value={detail.prev_hash} />
-          </div>
-        ) : (
-          <p className="text-xs text-slate-500">Not sealed yet. Rows are sealed in order, usually within a second (or once their response arrives).</p>
-        )}
-      </section>
     </div>
   )
 }

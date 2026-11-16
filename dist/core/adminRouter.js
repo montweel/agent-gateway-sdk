@@ -19,6 +19,7 @@ const setupRoutes_1 = require("./routes/setupRoutes");
 const protectionRoutes_1 = require("./routes/protectionRoutes");
 const workspaceRoutes_1 = require("./routes/workspaceRoutes");
 const auditRoutes_1 = require("./routes/auditRoutes");
+const complianceRoutes_1 = require("./routes/complianceRoutes");
 /**
  * Admin API. Mount it BEFORE the gateway so it is never intercepted.
  * Order matters: public auth routes, then the auth/RBAC middleware, then everything else.
@@ -54,6 +55,7 @@ function createAdminRouter(ctx) {
     (0, protectionRoutes_1.registerProtectionRoutes)(router, ctx);
     (0, workspaceRoutes_1.registerWorkspaceRoutes)(router, ctx);
     (0, auditRoutes_1.registerAuditRoutes)(router, ctx);
+    (0, complianceRoutes_1.registerComplianceRoutes)(router, ctx);
     router.use((err, _req, res, _next) => {
         (0, utils_1.sendCaughtError)(res, err);
     });

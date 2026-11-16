@@ -7,6 +7,15 @@ import type { AuthUser, ProRequiredResponse, TeamUser, UserRole } from '../lib/t
 import { formatTime, INPUT_CLASS } from '../lib/utils'
 import { Badge, ErrorBanner, ProCallout, PageHeader, RefreshButton, Spinner } from '../components/ui'
  
+/** GET /users. Never throws. */
+async function fetchUsers(): Promise<{ users: TeamUser[] } | { error: string }> {
+  try {
+    return { users: (await api.get<TeamUser[]>('/users')).data }
+  } catch (err) {
+    return { error: errorMessage(err) }
+  }
+}
+
 interface IssuedCreds {
   username: string
   role?: UserRole
@@ -28,22 +37,30 @@ export function TeamTab({ currentUser }: { currentUser: AuthUser }) {
   const [copiedCreds, setCopiedCreds] = useState(false)
   const [busyUserId, setBusyUserId] = useState<number | null>(null)
  
+  const showUsers = useCallback((r: Awaited<ReturnType<typeof fetchUsers>>) => {
+    if ('users' in r) {
+      setUsers(r.users)
+      setError(null)
+    } else setError(r.error)
+    setLoading(false)
+  }, [])
+
+  /** Refresh button / after a change. */
   const loadUsers = useCallback(async () => {
     setLoading(true)
-    try {
-      const res = await api.get<TeamUser[]>('/users')
-      setUsers(res.data)
-      setError(null)
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setLoading(false)
-    }
-  }, [])
- 
+    showUsers(await fetchUsers())
+  }, [showUsers])
+
+  // First load: "loading" already starts true, so only the answer is set.
   useEffect(() => {
-    void loadUsers()
-  }, [loadUsers])
+    let live = true
+    void fetchUsers().then((r) => {
+      if (live) showUsers(r)
+    })
+    return () => {
+      live = false
+    }
+  }, [showUsers])
  
   useEffect(() => {
     if (!copiedCreds) return

@@ -17,7 +17,8 @@ import { TeamTab } from '../tabs/TeamTab'
 import { SettingsTab } from '../tabs/SettingsTab'
 import { SetupTab } from '../tabs/SetupTab'
 import { EmergencyBar } from '../components/EmergencyBar'
-import { useWorkspaces, WorkspaceSwitcher } from '../components/WorkspaceSwitcher'
+import { WorkspaceSwitcher } from '../components/WorkspaceSwitcher'
+import { useWorkspaces } from '../hooks/useWorkspaces'
 import { AllClientsOverview } from './AllClientsOverview'
 
 function ViewerBanner() {
@@ -136,7 +137,10 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
   const showOverview = multiWorkspace && workspace === 'all' && SCOPED_TABS.includes(tab)
 
   return (
-    <div className="flex h-screen bg-slate-100 font-sans text-slate-900">
+    // The shell never scrolls sideways: the main pane may only scroll vertically, and anything wider
+    // (tables, JSON) scrolls inside its own container. min-w-0 stops a wide child from widening the
+    // flex item past the viewport (which pushed the top bar's avatar off-screen).
+    <div className="flex h-screen w-full overflow-hidden bg-slate-100 font-sans text-slate-900">
       <Sidebar
         tab={tab}
         onChange={setTab}
@@ -145,7 +149,7 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
         license={licenseApi.license}
         onOpenLicense={openLicense}
       />
-      <main className="flex-1 overflow-y-auto">
+      <main className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
         <TopBar
           user={user}
           online={approvalsApi.online}
@@ -156,7 +160,7 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
         <EmergencyBar key={`emergency-${workspace}`} readOnly={readOnly} workspace={workspace} multiWorkspace={multiWorkspace} />
         {licenseApi.license?.expired && <LicenseExpiredBanner license={licenseApi.license} onOpen={openLicense} />}
         {readOnly && <ViewerBanner />}
-        <div className="mx-auto max-w-5xl px-10 py-8" key={`content-${workspace}`}>
+        <div className="mx-auto min-w-0 max-w-5xl px-10 py-8" key={`content-${workspace}`}>
           {showOverview ? (
             <AllClientsOverview />
           ) : (
@@ -171,6 +175,8 @@ export function Dashboard({ user, onSignOut }: { user: AuthUser; onSignOut: () =
                   initialFilter={logsFilter}
                   onCreateRule={(method, path) => openPayloadEditor(ruleKey(method, path))}
                   onOpenApproval={openApproval}
+                  isPro={licenseApi.isPro}
+                  onOpenLicense={openLicense}
                 />
               )}
               {tab === 'analytics' && (

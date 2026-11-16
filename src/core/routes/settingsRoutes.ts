@@ -17,6 +17,7 @@ import type { BudgetSpec, DedupeSpec, PolicyTier, Rule } from "../types";
 import { validateBudget, validateDedupe, validatePolicies } from "../policy";
 import { requireWorkspace } from "./scope";
 import { cleanRedactKeys } from "../config";
+import { maskSecret } from "../secretMask";
 
 /** Adds rateLimit to a rule only when it is a real limit, so rules.json stays clean. */
 function withRateLimit(rule: Rule, rateLimit: number | null | undefined): Rule {
@@ -68,9 +69,9 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
     const role = req.user?.role ?? "admin";
     res.json({
       ...config,
-      // The shared secret lets anyone impersonate any user through the SSO headers,
-      // so only administrators ever receive it.
-      ...(role === "admin" ? { ssoSharedSecret } : {}),
+      // The shared secret lets anyone impersonate any user through the SSO headers: viewers never
+      // see it, and administrators get it masked (Show / Copy fetch it from GET /secrets/sso.sharedSecret).
+      ...(role === "admin" ? { ssoSharedSecret: maskSecret(ssoSharedSecret) } : {}),
       ssoSharedSecretConfigured: ssoSharedSecret !== "",
       ssoProxySecretConfigured: ssoSharedSecret !== "", // older dashboards read this name
       authEnabled: true,
@@ -193,7 +194,8 @@ export function registerSettingsRoutes(router: Router, ctx: GatewayContext): voi
       if (updated.requireAgentApiKey) {
         warnings.push("Agent keys are now required. Make sure your agents have one before they next call the gateway.");
       }
-      res.json({ success: true, config: configStore.load(), warnings });
+      const saved = configStore.load();
+      res.json({ success: true, config: { ...saved, ssoSharedSecret: maskSecret(saved.ssoSharedSecret) }, warnings });
     } catch (err) {
       sendInternalError(res, "Failed to save config", err, "Could not write config.json.");
     }

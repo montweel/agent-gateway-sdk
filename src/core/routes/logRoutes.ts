@@ -4,6 +4,7 @@ import type { LogStatus } from "../types";
 import { escapeLike, sendError, sendInternalError } from "../utils";
 import { workspaceFilter } from "../protection";
 import { readScope } from "./scope";
+import { approverLabel } from "../approvals";
 
 // window -> total span and bucket size (both in ms)
 const WINDOWS: Record<string, { spanMs: number; stepMs: number }> = {
@@ -179,6 +180,19 @@ export function registerLogRoutes(router: Router, ctx: GatewayContext): void {
           : null;
       out.response = parse(row.response_payload);
       delete out.response_payload;
+      // The outcome of a held request, so its QUEUED row can say who approved / rejected it
+      // (decision rows carry it in approved_by already).
+      if (typeof row.action_id === "number") {
+        const p = await db.get<{ status: string; decided_by: string | null; revoked_by: string | null }>(
+          "SELECT status, decided_by, revoked_by FROM pending_actions WHERE id = ?",
+          [row.action_id]
+        );
+        out.approval = p
+          ? { status: p.status, by: p.decided_by ? approverLabel(p.decided_by) : null, revokedBy: p.revoked_by ? approverLabel(p.revoked_by) : null }
+          : { status: "UNKNOWN", by: null, revokedBy: null }; // pruned from the approval queue's retention
+      } else {
+        out.approval = null; // never held for approval
+      }
       res.json(out);
     } catch (err) {
       sendInternalError(res, "Log detail error", err, "Could not load the audit row.");

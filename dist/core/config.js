@@ -6,6 +6,7 @@ const constants_1 = require("./constants");
 const crypto_1 = require("./crypto");
 const fileCache_1 = require("./fileCache");
 const utils_1 = require("./utils");
+const complianceTemplates_1 = require("./complianceTemplates");
 function cleanHeaderName(value, fallback) {
     if (typeof value !== "string")
         return fallback;
@@ -32,10 +33,17 @@ function cleanRedactKeys(value) {
 function parseAuditConfig(value) {
     const d = constants_1.DEFAULT_CONFIG.audit;
     const raw = typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
-    return {
+    const out = {
         capturePayloads: typeof raw.capturePayloads === "boolean" ? raw.capturePayloads : d.capturePayloads,
         redactKeys: cleanRedactKeys(raw.redactKeys) ?? [...d.redactKeys],
     };
+    if (typeof raw.activeTemplate === "string" && complianceTemplates_1.COMPLIANCE_TEMPLATE_IDS.includes(raw.activeTemplate)) {
+        out.activeTemplate = raw.activeTemplate;
+    }
+    const frameworks = (0, complianceTemplates_1.cleanFrameworks)(raw.complianceFrameworks);
+    if (frameworks)
+        out.complianceFrameworks = frameworks;
+    return out;
 }
 const newSecret = () => (0, crypto_1.randomHex)(32);
 const validSecret = (v) => typeof v === "string" && v.length >= 32;
@@ -109,7 +117,12 @@ function createConfigStore(configPath, options) {
             ssoTrustProxyHeader: config.ssoTrustProxyHeader,
             ssoUserHeader: config.ssoUserHeader,
             ssoRoleHeader: config.ssoRoleHeader,
-            audit: { capturePayloads: config.audit.capturePayloads, redactKeys: [...config.audit.redactKeys] },
+            audit: {
+                capturePayloads: config.audit.capturePayloads,
+                redactKeys: [...config.audit.redactKeys],
+                ...(config.audit.activeTemplate ? { activeTemplate: config.audit.activeTemplate } : {}),
+                ...(config.audit.complianceFrameworks ? { complianceFrameworks: [...config.audit.complianceFrameworks] } : {}),
+            },
         };
         if (secret)
             merged.ssoSharedSecret = secret;

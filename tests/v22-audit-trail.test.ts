@@ -14,6 +14,7 @@ import express from "express";
 import type { Request, Response } from "express";
 import { GENESIS_HASH, computeRowHash } from "../src/core/auditLedger";
 import { cleanEndUser, endUserOf } from "../src/core/payloadCapture";
+import { approverLabel } from "../src/core/approvals";
 import { closeServer, listen, makeHarness, onCleanup, postJson, runCleanups, sqliteAll, sqliteGet, sqliteRun, tempDir, waitFor } from "./helpers";
 
 after(runCleanups);
@@ -279,12 +280,50 @@ describe("compliance audit trail", () => {
     assert.equal(q.approved_by, null);
     assert.equal(a.status, "APPROVED");
     assert.equal(a.end_user, "bob", "end user follows the action to its decision row");
-    assert.equal(a.approved_by, approver);
+    assert.equal(approver, "api-token-admin", "the API keeps the raw decider id");
+    assert.equal(a.approved_by, "Admin (Dashboard)", "the ledger records a readable approver");
+    // The QUEUED row's detail shows the outcome, instead of pointing at another row.
+    const queuedDetail = (await h.admin("GET", `/logs/${q.id}`)).data;
+    assert.deepEqual(queuedDetail.approval, { status: "APPROVED", by: "Admin (Dashboard)", revokedBy: null });
+    assert.equal((await h.admin("GET", "/logs?limit=1&status=ALLOWED")).status, 200);
     const response = JSON.parse(a.response_payload ?? "null") as { status: number; body: { executed: string } };
     assert.equal(response.status, 200);
     assert.equal(response.body.executed, "POST /api/refund");
     // The replay to the host app is internal: it does not add an ALLOWED row of its own.
     assert.equal((await sqliteAll(h.dbPath, "SELECT id FROM agent_logs WHERE status = 'ALLOWED'")).length, 0);
+
+    // Rejections are attributed too, and a still-held request says so.
+    const r2 = (await (await postJson(`${h.base}/api/refund`, { amount: 41 })).json()) as { approvalId: number };
+    const r3 = (await (await postJson(`${h.base}/api/refund`, { amount: 42 })).json()) as { approvalId: number };
+    assert.equal((await h.admin("POST", `/approvals/${r2.approvalId}/decide`, { decision: "REJECT" })).status, 200);
+    const rejected = await waitFor(
+      async () => sqliteGet<LogDbRow>(h.dbPath, "SELECT * FROM agent_logs WHERE action_id = ? AND status = 'REJECTED'", [r2.approvalId]),
+      5000,
+      "REJECTED row"
+    );
+    assert.equal(rejected.approved_by, "Admin (Dashboard)");
+    const r2Queued = await sqliteGet<LogDbRow>(h.dbPath, "SELECT * FROM agent_logs WHERE action_id = ? AND status = 'QUEUED'", [r2.approvalId]);
+    assert.equal((await h.admin("GET", `/logs/${r2Queued!.id}`)).data.approval.status, "REJECTED");
+    const r3Queued = await sqliteGet<LogDbRow>(h.dbPath, "SELECT * FROM agent_logs WHERE action_id = ? AND status = 'QUEUED'", [r3.approvalId]);
+    assert.deepEqual((await h.admin("GET", `/logs/${r3Queued!.id}`)).data.approval, { status: "PENDING", by: null, revokedBy: null });
+    assert.equal((await postJson(`${h.base}/api/no-rule-here`, {})).status, 403);
+    const plain = await waitFor(
+      async () => sqliteGet<LogDbRow>(h.dbPath, "SELECT * FROM agent_logs WHERE action_id IS NULL AND status = 'BLOCKED'"),
+      5000,
+      "blocked row"
+    );
+    assert.equal((await h.admin("GET", `/logs/${plain.id}`)).data.approval, null, "never held: no approval");
     assert.equal((await h.admin("GET", "/audit/verify")).data.ok, true);
+  });
+
+  test("approverLabel: readable, channel-specific decider names", () => {
+    assert.equal(approverLabel("api-token-admin"), "Admin (Dashboard)");
+    assert.equal(approverLabel("admin"), "Admin (Dashboard)");
+    assert.equal(approverLabel("sso:alice@corp.example"), "alice@corp.example (SSO)");
+    assert.equal(approverLabel("telegram:@u777"), "Admin (Telegram @u777)");
+    assert.equal(approverLabel("slack:bob"), "Admin (Slack bob)");
+    assert.equal(approverLabel("mobile-link"), "Admin (Signed link)");
+    assert.equal(approverLabel("jane"), "jane (Dashboard)");
+    assert.equal(approverLabel("auto:caller-blocked-by:sso:alice@corp.example"), "Auto-rejected (caller blocked by alice@corp.example (SSO))");
   });
 });

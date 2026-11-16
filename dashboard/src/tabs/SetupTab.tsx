@@ -4,7 +4,8 @@ import { AlertCircle, Award, BellRing, Building2, CheckCircle2, Clock, EyeOff, P
 import type { LicenseApi } from '../hooks/useLicense'
 import { LicenseCard } from '../components/LicenseCard'
 import { WorkspacesPanel } from '../components/WorkspacesPanel'
-import type { WorkspacesApi } from '../components/WorkspaceSwitcher'
+import type { WorkspacesApi } from '../hooks/useWorkspaces'
+import { SecretInput } from '../components/SecretInput'
 import { api, errorMessage } from '../lib/api'
 import type { RulesApi } from '../hooks/useRules'
 import type {
@@ -77,6 +78,16 @@ interface DraftTier {
 }
 
 /** "250" -> 250, "true" -> true, "null" -> null, "\"250\"" -> "250", anything else -> the text. */
+/** Gateway setup + the blocked-caller list. Never throws. */
+async function fetchSetup(): Promise<{ setup: SetupResponse; blocked: BlockedCaller[] } | { error: string }> {
+  try {
+    const [setup, blocked] = await Promise.all([api.get<SetupResponse>('/setup'), api.get<BlockedCaller[]>('/blocked-callers')])
+    return { setup: setup.data, blocked: blocked.data }
+  } catch (err) {
+    return { error: errorMessage(err) }
+  }
+}
+
 function parseScalar(text: string): string | number | boolean | null {
   const t = text.trim()
   if (/^".*"$/.test(t)) return t.slice(1, -1)
@@ -285,23 +296,34 @@ export function SetupTab({
     return () => window.clearInterval(id)
   }, [])
 
+  const showSetup = useCallback(
+    (r: Awaited<ReturnType<typeof fetchSetup>>) => {
+      if ('setup' in r) {
+        apply(r.setup)
+        setBlocked(r.blocked)
+        setError(null)
+      } else setError(r.error)
+      setLoading(false)
+    },
+    [apply]
+  )
+
+  /** Refresh button. */
   const load = useCallback(async () => {
     setLoading(true)
-    try {
-      const [setup, blockedRes] = await Promise.all([api.get<SetupResponse>('/setup'), api.get<BlockedCaller[]>('/blocked-callers')])
-      apply(setup.data)
-      setBlocked(blockedRes.data)
-      setError(null)
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setLoading(false)
-    }
-  }, [apply])
+    showSetup(await fetchSetup())
+  }, [showSetup])
 
+  // First load: "loading" already starts true, so only the answer is set.
   useEffect(() => {
-    void load()
-  }, [load])
+    let live = true
+    void fetchSetup().then((r) => {
+      if (live) showSetup(r)
+    })
+    return () => {
+      live = false
+    }
+  }, [showSetup])
 
   async function saveSetup(body: Record<string, unknown>, done: string, setBusy: (b: boolean) => void) {
     if (readOnly) return
@@ -526,9 +548,11 @@ export function SetupTab({
                     disabled={readOnly}
                   />
                   <Field label="Bot token" hint="Create a bot with @BotFather and paste its token.">
-                    <input
+                    <SecretInput
+                      label="Telegram bot token"
                       value={settings.notifications.telegram.botToken}
-                      onChange={(e) => patchNotify('telegram', { botToken: e.target.value })}
+                      onChange={(v) => patchNotify('telegram', { botToken: v })}
+                      revealField="telegram.botToken"
                       placeholder="123456789:AA..."
                       disabled={readOnly}
                       className={`${INPUT_CLASS} font-mono text-xs`}
@@ -576,9 +600,11 @@ export function SetupTab({
                   />
                   {settings.notifications.slack.mode === 'webhook' ? (
                     <Field label="Incoming webhook URL" hint="Slack → Apps → Incoming Webhooks → Add to channel.">
-                      <input
+                      <SecretInput
+                        label="Slack incoming webhook URL"
                         value={settings.notifications.slack.webhookUrl}
-                        onChange={(e) => patchNotify('slack', { webhookUrl: e.target.value })}
+                        onChange={(v) => patchNotify('slack', { webhookUrl: v })}
+                        revealField="slack.webhookUrl"
                         placeholder="https://hooks.slack.com/services/..."
                         disabled={readOnly}
                         className={`${INPUT_CLASS} font-mono text-xs`}
@@ -587,18 +613,22 @@ export function SetupTab({
                   ) : (
                     <>
                       <Field label="Bot token" hint="OAuth & Permissions → Bot User OAuth Token (scope chat:write).">
-                        <input
+                        <SecretInput
+                          label="Slack bot token"
                           value={settings.notifications.slack.botToken}
-                          onChange={(e) => patchNotify('slack', { botToken: e.target.value })}
+                          onChange={(v) => patchNotify('slack', { botToken: v })}
+                          revealField="slack.botToken"
                           placeholder="xoxb-..."
                           disabled={readOnly}
                           className={`${INPUT_CLASS} font-mono text-xs`}
                         />
                       </Field>
                       <Field label="App-level token" hint="Basic Information → App-Level Tokens (scope connections:write). Turn on Socket Mode and Interactivity.">
-                        <input
+                        <SecretInput
+                          label="Slack app-level token"
                           value={settings.notifications.slack.appToken}
-                          onChange={(e) => patchNotify('slack', { appToken: e.target.value })}
+                          onChange={(v) => patchNotify('slack', { appToken: v })}
+                          revealField="slack.appToken"
                           placeholder="xapp-..."
                           disabled={readOnly}
                           className={`${INPUT_CLASS} font-mono text-xs`}
@@ -633,18 +663,21 @@ export function SetupTab({
                 </div>
                 <div className="space-y-3">
                   <Field label="URL">
-                    <input
+                    <SecretInput
+                      label="Custom webhook URL"
                       value={settings.notifications.webhook.url}
-                      onChange={(e) => patchNotify('webhook', { url: e.target.value })}
+                      onChange={(v) => patchNotify('webhook', { url: v })}
                       placeholder="https://hooks.zapier.com/..."
                       disabled={readOnly}
                       className={`${INPUT_CLASS} font-mono text-xs`}
                     />
                   </Field>
-                  <Field label="Signing secret" hint="Sent as x-mont-signature: sha256=HMAC(secret, timestamp + '.' + body). Generated if empty.">
-                    <input
+                  <Field label="Signing secret" hint="Sent as x-mont-signature: sha256=HMAC(secret, timestamp + '.' + body). Generated if empty; Show to copy it into the receiver.">
+                    <SecretInput
+                      label="Custom webhook signing secret"
                       value={settings.notifications.webhook.secret}
-                      onChange={(e) => patchNotify('webhook', { secret: e.target.value })}
+                      onChange={(v) => patchNotify('webhook', { secret: v })}
+                      revealField="webhook.secret"
                       disabled={readOnly}
                       className={`${INPUT_CLASS} font-mono text-xs`}
                     />
@@ -707,10 +740,12 @@ export function SetupTab({
                 className={`${INPUT_CLASS} font-mono`}
               />
             </Field>
-            <Field label="Signing secret" hint="Generated if empty.">
-              <input
+            <Field label="Signing secret" hint="Generated if empty; Show to copy it into the receiver.">
+              <SecretInput
+                label="Rollback webhook signing secret"
                 value={settings.rollback.secret}
-                onChange={(e) => setSettings({ ...settings, rollback: { ...settings.rollback, secret: e.target.value } })}
+                onChange={(v) => setSettings({ ...settings, rollback: { ...settings.rollback, secret: v } })}
+                revealField="rollback.secret"
                 disabled={readOnly}
                 className={`${INPUT_CLASS} font-mono text-xs`}
               />
@@ -1234,11 +1269,14 @@ function PolicyBuilder({
   const [dedupeWindow, setDedupeWindow] = useState('1440')
   const [dedupeOnDuplicate, setDedupeOnDuplicate] = useState<'BLOCK' | 'REQUIRE_APPROVAL'>('BLOCK')
 
-  // Load the chosen rule into the editor.
-  useEffect(() => {
-    if (selected === '__new__') return
-    const rule: Rule | undefined = rules[selected]
-    if (!rule) return
+  // Load the chosen rule into the editor when the selection, or that rule itself (after a save or a
+  // reload), changes. Adjusted during render: React's pattern for state that follows props.
+  const selectedRule: Rule | undefined = selected === '__new__' ? undefined : rules[selected]
+  const [loadedFor, setLoadedFor] = useState<{ key: string; rule: Rule } | null>(null)
+  if (!selectedRule && loadedFor !== null) setLoadedFor(null) // so re-selecting the same rule loads it again
+  if (selectedRule && (loadedFor?.key !== selected || loadedFor.rule !== selectedRule)) {
+    const rule = selectedRule
+    setLoadedFor({ key: selected, rule })
     setFallback(rule.mode)
     setRuleLimit(rule.rateLimit ? String(rule.rateLimit) : '')
     setTiers((rule.policies ?? []).map(toDraft))
@@ -1256,21 +1294,18 @@ function PolicyBuilder({
       setDedupeWindow(String(rule.dedupe.windowMinutes))
       setDedupeOnDuplicate(rule.dedupe.onDuplicate)
     }
-  }, [selected, rules])
+  }
 
-  // On the first load of rules only, open the first rule that has payload tiers.
-  // The ref stops this from running again when a save changes keys.length, which
-  // would undo a form reset.
-  const autoSelectedRef = useRef(focusRuleKey !== null)
-  useEffect(() => {
-    if (autoSelectedRef.current || keys.length === 0) return
-    autoSelectedRef.current = true
+  // On the first load of rules only, open the first rule that has payload tiers. The flag stops
+  // this from running again when a save changes the rule list, which would undo a form reset.
+  const [autoSelected, setAutoSelected] = useState(focusRuleKey !== null)
+  if (!autoSelected && keys.length > 0) {
+    setAutoSelected(true)
     if (selected === '__new__' && tiers.length === 0) {
       const firstWithPolicies = keys.find((k) => (rules[k]?.policies?.length ?? 0) > 0)
       if (firstWithPolicies) setSelected(firstWithPolicies)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [keys.length])
+  }
 
   // Put the editor back into "new endpoint" mode with empty inputs, so the next
   // save creates a new rule instead of overwriting the one that was loaded.

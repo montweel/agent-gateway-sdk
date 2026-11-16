@@ -4,7 +4,7 @@ import { Building2, Copy, KeyRound, Lock, Plus, Save, Trash2 } from 'lucide-reac
 import { api, errorMessage, setWorkspace } from '../lib/api'
 import type { Workspace } from '../lib/types'
 import { INPUT_CLASS, READ_ONLY_HINT } from '../lib/utils'
-import type { WorkspacesApi } from './WorkspaceSwitcher'
+import type { WorkspacesApi } from '../hooks/useWorkspaces'
 import { ErrorBanner, Spinner, SuccessBanner } from './ui'
 
 interface Draft {
